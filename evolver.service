@@ -1,0 +1,17 @@
+[Unit]
+Description=eVOLVER control server
+After=network.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/evolver-gui
+EnvironmentFile=/etc/evolver/secret.env
+ExecStart=/home/pi/evolver-gui/.venv/bin/python /home/pi/evolver-gui/server/app.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/var/log/evolver/app.log
+StandardError=append:/var/log/evolver/app.log
+
+[Install]
+WantedBy=multi-user.target

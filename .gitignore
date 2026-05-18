@@ -3,3 +3,10 @@
 __pycache__/
 .DS_Store
 *.log
+
+# Python virtualenv (created by install.sh)
+.venv/
+
+# Runtime experiment data — backed up to lab storage, not git
+experiments/*
+!experiments/.gitkeep
