@@ -1,0 +1,1961 @@
+"""server/experiment_engine.py — control-loop orchestrator (SPEC §9).
+
+The engine owns the lifecycle of a single Phase-1 experiment: it builds
+per-vial :class:`TurbidostatController` instances, sends initial actuator
+commands, ticks every 10 s via :meth:`run_cycle` (called from the
+sensor_loop), enforces per-vial heater safety (SPEC §10), and persists
+state to ``experiments/{name}/state.json`` so a server restart can
+resume an in-flight experiment.
+
+State machine
+-------------
+
+::
+
+    IDLE ─create_experiment─► CREATED ─start_experiment─► RUNNING
+                                │                            │
+                                │                stop / err  │
+                                ▼                            ▼
+                          (delete back to IDLE)        STOPPED / ERROR
+                                                            │
+                                                            ▼
+                                                  (delete back to IDLE)
+
+Only one experiment is loaded in memory at a time (Phase 1 scope). The
+disk holds all experiments — :meth:`list_experiments` enumerates them.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import math
+import os
+import re
+import shutil
+import threading
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Optional
+
+import numpy as np
+
+from control_modes.chemostat import ChemostatController
+from control_modes.morbidostat import EscalationEvent, MorbidostatController
+from control_modes.turbidostat import PumpAction, TurbidostatController
+from serial_manager import HEATER_OFF_SETPOINT, MAX_SAFE_TEMP_C
+
+# Union of all controller types accepted by the engine. New modes that follow
+# the same interface (push_od / decide / to_state / restore_state /
+# flow_rate_ml_s) plug in by adding to this union and to SUPPORTED_MODES.
+ControllerType = TurbidostatController | ChemostatController | MorbidostatController
+
+SUPPORTED_MODES: frozenset[str] = frozenset({"turbidostat", "chemostat", "morbidostat"})
+
+
+class ConflictError(Exception):
+    """Raised by lifecycle methods when an operation conflicts with current
+    runtime state (e.g. confirming an escalation that isn't pending). The
+    API layer maps this to HTTP 409."""
+
+
+_VALID_BOTTLE_ID = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
+
+
+N_VIALS = 16
+STIR_MAX = 15
+DEFAULT_HEATER_OVERRUN_C = 5.0
+DEFAULT_HEATER_CRITICAL_C = 50.0
+DEFAULT_HEATER_STEP_DOWN_C = 2.0  # SPEC.md §10: per-cycle target reduction on overrun
+DEFAULT_SENSOR_FAILURE_THRESHOLD = 3
+DEFAULT_CYCLE_INTERVAL_SECONDS = 10.0
+PUMP_DURATION_HARD_CAP_SECONDS = 30.0  # engine-level safety cap (SPEC §10)
+DEFAULT_MAINTENANCE_TIMEOUT_MINUTES = 30.0  # auto-resume failsafe
+
+# Defaults if no per-vial pump_flow_rates supplied. Same constants used by
+# the mock; lifted here so the engine doesn't import the mock.
+DEFAULT_FLOW_RATES_ML_PER_SEC: tuple[float, ...] = (
+    0.95, 1.1, 0.975, 0.85, 0.95, 1.05, 1.05, 1.05,
+    1.025, 1.125, 1.0, 1.0, 1.05, 1.15, 1.1, 1.025,
+)
+DEFAULT_VOLUME_ML = 25.0
+DEFAULT_EFFLUX_EXTRA_SECONDS = 5.0
+DEFAULT_HISTORY_WINDOW = 5
+DEFAULT_PUMP_WAIT_MINUTES = 15.0
+
+log = logging.getLogger(__name__)
+
+
+class ExperimentStatus:
+    IDLE = "idle"
+    CREATED = "created"
+    RUNNING = "running"
+    STOPPED = "stopped"
+    ERROR = "error"
+
+    ALL = ("idle", "created", "running", "stopped", "error")
+
+
+class InvalidExperimentStateError(RuntimeError):
+    """Raised by lifecycle methods when called from the wrong status."""
+
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _iso_now() -> str:
+    return _now_utc().isoformat(timespec="seconds")
+
+
+def _is_nan(x: Any) -> bool:
+    try:
+        return float(x) != float(x)
+    except (TypeError, ValueError):
+        return False
+
+
+def _as_list_of_16(value: Any, *, default: float, name: str) -> list[float]:
+    """Coerce a parameter into a length-16 list of floats. Accepts a scalar
+    (broadcast across all vials) or a list of length 16."""
+    if value is None:
+        return [float(default)] * N_VIALS
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return [float(value)] * N_VIALS
+    if isinstance(value, (list, tuple)):
+        if len(value) != N_VIALS:
+            raise ValueError(
+                f"'{name}' list must have length {N_VIALS}, got {len(value)}"
+            )
+        return [float(v) for v in value]
+    raise ValueError(f"'{name}' must be a number or a list of {N_VIALS} numbers")
+
+
+def _validate_and_normalize_media(media: dict) -> dict:
+    """Validate the media block from POST /experiments/create.
+
+    Returns a normalized copy with: ``bottles`` carrying defaults for
+    ``low_volume_alert_ml`` (= 10 % of initial), ``vial_to_bottle`` with
+    string keys, and ``waste`` carrying a default ``high_fill_alert_ml``
+    (= 90 % of capacity). Raises ``ValueError`` with a descriptive message
+    on any failure — caller maps these to HTTP 400.
+    """
+    if not isinstance(media, dict):
+        raise ValueError("'media' must be an object")
+    bottles_in = media.get("bottles")
+    if not isinstance(bottles_in, list) or not bottles_in:
+        raise ValueError("'media.bottles' must be a non-empty list")
+    seen_ids: set[str] = set()
+    bottles: list[dict] = []
+    for i, b in enumerate(bottles_in):
+        if not isinstance(b, dict):
+            raise ValueError(f"'media.bottles[{i}]' must be an object")
+        bid = b.get("id")
+        if not isinstance(bid, str) or not _VALID_BOTTLE_ID.match(bid):
+            raise ValueError(
+                f"'media.bottles[{i}].id' must match {_VALID_BOTTLE_ID.pattern!r}; got {bid!r}"
+            )
+        if bid in seen_ids:
+            raise ValueError(f"duplicate bottle id {bid!r}")
+        seen_ids.add(bid)
+        name = b.get("name", "")
+        if not isinstance(name, str):
+            raise ValueError(f"'media.bottles[{i}].name' must be a string")
+        contents = b.get("contents", "")
+        if not isinstance(contents, str):
+            raise ValueError(f"'media.bottles[{i}].contents' must be a string")
+        initial = b.get("initial_volume_ml")
+        if not isinstance(initial, (int, float)) or isinstance(initial, bool) or initial <= 0:
+            raise ValueError(
+                f"'media.bottles[{i}].initial_volume_ml' must be a positive number"
+            )
+        initial = float(initial)
+        low = b.get("low_volume_alert_ml")
+        if low is None:
+            low = initial * 0.10  # default 10 % remaining
+        if not isinstance(low, (int, float)) or isinstance(low, bool) or low < 0:
+            raise ValueError(
+                f"'media.bottles[{i}].low_volume_alert_ml' must be >= 0"
+            )
+        bottles.append({
+            "id": bid,
+            "name": name,
+            "contents": contents,
+            "initial_volume_ml": initial,
+            "low_volume_alert_ml": float(low),
+        })
+
+    v2b_in = media.get("vial_to_bottle")
+    if not isinstance(v2b_in, dict) or not v2b_in:
+        raise ValueError("'media.vial_to_bottle' must be a non-empty object")
+    vial_to_bottle: dict[str, str] = {}
+    for k, v in v2b_in.items():
+        try:
+            vi = int(k)
+        except (TypeError, ValueError):
+            raise ValueError(f"'media.vial_to_bottle' key {k!r} must be an int 0..15")
+        if not (0 <= vi < N_VIALS):
+            raise ValueError(f"vial {vi} out of range 0..{N_VIALS - 1}")
+        if v not in seen_ids:
+            raise ValueError(
+                f"'media.vial_to_bottle[{k}]' references unknown bottle id {v!r}"
+            )
+        vial_to_bottle[str(vi)] = v
+
+    waste_in = media.get("waste") or {}
+    if not isinstance(waste_in, dict):
+        raise ValueError("'media.waste' must be an object")
+    capacity = waste_in.get("capacity_ml")
+    if not isinstance(capacity, (int, float)) or isinstance(capacity, bool) or capacity <= 0:
+        raise ValueError("'media.waste.capacity_ml' must be a positive number")
+    capacity = float(capacity)
+    high = waste_in.get("high_fill_alert_ml")
+    if high is None:
+        high = capacity * 0.90  # default 90 % full
+    if not isinstance(high, (int, float)) or isinstance(high, bool) or high < 0:
+        raise ValueError("'media.waste.high_fill_alert_ml' must be >= 0")
+    if high > capacity:
+        raise ValueError(
+            "'media.waste.high_fill_alert_ml' must be <= capacity_ml"
+        )
+    waste_name = waste_in.get("name", "")
+    if not isinstance(waste_name, str):
+        raise ValueError("'media.waste.name' must be a string")
+
+    return {
+        "bottles": bottles,
+        "vial_to_bottle": vial_to_bottle,
+        "waste": {
+            "name": waste_name,
+            "capacity_ml": capacity,
+            "high_fill_alert_ml": float(high),
+        },
+    }
+
+
+class ExperimentEngine:
+    def __init__(
+        self,
+        serial_manager,
+        data_logger,
+        experiments_root: Path,
+        *,
+        on_event: Optional[Callable[[dict], None]] = None,
+        on_alert: Optional[Callable[[dict], None]] = None,
+        temp_cal: Optional[np.ndarray] = None,
+        clock: Callable[[], float] = time.time,
+        cycle_interval_seconds: float = DEFAULT_CYCLE_INTERVAL_SECONDS,
+        sensor_failure_threshold: int = DEFAULT_SENSOR_FAILURE_THRESHOLD,
+        heater_overrun_C: float = DEFAULT_HEATER_OVERRUN_C,
+        heater_critical_C: float = DEFAULT_HEATER_CRITICAL_C,
+        maintenance_timeout_minutes: float = DEFAULT_MAINTENANCE_TIMEOUT_MINUTES,
+    ) -> None:
+        self._manager = serial_manager
+        self._data_logger = data_logger
+        self._experiments_root = Path(experiments_root)
+        self._on_event = on_event
+        self._on_alert = on_alert
+        self._temp_cal = temp_cal
+        self._clock = clock
+        self._cycle_interval_seconds = float(cycle_interval_seconds)
+        self._sensor_failure_threshold = int(sensor_failure_threshold)
+        self._heater_overrun_C = float(heater_overrun_C)
+        self._heater_critical_C = float(heater_critical_C)
+        self._maintenance_timeout_seconds = float(maintenance_timeout_minutes) * 60.0
+
+        self._lock = threading.RLock()
+
+        # Loaded experiment (single-experiment Phase 1)
+        self._status: str = ExperimentStatus.IDLE
+        self._name: Optional[str] = None
+        self._config: Optional[dict] = None
+        self._vials: list[int] = []
+        self._controllers: dict[int, ControllerType] = {}
+        self._setpoint_raw: dict[int, int] = {}
+        self._setpoint_stir: int = 0
+        self._nan_streak: dict[int, int] = {}
+        self._vial_faults: dict[int, Optional[str]] = {}
+        self._created_at: Optional[datetime] = None
+        self._started_at: Optional[datetime] = None
+        self._stopped_at: Optional[datetime] = None
+        self._stop_reason: Optional[str] = None
+
+        # Media tracking (Phase 1: bottles are purely logical; static for run)
+        self._media_bottles: dict[str, dict] = {}     # id -> static config
+        self._vial_to_bottle: dict[int, str] = {}     # vial -> bottle id
+        self._bottle_consumed_ml: dict[str, float] = {}
+        self._bottle_alerted_low: dict[str, bool] = {}
+        self._waste_config: Optional[dict] = None
+        self._waste_filled_ml: float = 0.0
+        self._waste_alerted_high: bool = False
+
+        # Maintenance mode (pauses pump execution; coalesces decisions per
+        # vial so we don't over-dilute on resume). Cleared on stop.
+        self._maintenance_active: bool = False
+        self._maintenance_entered_at: Optional[datetime] = None
+        # vial -> (PumpAction, ts_iso captured at decide time)
+        self._pending_pump_actions: dict[int, tuple[PumpAction, str]] = {}
+
+        self._experiments_root.mkdir(parents=True, exist_ok=True)
+
+    # ------------------------------------------------------------------
+    # Properties
+    # ------------------------------------------------------------------
+
+    @property
+    def is_running(self) -> bool:
+        with self._lock:
+            return self._status == ExperimentStatus.RUNNING
+
+    @property
+    def loaded_experiment(self) -> Optional[str]:
+        with self._lock:
+            return self._name
+
+    @property
+    def loaded_vials(self) -> list[int]:
+        with self._lock:
+            return list(self._vials)
+
+    @property
+    def status_string(self) -> str:
+        with self._lock:
+            return self._status
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def create_experiment(
+        self,
+        name: str,
+        mode: str,
+        vials: Optional[list[int]] = None,
+        parameters: Optional[dict] = None,
+        calibration: Optional[dict] = None,
+        notes: str = "",
+        media: Optional[dict] = None,
+    ) -> dict:
+        """Validate, create the experiment directory via DataLogger, write
+        the initial ``state.json``, and transition IDLE → CREATED. Returns
+        the saved config.
+
+        When ``media`` is provided, ``vials`` may be omitted — the engine
+        derives the vial list from ``media.vial_to_bottle.keys()``. If both
+        are supplied they must agree (sorted-equal).
+        """
+        if mode not in SUPPORTED_MODES:
+            raise ValueError(
+                f"unsupported mode {mode!r}; supported: {sorted(SUPPORTED_MODES)}"
+            )
+
+        normalized_media: Optional[dict] = None
+        if media is not None:
+            normalized_media = _validate_and_normalize_media(media)
+            derived_vials = sorted(int(k) for k in normalized_media["vial_to_bottle"])
+            if vials is None or len(vials) == 0:
+                vials = derived_vials
+            else:
+                if sorted(int(v) for v in vials) != derived_vials:
+                    raise ValueError(
+                        "'vials' must equal the keys of media.vial_to_bottle "
+                        f"({derived_vials}); got {sorted(vials)}"
+                    )
+
+        if vials is None or len(vials) == 0:
+            raise ValueError("'vials' must be a non-empty list (or supply 'media')")
+
+        with self._lock:
+            self._assert_status(ExperimentStatus.IDLE, ExperimentStatus.STOPPED, ExperimentStatus.ERROR)
+            # If a previous experiment is in STOPPED/ERROR, unload it before creating a new one.
+            if self._status in (ExperimentStatus.STOPPED, ExperimentStatus.ERROR):
+                self._unload_locked()
+
+            config = self._data_logger.create_experiment(
+                name=name,
+                mode=mode,
+                vials=vials,
+                parameters=parameters or {},
+                calibration=calibration or {},
+                notes=notes,
+                media=normalized_media,
+            )
+            self._status = ExperimentStatus.CREATED
+            self._name = name
+            self._config = config
+            self._vials = sorted(int(v) for v in config["vials"])
+            self._controllers = {}  # built at start()
+            # Init experiment vials parked OFF; start_experiment will replace
+            # these with the target temperatures derived from config parameters.
+            self._setpoint_raw = {v: HEATER_OFF_SETPOINT for v in self._vials}
+            self._setpoint_stir = 0
+            self._nan_streak = {v: 0 for v in self._vials}
+            self._vial_faults = {v: None for v in self._vials}
+            self._created_at = _now_utc()
+            self._started_at = None
+            self._stopped_at = None
+            self._stop_reason = None
+            # Reset media tracking; populated at start_experiment time below.
+            self._media_bottles = {}
+            self._vial_to_bottle = {}
+            self._bottle_consumed_ml = {}
+            self._bottle_alerted_low = {}
+            self._waste_config = None
+            self._waste_filled_ml = 0.0
+            self._waste_alerted_high = False
+            self._save_state_locked()
+
+        self._broadcast_event({"type": "created", "name": name, "vials": self._vials})
+        log.info("experiment '%s' created (vials=%s)", name, self._vials)
+        return config
+
+    def start_experiment(self, name: Optional[str] = None) -> dict:
+        """Build per-vial controllers, send initial actuator commands,
+        activate the DataLogger, and transition CREATED → RUNNING."""
+        with self._lock:
+            self._assert_status(ExperimentStatus.CREATED)
+            if name is not None and name != self._name:
+                raise ValueError(
+                    f"requested start of '{name}' but '{self._name}' is loaded"
+                )
+            params = self._config["parameters"]
+            calibration = self._config.get("calibration", {})
+
+            mode = self._config.get("mode", "turbidostat")
+            self._controllers = self._build_controllers(
+                mode, params, calibration, self._vials
+            )
+            self._setpoint_stir = int(params.get("stir_rate", 10))
+
+            # Initialise media tracking from the persisted config (if present).
+            self._load_media_locked(self._config.get("media"))
+
+            self._started_at = _now_utc()
+            self._data_logger.activate_experiment(self._name, start=self._started_at)
+
+            try:
+                self._apply_initial_actuators_locked(params)
+            except Exception:
+                log.exception("failed to apply initial actuators; aborting start")
+                self._data_logger.deactivate_experiment()
+                self._started_at = None
+                raise
+
+            self._status = ExperimentStatus.RUNNING
+            self._save_state_locked()
+            cfg = dict(self._config)
+
+        self._broadcast_event({"type": "started", "name": cfg["name"], "vials": self._vials})
+        log.info("experiment '%s' started", cfg["name"])
+        return cfg
+
+    def stop_experiment(self, reason: str = "manual") -> Optional[str]:
+        """Zero pumps/heater/stir for experiment vials, deactivate the
+        DataLogger, persist state, and transition to STOPPED.
+
+        Idempotent: a no-op if already STOPPED or IDLE."""
+        with self._lock:
+            if self._status == ExperimentStatus.IDLE:
+                return None
+            if self._status == ExperimentStatus.STOPPED:
+                # Already stopped — idempotent return.
+                return self._name
+            if self._status == ExperimentStatus.CREATED:
+                # CREATED never sent actuator commands, so no zeroing needed.
+                name = self._name
+                self._stopped_at = _now_utc()
+                self._stop_reason = reason
+                self._status = ExperimentStatus.STOPPED
+                self._save_state_locked()
+                self._broadcast_event({"type": "stopped", "name": name, "reason": reason})
+                log.info("experiment '%s' stopped from CREATED state (%s)", name, reason)
+                return name
+
+            self._assert_status(ExperimentStatus.RUNNING, ExperimentStatus.ERROR)
+            name = self._name
+
+            # Zero actuators for experiment vials only (preserve others).
+            self._zero_experiment_actuators_locked()
+            # Stop logging
+            try:
+                self._data_logger.deactivate_experiment()
+            except Exception:
+                log.exception("data_logger.deactivate_experiment failed during stop")
+
+            # Drop maintenance state — stopping an experiment dismisses any
+            # pending pump actions (they would be stale and were never fired).
+            self._maintenance_active = False
+            self._maintenance_entered_at = None
+            self._pending_pump_actions = {}
+
+            self._stopped_at = _now_utc()
+            self._stop_reason = reason
+            self._status = ExperimentStatus.STOPPED
+            self._save_state_locked()
+
+        self._broadcast_event({"type": "stopped", "name": name, "reason": reason})
+        log.info("experiment '%s' stopped (%s)", name, reason)
+        return name
+
+    def delete_experiment(self, name: str) -> None:
+        """Remove an experiment's directory. Legal only when (a) the
+        experiment is not the loaded one, OR (b) the loaded one is in
+        STOPPED/ERROR status."""
+        with self._lock:
+            if self._name == name and self._status not in (
+                ExperimentStatus.STOPPED,
+                ExperimentStatus.ERROR,
+                ExperimentStatus.IDLE,
+            ):
+                raise InvalidExperimentStateError(
+                    f"cannot delete '{name}' while it is loaded with status={self._status}"
+                )
+            if self._name == name:
+                self._unload_locked()
+            exp_dir = self._experiments_root / name
+            if not exp_dir.is_dir():
+                raise FileNotFoundError(f"experiment directory not found: {exp_dir}")
+            shutil.rmtree(exp_dir)
+        log.info("experiment '%s' deleted", name)
+
+    def handle_emergency_stop(self) -> None:
+        """Called by `api_emergency_stop` after `manager.emergency_shutdown()`
+        has already zeroed everything: broadcast a critical alert, then
+        fully stop any active experiment via `stop_experiment` (transitions
+        to STOPPED). Idempotent — no-op when no experiment is loaded or
+        the experiment is already stopped."""
+        with self._lock:
+            if self._status not in (
+                ExperimentStatus.RUNNING,
+                ExperimentStatus.CREATED,
+                ExperimentStatus.ERROR,
+            ):
+                return
+            name = self._name
+        self._broadcast_alert(
+            level="critical",
+            message=f"Experiment '{name}' stopped by emergency stop",
+        )
+        # stop_experiment is idempotent and re-entrant under the RLock.
+        self.stop_experiment(reason="emergency_stop")
+
+    # ------------------------------------------------------------------
+    # Maintenance mode
+    # ------------------------------------------------------------------
+    # Pauses pump execution so the user can refill bottles / empty the
+    # waste carboy without disrupting the experiment. Sensor reads, CSV
+    # logging, and per-vial control decisions all keep running — only the
+    # PHYSICAL pump commands are suppressed. Pump actions decided during
+    # maintenance are queued per-vial (newest wins, to avoid over-diluting
+    # on resume).
+    #
+    # Auto-resume failsafe: if maintenance has been active for more than
+    # `maintenance_timeout_minutes`, the engine self-exits with a critical
+    # alert so the experiment doesn't stall indefinitely.
+
+    @property
+    def is_maintenance_active(self) -> bool:
+        with self._lock:
+            return self._maintenance_active
+
+    def enter_maintenance(self) -> dict:
+        """Enter maintenance mode. Subsequent run_cycle calls queue pump
+        actions instead of returning them for execution. Idempotent — a
+        no-op when already active. Allowed only while RUNNING."""
+        with self._lock:
+            if self._status != ExperimentStatus.RUNNING:
+                raise InvalidExperimentStateError(
+                    f"maintenance mode is only allowed while RUNNING; "
+                    f"current status={self._status}"
+                )
+            if self._maintenance_active:
+                return self._maintenance_status_locked()
+            self._maintenance_active = True
+            self._maintenance_entered_at = _now_utc()
+            self._pending_pump_actions = {}
+            self._save_state_locked()
+            status = self._maintenance_status_locked()
+        self._broadcast_event({
+            "type": "maintenance_entered",
+            "name": self._name,
+        })
+        self._broadcast_alert(
+            level="warning",
+            message=(
+                "Maintenance mode — pumps suppressed. "
+                f"Auto-resume in {self._maintenance_timeout_seconds / 60:.0f} min."
+            ),
+        )
+        log.warning("maintenance mode entered for experiment '%s'", self._name)
+        return status
+
+    def exit_maintenance(
+        self, reason: str = "manual"
+    ) -> list[tuple[int, PumpAction, str]]:
+        """Exit maintenance mode and return any queued pump actions for the
+        caller (sensor_loop) to execute. Idempotent — returns an empty
+        list when not in maintenance."""
+        with self._lock:
+            if not self._maintenance_active:
+                return []
+            queued = [
+                (vial, action, ts_iso)
+                for vial, (action, ts_iso) in sorted(self._pending_pump_actions.items())
+            ]
+            self._maintenance_active = False
+            self._maintenance_entered_at = None
+            self._pending_pump_actions = {}
+            self._save_state_locked()
+        self._broadcast_event({
+            "type": "maintenance_exited",
+            "name": self._name,
+            "reason": reason,
+            "queued_actions": len(queued),
+        })
+        log.info(
+            "maintenance mode exited (%s) for experiment '%s'; firing %d queued action(s)",
+            reason, self._name, len(queued),
+        )
+        return queued
+
+    def check_maintenance_timeout(
+        self,
+    ) -> Optional[list[tuple[int, PumpAction, str]]]:
+        """Called from sensor_loop each cycle. If maintenance has been active
+        for longer than the configured timeout, auto-exit with a critical
+        alert and return any queued actions for the caller to execute.
+        Returns ``None`` otherwise."""
+        with self._lock:
+            if not self._maintenance_active or self._maintenance_entered_at is None:
+                return None
+            elapsed = (_now_utc() - self._maintenance_entered_at).total_seconds()
+            if elapsed < self._maintenance_timeout_seconds:
+                return None
+        # Outside lock: emit alert + exit (exit takes the lock).
+        self._broadcast_alert(
+            level="critical",
+            message=(
+                f"Maintenance mode auto-resumed after "
+                f"{self._maintenance_timeout_seconds / 60:.0f} min — "
+                "experiment was at risk of stalling"
+            ),
+        )
+        return self.exit_maintenance(reason="auto_timeout")
+
+    def refill_media(
+        self,
+        *,
+        bottles: Optional[dict[str, float]] = None,
+        waste_filled_ml: Optional[float] = None,
+    ) -> dict:
+        """Update bottle remaining volumes and/or waste fill level during
+        maintenance mode. ``bottles`` maps bottle_id → new remaining_ml
+        (i.e. user's measurement after refill). Resets the corresponding
+        alert latches when levels are restored below their thresholds.
+        Returns the updated media status."""
+        with self._lock:
+            if not self._maintenance_active:
+                raise InvalidExperimentStateError(
+                    "refill is only allowed during maintenance mode"
+                )
+            if bottles:
+                for bid, remaining_ml in bottles.items():
+                    if bid not in self._media_bottles:
+                        raise ValueError(f"unknown bottle id {bid!r}")
+                    if not isinstance(remaining_ml, (int, float)) or isinstance(
+                        remaining_ml, bool
+                    ) or remaining_ml < 0:
+                        raise ValueError(
+                            f"bottles[{bid!r}] remaining_ml must be >= 0"
+                        )
+                    initial = self._media_bottles[bid]["initial_volume_ml"]
+                    if remaining_ml > initial:
+                        raise ValueError(
+                            f"bottles[{bid!r}] remaining_ml ({remaining_ml}) "
+                            f"exceeds initial volume ({initial})"
+                        )
+                    self._bottle_consumed_ml[bid] = initial - float(remaining_ml)
+                    # Clear the low-volume latch so the next genuine crossing
+                    # re-alerts (otherwise the alert would stay silent forever
+                    # after a refill).
+                    self._bottle_alerted_low[bid] = False
+            if waste_filled_ml is not None:
+                if self._waste_config is None:
+                    raise ValueError("experiment has no waste container configured")
+                if not isinstance(waste_filled_ml, (int, float)) or isinstance(
+                    waste_filled_ml, bool
+                ) or waste_filled_ml < 0:
+                    raise ValueError("waste_filled_ml must be >= 0")
+                cap = self._waste_config["capacity_ml"]
+                if waste_filled_ml > cap:
+                    raise ValueError(
+                        f"waste_filled_ml ({waste_filled_ml}) exceeds capacity ({cap})"
+                    )
+                self._waste_filled_ml = float(waste_filled_ml)
+                self._waste_alerted_high = False
+            self._save_state_locked()
+            media = self._media_status_locked()
+        log.info("media refilled during maintenance: bottles=%s waste=%s",
+                 bottles, waste_filled_ml)
+        return {"media": media}
+
+    def _maintenance_status_locked(self) -> dict:
+        """Build the maintenance block for status() / sensor_update payloads.
+        Always returns a dict (even when inactive) so the dashboard can
+        unconditionally read flags."""
+        if not self._maintenance_active or self._maintenance_entered_at is None:
+            return {
+                "active": False,
+                "entered_at": None,
+                "auto_resume_at": None,
+                "auto_resume_in_seconds": None,
+                "queued_pump_count": 0,
+            }
+        entered = self._maintenance_entered_at
+        auto_at = entered.timestamp() + self._maintenance_timeout_seconds
+        remaining = auto_at - _now_utc().timestamp()
+        return {
+            "active": True,
+            "entered_at": entered.isoformat(timespec="seconds"),
+            "auto_resume_at": datetime.fromtimestamp(
+                auto_at, tz=timezone.utc
+            ).isoformat(timespec="seconds"),
+            "auto_resume_in_seconds": max(0.0, round(remaining, 1)),
+            "queued_pump_count": len(self._pending_pump_actions),
+        }
+
+    # ------------------------------------------------------------------
+    # Per-cycle entry point
+    # ------------------------------------------------------------------
+
+    def run_cycle(
+        self,
+        timestamp_iso: str,
+        temperature_calibrated: list[float],
+        od_calibrated: list[float],
+    ) -> list[tuple[int, PumpAction]]:
+        """Run one control-loop tick. Returns pump actions the caller
+        should execute (each as a ``(vial, PumpAction)`` tuple). Returns
+        ``[]`` when the engine isn't RUNNING or no vial wants a pump.
+
+        The caller (sensor_loop in app.py) is responsible for:
+          - firing the pumps via ``serial_manager.pump_command``,
+          - logging via ``data_logger.log_pump_event``,
+          - emitting ``experiment_event`` over socketio.
+
+        The engine still handles per-vial heater safety, NaN-streak
+        fault latching, stir re-send, and state.json persistence —
+        those are pure engine concerns that don't need the caller.
+        """
+        if len(temperature_calibrated) != N_VIALS or len(od_calibrated) != N_VIALS:
+            log.warning(
+                "run_cycle: sensor arrays must be length %d; got %d / %d",
+                N_VIALS,
+                len(temperature_calibrated),
+                len(od_calibrated),
+            )
+            return []
+
+        now = self._clock()
+        pump_actions: list[tuple[int, PumpAction]] = []
+
+        with self._lock:
+            if self._status != ExperimentStatus.RUNNING:
+                return []
+            for vial in list(self._vials):
+                if self._vial_faults.get(vial) is not None:
+                    continue  # latched fault — skip
+                temp_c = temperature_calibrated[vial]
+                od = od_calibrated[vial]
+
+                # (1) sensor failure handling
+                if _is_nan(temp_c) or _is_nan(od):
+                    self._nan_streak[vial] = self._nan_streak.get(vial, 0) + 1
+                    if self._nan_streak[vial] >= self._sensor_failure_threshold:
+                        self._latch_fault_locked(vial, "sensor_fail")
+                    continue
+                self._nan_streak[vial] = 0
+
+                # (2) heater safety
+                self._handle_heater_safety_locked(vial, float(temp_c))
+                if self._vial_faults.get(vial) is not None:
+                    continue
+
+                # (3) push OD, (4) decide
+                controller = self._controllers.get(vial)
+                if controller is None:
+                    continue
+                # MorbidostatController needs the timestamp for its
+                # growth-rate fit; others take only the OD.
+                if isinstance(controller, MorbidostatController):
+                    controller.push_od(now=now, od=float(od))
+                else:
+                    controller.push_od(float(od))
+                action = controller.decide(now)
+                if action is not None:
+                    # Engine-level hard cap (SPEC §10 confirmation rule,
+                    # machine-enforced as a guardrail above the controller's
+                    # 20 s SPEC cap).
+                    if action.pump_time > PUMP_DURATION_HARD_CAP_SECONDS:
+                        action = PumpAction(
+                            pump_time=PUMP_DURATION_HARD_CAP_SECONDS,
+                            efflux_extra_seconds=action.efflux_extra_seconds,
+                            average_od=action.average_od,
+                        )
+                    pump_actions.append((vial, action))
+
+            # (4a) Morbidostat: poll each controller for escalation events
+            # and reminder-due flags. Emitted as experiment_event + alert,
+            # and logged to escalation_log.csv for provenance.
+            self._broadcast_morbidostat_events_locked(now, timestamp_iso)
+
+            # (4b) debit media consumption + waste accumulation and
+            # edge-trigger threshold alerts. Bookkeeping is optimistic
+            # (assumes the caller's pump_command will succeed); for Phase 1
+            # the sub-percent error is acceptable.
+            if self._media_bottles:
+                self._debit_media_locked(pump_actions)
+
+            # (5) re-send stir setpoints (drift protection)
+            try:
+                self._resend_stir_locked()
+            except Exception:
+                log.exception("resend stir failed")
+
+            # (4c) Maintenance mode: keep the decision but don't execute.
+            # Coalesce per-vial so a long maintenance window doesn't queue
+            # 10+ dilutions for the same vial (over-dilution on resume).
+            if self._maintenance_active and pump_actions:
+                for vial, action in pump_actions:
+                    self._pending_pump_actions[vial] = (action, timestamp_iso)
+                pump_actions_to_return: list[tuple[int, PumpAction]] = []
+            else:
+                pump_actions_to_return = pump_actions
+
+            # (6) persist
+            try:
+                self._save_state_locked()
+            except Exception:
+                log.exception("state.json persist failed")
+
+        return pump_actions_to_return
+
+    # ------------------------------------------------------------------
+    # Inspection / data
+    # ------------------------------------------------------------------
+
+    def status(self) -> dict:
+        """Snapshot for the API and dashboard."""
+        with self._lock:
+            if self._status == ExperimentStatus.IDLE or self._name is None:
+                return {"status": "idle", "name": None}
+            started = self._started_at
+            elapsed_h = (
+                (_now_utc() - started).total_seconds() / 3600.0
+                if started is not None
+                else 0.0
+            )
+            now = self._clock()
+            per_vial: dict[str, dict] = {}
+            for vial in self._vials:
+                c = self._controllers.get(vial)
+                # Adapter for cross-mode status: turbidostat has the full
+                # `target` / `average_od()` / `time_since_last_pump()` API;
+                # chemostat and morbidostat expose a subset (morbidostat
+                # forwards to its inner turbidostat, chemostat reports its
+                # last bolus time).
+                avg: Optional[float] = None
+                target: Optional[float] = None
+                age = float("inf")
+                if isinstance(c, TurbidostatController):
+                    avg = c.average_od()
+                    target = c.target
+                    age = c.time_since_last_pump(now)
+                elif isinstance(c, MorbidostatController):
+                    avg = c._inner.average_od()
+                    target = c._inner.target
+                    age = c._inner.time_since_last_pump(now)
+                elif isinstance(c, ChemostatController):
+                    avg = c.last_od
+                    if c.last_bolus_time is not None:
+                        age = now - c.last_bolus_time
+                per_vial[str(vial)] = {
+                    "target": target,
+                    "avg_od": avg,
+                    "last_pump_age_s": (None if math.isinf(age) else age),
+                    "fault": self._vial_faults.get(vial),
+                    "setpoint_raw": self._setpoint_raw.get(vial, HEATER_OFF_SETPOINT),
+                }
+            return {
+                "name": self._name,
+                "status": self._status,
+                "mode": (self._config or {}).get("mode"),
+                "created": self._created_at.isoformat(timespec="seconds") if self._created_at else None,
+                "started": self._started_at.isoformat(timespec="seconds") if self._started_at else None,
+                "stopped": self._stopped_at.isoformat(timespec="seconds") if self._stopped_at else None,
+                "stop_reason": self._stop_reason,
+                "elapsed_hours": round(elapsed_h, 4),
+                "vials": self._vials,
+                "per_vial": per_vial,
+                "setpoint_stir": self._setpoint_stir,
+                "media": self._media_status_locked(),
+                "maintenance": self._maintenance_status_locked(),
+                "morbidostat": self._morbidostat_status_locked(),
+            }
+
+    def _morbidostat_status_locked(self) -> Optional[dict]:
+        """Build the ``morbidostat`` block for ``status()``. Returns None
+        when the active experiment isn't morbidostat mode."""
+        if (self._config or {}).get("mode") != "morbidostat":
+            return None
+        per_vial: dict[str, dict] = {}
+        for vial in self._vials:
+            c = self._controllers.get(vial)
+            if not isinstance(c, MorbidostatController):
+                continue
+            last_t: Optional[str] = None
+            if c.last_escalation_time is not None:
+                last_t = datetime.fromtimestamp(
+                    c.last_escalation_time, tz=timezone.utc
+                ).isoformat(timespec="seconds")
+            per_vial[str(vial)] = {
+                "drug_conc": c.drug_conc,
+                "growth_rate_per_hour": c.latest_growth_rate,
+                "awaiting_escalation_confirm": c.awaiting_escalation_confirm,
+                "escalation_count": c.escalation_count,
+                "last_escalation_time": last_t,
+                "proposed_new_drug_conc": c.proposed_new_drug_conc,
+            }
+        return {"per_vial": per_vial}
+
+    def _media_status_locked(self) -> Optional[dict]:
+        """Build the `media` block for status() responses. Returns None when
+        no media config is loaded."""
+        if not self._media_bottles:
+            return None
+        bottles: list[dict] = []
+        for bid, b in self._media_bottles.items():
+            initial = float(b["initial_volume_ml"])
+            consumed = float(self._bottle_consumed_ml.get(bid, 0.0))
+            remaining = max(0.0, initial - consumed)
+            pct = 100.0 * remaining / initial if initial > 0 else 0.0
+            bottles.append({
+                "id": bid,
+                "name": b["name"],
+                "contents": b.get("contents", ""),
+                "initial_volume_ml": initial,
+                "consumed_ml": round(consumed, 3),
+                "remaining_ml": round(remaining, 3),
+                "remaining_pct": round(pct, 2),
+                "low_volume_alert_ml": b["low_volume_alert_ml"],
+                "alerted_low": bool(self._bottle_alerted_low.get(bid, False)),
+            })
+        waste: Optional[dict] = None
+        if self._waste_config is not None:
+            cap = float(self._waste_config["capacity_ml"])
+            filled = float(self._waste_filled_ml)
+            remaining = max(0.0, cap - filled)
+            filled_pct = 100.0 * filled / cap if cap > 0 else 0.0
+            waste = {
+                "name": self._waste_config.get("name", ""),
+                "capacity_ml": cap,
+                "filled_ml": round(filled, 3),
+                "remaining_ml": round(remaining, 3),
+                "filled_pct": round(filled_pct, 2),
+                "high_fill_alert_ml": self._waste_config["high_fill_alert_ml"],
+                "alerted_high": bool(self._waste_alerted_high),
+            }
+        return {
+            "bottles": bottles,
+            "vial_to_bottle": {str(k): v for k, v in self._vial_to_bottle.items()},
+            "waste": waste,
+        }
+
+    def list_experiments(self) -> list[dict]:
+        """All experiment directories with their persisted status."""
+        with self._lock:
+            loaded_name = self._name
+            loaded_status = self._status
+            loaded_vials = list(self._vials)
+        results: list[dict] = []
+        if not self._experiments_root.exists():
+            return results
+        for entry in sorted(self._experiments_root.iterdir()):
+            if not entry.is_dir():
+                continue
+            info: dict = {"name": entry.name, "status": "stopped"}
+            state_path = entry / "state.json"
+            config_path = entry / "config.json"
+            if state_path.is_file():
+                try:
+                    s = json.loads(state_path.read_text(encoding="utf-8"))
+                    info["status"] = s.get("status", "stopped")
+                    for key in ("mode", "vials", "created", "started", "stopped", "stop_reason"):
+                        if key in s:
+                            info[key] = s[key]
+                except Exception:
+                    log.exception("failed to parse %s", state_path)
+            elif config_path.is_file():
+                try:
+                    c = json.loads(config_path.read_text(encoding="utf-8"))
+                    for key in ("mode", "vials", "created"):
+                        if key in c:
+                            info[key] = c[key]
+                except Exception:
+                    log.exception("failed to parse %s", config_path)
+            if entry.name == loaded_name:
+                info["status"] = loaded_status
+                info["vials"] = loaded_vials
+            results.append(info)
+        return results
+
+    def get_data(
+        self,
+        name: str,
+        vial: int,
+        parameter: str,
+        last_n: Optional[int] = None,
+    ) -> dict:
+        """Read CSV rows for a vial/parameter, return JSON-shaped data."""
+        if parameter not in ("od", "temp", "pump"):
+            raise ValueError(f"parameter must be od/temp/pump, got {parameter!r}")
+        if not (0 <= vial < N_VIALS):
+            raise ValueError(f"vial must be in 0..{N_VIALS - 1}, got {vial}")
+        if last_n is not None and last_n <= 0:
+            raise ValueError(f"last_n must be > 0, got {last_n}")
+
+        fname = {
+            "od": f"vial{vial:02d}_OD.csv",
+            "temp": f"vial{vial:02d}_temp.csv",
+            "pump": f"vial{vial:02d}_pump_log.csv",
+        }[parameter]
+        path = self._experiments_root / name / fname
+        if not path.is_file():
+            raise FileNotFoundError(f"data file not found: {path}")
+
+        # Read whole file (CSVs are append-only and small-ish for Phase 1).
+        with path.open("r", encoding="utf-8", newline="") as f:
+            lines = f.read().splitlines()
+        if not lines:
+            return {"timestamps": [], "values": []}
+        header = lines[0].split(",")
+        data_rows = lines[1:]
+        if last_n is not None:
+            data_rows = data_rows[-last_n:]
+
+        if parameter == "pump":
+            rows: list[dict] = []
+            timestamps: list[str] = []
+            for line in data_rows:
+                parts = line.split(",")
+                if len(parts) < len(header):
+                    parts += [""] * (len(header) - len(parts))
+                row = dict(zip(header, parts))
+                rows.append(row)
+                timestamps.append(row.get("timestamp", ""))
+            return {"timestamps": timestamps, "rows": rows, "header": header}
+
+        # od / temp: timestamps + calibrated values
+        value_col = header.index("calibrated_od") if parameter == "od" else header.index("calibrated_temp_c")
+        timestamps = []
+        values: list[Optional[float]] = []
+        for line in data_rows:
+            parts = line.split(",")
+            timestamps.append(parts[0] if parts else "")
+            cell = parts[value_col] if len(parts) > value_col else ""
+            try:
+                values.append(float(cell) if cell != "" else None)
+            except ValueError:
+                values.append(None)
+        return {"timestamps": timestamps, "values": values}
+
+    # ------------------------------------------------------------------
+    # Media tracking (must hold self._lock)
+    # ------------------------------------------------------------------
+
+    def _debit_media_locked(
+        self, pump_actions: list[tuple[int, PumpAction]]
+    ) -> None:
+        """For each pump action, debit the assigned bottle by the influx
+        volume and the waste container by the efflux volume; fire one-shot
+        low-volume / high-fill alerts on threshold crossings."""
+        for vial, action in pump_actions:
+            bottle_id = self._vial_to_bottle.get(vial)
+            if bottle_id is None or bottle_id not in self._media_bottles:
+                continue
+            controller = self._controllers.get(vial)
+            if controller is None:
+                continue
+            flow_ml_s = controller.flow_rate_ml_s
+            influx_ml = action.pump_time * flow_ml_s
+            efflux_ml = (action.pump_time + action.efflux_extra_seconds) * flow_ml_s
+            self._bottle_consumed_ml[bottle_id] = (
+                self._bottle_consumed_ml.get(bottle_id, 0.0) + influx_ml
+            )
+            self._waste_filled_ml += efflux_ml
+
+            self._check_bottle_threshold_locked(bottle_id)
+        self._check_waste_threshold_locked()
+
+    def _broadcast_morbidostat_events_locked(
+        self, now: float, timestamp_iso: str,
+    ) -> None:
+        """For each morbidostat controller: emit any pending escalation
+        proposal (with experiment_event + warning alert + CSV log), and
+        emit a reminder alert when the confirmation deadline ticks past."""
+        for vial, controller in self._controllers.items():
+            if not isinstance(controller, MorbidostatController):
+                continue
+            pending: Optional[EscalationEvent] = controller.pending_escalation()
+            if pending is not None:
+                self._broadcast_event({
+                    "type": "escalation_proposed",
+                    "vial": pending.vial,
+                    "old_drug_conc": pending.old_drug_conc,
+                    "new_drug_conc": pending.new_drug_conc,
+                    "growth_rate": pending.growth_rate,
+                })
+                self._broadcast_alert(
+                    level="warning",
+                    vial=pending.vial,
+                    message=(
+                        f"Vial {pending.vial} escalation proposed: "
+                        f"{pending.old_drug_conc:.2f}x -> {pending.new_drug_conc:.2f}x "
+                        f"(growth {pending.growth_rate:.2f}/hr "
+                        "exceeds threshold)"
+                    ),
+                )
+                try:
+                    self._data_logger.log_escalation_event(
+                        timestamp_iso,
+                        vial=pending.vial,
+                        old_drug_conc=pending.old_drug_conc,
+                        proposed_new_drug_conc=pending.new_drug_conc,
+                        growth_rate_per_hour=pending.growth_rate,
+                    )
+                except Exception:
+                    log.exception("escalation_log.csv write failed")
+            if controller.due_for_reminder(now):
+                controller.mark_reminder_sent(now)
+                self._broadcast_alert(
+                    level="warning",
+                    vial=vial,
+                    message=f"Vial {vial} escalation still pending confirmation",
+                )
+
+    def confirm_escalation(
+        self,
+        name: str,
+        vial: int,
+        *,
+        new_drug_conc: Optional[float] = None,
+        new_bottle_contents: Optional[str] = None,
+    ) -> dict:
+        """Apply a user-confirmed morbidostat escalation: bump drug_conc
+        for the vial, optionally update the bottle contents text in
+        ``config.json``, and log a confirmation row to
+        ``escalation_log.csv``.
+
+        Raises ``ConflictError`` when the vial isn't awaiting confirmation
+        (mapped to 409 by the API)."""
+        with self._lock:
+            if self._status != ExperimentStatus.RUNNING:
+                raise InvalidExperimentStateError(
+                    f"confirm_escalation requires RUNNING, got {self._status!r}"
+                )
+            if self._name != name:
+                raise ValueError(
+                    f"experiment {name!r} is not the running experiment"
+                )
+            if (self._config or {}).get("mode") != "morbidostat":
+                raise ValueError(
+                    f"experiment {name!r} is not morbidostat mode"
+                )
+            controller = self._controllers.get(vial)
+            if not isinstance(controller, MorbidostatController):
+                raise ValueError(f"vial {vial} has no morbidostat controller")
+            if not controller.awaiting_escalation_confirm:
+                raise ConflictError(
+                    f"vial {vial} is not awaiting escalation confirmation"
+                )
+            proposed = controller.proposed_new_drug_conc
+            actual = float(new_drug_conc) if new_drug_conc is not None else proposed
+            if actual is None or actual <= controller.drug_conc:
+                raise ValueError(
+                    f"new_drug_conc ({actual}) must be > current "
+                    f"drug_conc ({controller.drug_conc})"
+                )
+            controller.confirm_escalation(new_conc=actual, timestamp=self._clock())
+            updated_contents: Optional[str] = None
+            if new_bottle_contents is not None:
+                bottle_id = self._vial_to_bottle.get(vial)
+                if bottle_id and bottle_id in self._media_bottles:
+                    self._media_bottles[bottle_id]["contents"] = str(new_bottle_contents)
+                    if isinstance(self._config, dict):
+                        media = self._config.get("media")
+                        if isinstance(media, dict):
+                            for b in media.get("bottles", []):
+                                if b.get("id") == bottle_id:
+                                    b["contents"] = str(new_bottle_contents)
+                                    break
+                    updated_contents = str(new_bottle_contents)
+                    try:
+                        self._data_logger.update_experiment_config(
+                            name, {"media": (self._config or {}).get("media")},
+                        )
+                    except Exception:
+                        log.exception("update_experiment_config failed")
+            try:
+                self._data_logger.log_escalation_event(
+                    _iso_now(),
+                    vial=vial,
+                    confirmed_time=_iso_now(),
+                    confirmed_drug_conc=actual,
+                    bottle_contents_after=updated_contents,
+                )
+            except Exception:
+                log.exception("escalation_log.csv confirmation write failed")
+            self._save_state_locked()
+            result = {
+                "vial": vial,
+                "drug_conc": controller.drug_conc,
+                "bottle_contents": updated_contents,
+            }
+        self._broadcast_event({
+            "type": "escalation_confirmed",
+            "vial": vial,
+            "new_drug_conc": actual,
+        })
+        log.info(
+            "morbidostat escalation confirmed for vial %d: drug_conc -> %.3f",
+            vial, actual,
+        )
+        return result
+
+    def escalation_pending_vials(self) -> list[int]:
+        """List of morbidostat vials currently awaiting user confirmation
+        of an escalation. Empty when not morbidostat or none pending. Used
+        by the dashboard's compact sensor_update payload."""
+        with self._lock:
+            result: list[int] = []
+            for vial, controller in self._controllers.items():
+                if isinstance(controller, MorbidostatController) and (
+                    controller.awaiting_escalation_confirm
+                ):
+                    result.append(vial)
+            return sorted(result)
+
+    def _check_bottle_threshold_locked(self, bottle_id: str) -> None:
+        b = self._media_bottles.get(bottle_id)
+        if b is None or self._bottle_alerted_low.get(bottle_id, False):
+            return
+        consumed = self._bottle_consumed_ml.get(bottle_id, 0.0)
+        remaining = b["initial_volume_ml"] - consumed
+        if remaining <= b["low_volume_alert_ml"]:
+            self._bottle_alerted_low[bottle_id] = True
+            self._broadcast_alert(
+                level="warning",
+                message=(
+                    f"Bottle '{b['name']}' has {max(0.0, remaining):.0f} mL "
+                    f"remaining (alert at {b['low_volume_alert_ml']:.0f} mL)"
+                ),
+            )
+
+    def _check_waste_threshold_locked(self) -> None:
+        if self._waste_config is None or self._waste_alerted_high:
+            return
+        if self._waste_filled_ml >= self._waste_config["high_fill_alert_ml"]:
+            self._waste_alerted_high = True
+            pct = 100.0 * self._waste_filled_ml / self._waste_config["capacity_ml"]
+            self._broadcast_alert(
+                level="warning",
+                message=f"Waste container at {pct:.0f}% capacity",
+            )
+
+    def _media_runtime_state_locked(self) -> Optional[dict]:
+        """Build the state.json `media_state` block. Returns None if no
+        media config is loaded so the field is omitted from disk."""
+        if not self._media_bottles:
+            return None
+        return {
+            "bottles": {
+                bid: {
+                    "consumed_ml": float(self._bottle_consumed_ml.get(bid, 0.0)),
+                    "alerted_low": bool(self._bottle_alerted_low.get(bid, False)),
+                }
+                for bid in self._media_bottles
+            },
+            "waste": {
+                "filled_ml": float(self._waste_filled_ml),
+                "alerted_high": bool(self._waste_alerted_high),
+            },
+        }
+
+    def _restore_media_runtime_locked(
+        self, media_config: Optional[dict], media_state: Optional[dict]
+    ) -> None:
+        """Re-load the runtime media tracking from a persisted state.json
+        snapshot. Called from resume_on_startup."""
+        self._load_media_locked(media_config)
+        if not media_state or not self._media_bottles:
+            return
+        bottles_state = media_state.get("bottles") or {}
+        for bid, b in bottles_state.items():
+            if bid in self._bottle_consumed_ml:
+                self._bottle_consumed_ml[bid] = float(b.get("consumed_ml", 0.0))
+                self._bottle_alerted_low[bid] = bool(b.get("alerted_low", False))
+        waste_state = media_state.get("waste") or {}
+        self._waste_filled_ml = float(waste_state.get("filled_ml", 0.0))
+        self._waste_alerted_high = bool(waste_state.get("alerted_high", False))
+
+    # ------------------------------------------------------------------
+    # Safety / fault helpers (must hold self._lock)
+    # ------------------------------------------------------------------
+
+    def _handle_heater_safety_locked(self, vial: int, temp_c: float) -> None:
+        """Per-cycle overtemp watchdog.
+
+        Convention reminder: raw setpoint is INVERTED — lower = hotter. So
+        "back off the heater" means *raising* the raw setpoint integer
+        (lowering the target Celsius). The gate doesn't condition on
+        ``setpoint_raw > 0`` (that would only trigger when the heater is
+        already cooling); it fires whenever the measured temperature
+        overshoots the target by more than the overrun threshold."""
+        setpoint_raw = self._setpoint_raw.get(vial, HEATER_OFF_SETPOINT)
+        setpoint_c = self._raw_to_C(setpoint_raw, vial)
+        if temp_c > self._heater_critical_C:
+            # Critical: latch fault, park heater off for this vial.
+            self._latch_fault_locked(vial, "overtemp")
+            return
+        if temp_c > setpoint_c + self._heater_overrun_C:
+            # Overrun: lower the target by DEFAULT_HEATER_STEP_DOWN_C (SPEC.md §10).
+            new_target_c = max(22.0, setpoint_c - DEFAULT_HEATER_STEP_DOWN_C)
+            new_raw = self._C_to_raw(new_target_c, vial)
+            self._setpoint_raw[vial] = new_raw
+            self._apply_temperature_locked()
+            log.warning(
+                "vial %d overtemp: %.2f C > target %.2f C + %.1f; "
+                "target -> %.2f C (raw %d -> %d)",
+                vial, temp_c, setpoint_c, self._heater_overrun_C,
+                new_target_c, setpoint_raw, new_raw,
+            )
+
+    def _latch_fault_locked(self, vial: int, kind: str) -> None:
+        if self._vial_faults.get(vial) is not None:
+            return  # already latched
+        self._vial_faults[vial] = kind
+        # Park this vial's heater OFF. Under the inverted convention "off"
+        # is HEATER_OFF_SETPOINT (an unreachably cold target), NOT zero —
+        # zero would pin the heater at maximum, which is what the safety
+        # path is supposed to prevent.
+        self._setpoint_raw[vial] = HEATER_OFF_SETPOINT
+        try:
+            self._apply_temperature_locked()
+        except Exception:
+            log.exception("latch_fault: heater park-off failed for vial %d", vial)
+        # Stir is a 16-vial command; the experiment's _setpoint_stir is
+        # shared, so we don't zero stir on a single-vial fault. The
+        # vial's heater being parked off is the primary safety action.
+        level = "critical" if kind == "overtemp" else "warning"
+        self._broadcast_alert(
+            level=level,
+            message=f"Vial {vial} latched fault: {kind}",
+            vial=vial,
+        )
+
+    # ------------------------------------------------------------------
+    # Actuator helpers (must hold self._lock)
+    # ------------------------------------------------------------------
+
+    def _apply_initial_actuators_locked(self, parameters: dict) -> None:
+        """At start: convert ``temperature_c`` to per-vial raw setpoints,
+        send ``set_temperature_raw`` and ``set_stir``. Preserves non-experiment
+        vials' existing setpoints (which default to HEATER_OFF_SETPOINT)."""
+        target_temps = _as_list_of_16(
+            parameters.get("temperature_c"),
+            default=parameters.get("temperature", 37.0) if isinstance(parameters.get("temperature"), (int, float)) else 37.0,
+            name="temperature_c",
+        )
+        if self._temp_cal is None:
+            raise RuntimeError(
+                "temp_cal is None — engine cannot convert °C to raw setpoint. "
+                "Load calibration first."
+            )
+        # Build the full 16-vial raw-setpoint list, splicing in experiment vials
+        # only. Vials outside the experiment keep whatever the manager last sent
+        # (defaults to HEATER_OFF_SETPOINT on fresh init).
+        current_raw = np.asarray(
+            getattr(
+                self._manager, "temp_setpoint_raw",
+                np.full(N_VIALS, HEATER_OFF_SETPOINT, dtype=int),
+            )
+        )
+        raw_list = [int(v) for v in current_raw.tolist()]
+        for vial in self._vials:
+            target_raw = self._C_to_raw(target_temps[vial], vial)
+            self._setpoint_raw[vial] = target_raw
+            raw_list[vial] = target_raw
+        self._manager.set_temperature_raw(raw_list)
+
+        # Stir: splice the experiment's uniform stir into the existing array.
+        current_stir = np.asarray(
+            getattr(self._manager, "stir_speed", np.zeros(N_VIALS, dtype=int))
+        )
+        stir_list = [int(v) for v in current_stir.tolist()]
+        for vial in self._vials:
+            stir_list[vial] = self._setpoint_stir
+        self._manager.set_stir(stir_list)
+
+    def _apply_temperature_locked(self) -> None:
+        """Re-send the temperature raw-setpoint array reflecting current
+        ``self._setpoint_raw``, preserving non-experiment vials' values."""
+        current_raw = np.asarray(
+            getattr(
+                self._manager, "temp_setpoint_raw",
+                np.full(N_VIALS, HEATER_OFF_SETPOINT, dtype=int),
+            )
+        )
+        raw_list = [int(v) for v in current_raw.tolist()]
+        for vial, raw in self._setpoint_raw.items():
+            raw_list[vial] = int(raw)
+        self._manager.set_temperature_raw(raw_list)
+
+    def _resend_stir_locked(self) -> None:
+        """Re-send stir setpoints for experiment vials (SPEC §9 step 6).
+        Preserves non-experiment vials' values."""
+        current_stir = np.asarray(
+            getattr(self._manager, "stir_speed", np.zeros(N_VIALS, dtype=int))
+        )
+        stir_list = [int(v) for v in current_stir.tolist()]
+        for vial in self._vials:
+            # Faulted vials don't get stirred either.
+            stir_list[vial] = 0 if self._vial_faults.get(vial) is not None else self._setpoint_stir
+        self._manager.set_stir(stir_list)
+
+    def _zero_experiment_actuators_locked(self) -> None:
+        """Zero pumps + heater + stir for experiment vials only. Used by
+        stop_experiment. Manual control of other vials is preserved."""
+        # Stop pumps for experiment vials (best-effort per-vial).
+        for vial in self._vials:
+            try:
+                # Fire each direction with seconds=0 to ensure they're not running.
+                # We rely on SerialManager.stop_all_pumps for a global stop, but
+                # the engine wants per-vial precision so other vials' manual
+                # pumps keep running. SerialManager doesn't expose per-vial
+                # stop, so emit pump_command(vial, "influx", 0) is a no-op on
+                # most firmwares; the safer path is stop_all_pumps. Trade-off
+                # for Phase 1: prefer stopping all pumps — manual pumps in
+                # progress on other vials get interrupted, but pump events are
+                # short (<= 30 s) so this is acceptable.
+                pass
+            except Exception:
+                log.exception("zero pump failed for vial %d", vial)
+        try:
+            self._manager.stop_all_pumps()
+        except Exception:
+            log.exception("stop_all_pumps failed during experiment stop")
+
+        # Park experiment-vial heaters off (HEATER_OFF_SETPOINT, NOT zero —
+        # the convention is inverted; zero would max the heaters). Stir is
+        # genuinely raw-PWM-0-is-off, so it really does get zeroed.
+        # _setpoint_stir is zeroed BEFORE _resend_stir_locked since the
+        # resend reads it.
+        for vial in self._vials:
+            self._setpoint_raw[vial] = HEATER_OFF_SETPOINT
+        self._setpoint_stir = 0
+        try:
+            self._apply_temperature_locked()
+        except Exception:
+            log.exception("heater park-off failed during stop")
+        try:
+            self._resend_stir_locked()
+        except Exception:
+            log.exception("stir zero failed during stop")
+
+    # ------------------------------------------------------------------
+    # Calibration helpers
+    # ------------------------------------------------------------------
+
+    def _C_to_raw(self, temp_c: float, vial: int) -> int:
+        """Convert target °C to raw `xr` setpoint: raw = (°C - intercept)/slope.
+
+        Calibration slope is NEGATIVE, so higher target °C yields a SMALLER
+        raw setpoint (e.g. 37 °C → ~482, 22 °C → ~580). Targets above
+        MAX_SAFE_TEMP_C are clamped; results are bounded above by
+        HEATER_OFF_SETPOINT so we never send unreachably-large integers."""
+        slope = float(self._temp_cal[0][vial])
+        intercept = float(self._temp_cal[1][vial])
+        if slope == 0:
+            return HEATER_OFF_SETPOINT
+        capped_c = min(float(temp_c), MAX_SAFE_TEMP_C)
+        raw = (capped_c - intercept) / slope
+        return int(max(0, min(HEATER_OFF_SETPOINT, round(raw))))
+
+    def _raw_to_C(self, raw: int, vial: int) -> float:
+        """temp_cal[0]*raw + temp_cal[1] = °C. Slope is negative, so
+        smaller raw integers correspond to higher temperatures."""
+        if self._temp_cal is None:
+            return 0.0
+        slope = float(self._temp_cal[0][vial])
+        intercept = float(self._temp_cal[1][vial])
+        return slope * raw + intercept
+
+    # ------------------------------------------------------------------
+    # Controllers
+    # ------------------------------------------------------------------
+
+    def _build_controllers(
+        self,
+        mode: str,
+        parameters: dict,
+        calibration: dict,
+        vials: list[int],
+    ) -> dict[int, ControllerType]:
+        if mode == "turbidostat":
+            return self._build_turbidostat_controllers(parameters, calibration, vials)
+        if mode == "chemostat":
+            return self._build_chemostat_controllers(parameters, calibration, vials)
+        if mode == "morbidostat":
+            return self._build_morbidostat_controllers(parameters, calibration, vials)
+        raise ValueError(f"no controller builder for mode {mode!r}")
+
+    def _resolve_flow_rates(self, parameters: dict, calibration: dict) -> list[float]:
+        """Flow rates: prefer parameters['pump_flow_rates'], then
+        calibration['pump_flow_rates'], else defaults."""
+        flow_rates_raw = (
+            parameters.get("pump_flow_rates")
+            or calibration.get("pump_flow_rates")
+            or list(DEFAULT_FLOW_RATES_ML_PER_SEC)
+        )
+        return _as_list_of_16(
+            flow_rates_raw, default=1.0, name="pump_flow_rates",
+        )
+
+    def _build_turbidostat_controllers(
+        self,
+        parameters: dict,
+        calibration: dict,
+        vials: list[int],
+    ) -> dict[int, ControllerType]:
+        od_lower = _as_list_of_16(
+            parameters.get("od_lower_thresh", parameters.get("od_lower", 0.2)),
+            default=0.2, name="od_lower_thresh",
+        )
+        od_upper = _as_list_of_16(
+            parameters.get("od_upper_thresh", parameters.get("od_upper", 0.4)),
+            default=0.4, name="od_upper_thresh",
+        )
+        pump_wait_minutes = float(
+            parameters.get("pump_wait_minutes", DEFAULT_PUMP_WAIT_MINUTES)
+        )
+        pump_wait_seconds = pump_wait_minutes * 60.0
+        volume_ml = float(parameters.get("volume_ml", DEFAULT_VOLUME_ML))
+        efflux_extra = float(
+            parameters.get("efflux_extra_seconds", DEFAULT_EFFLUX_EXTRA_SECONDS)
+        )
+        history_window = int(parameters.get("history_window", DEFAULT_HISTORY_WINDOW))
+        # Legacy warmup gate (custom_script.py:83): block control actions
+        # until ≥8 OD samples have accumulated. Configurable via the
+        # experiment parameter "min_samples_before_action" for tests that
+        # want to exercise the controller without warmup.
+        min_samples_before_action = int(parameters.get(
+            "min_samples_before_action", 8
+        ))
+        flow_rates = self._resolve_flow_rates(parameters, calibration)
+
+        controllers: dict[int, ControllerType] = {}
+        for vial in vials:
+            controllers[vial] = TurbidostatController(
+                vial=vial,
+                od_lower=od_lower[vial],
+                od_upper=od_upper[vial],
+                pump_wait_seconds=pump_wait_seconds,
+                flow_rate_ml_s=flow_rates[vial],
+                volume_ml=volume_ml,
+                efflux_extra_seconds=efflux_extra,
+                history_window=history_window,
+                pump_duration_cap_seconds=20.0,  # SPEC §9 cap
+                min_samples_before_action=min_samples_before_action,
+            )
+        return controllers
+
+    def _build_chemostat_controllers(
+        self,
+        parameters: dict,
+        calibration: dict,
+        vials: list[int],
+    ) -> dict[int, ControllerType]:
+        dilution_rate = float(parameters.get("dilution_rate_per_hour", 0.5))
+        bolus_interval = float(parameters.get(
+            "bolus_interval_seconds", self._cycle_interval_seconds,
+        ))
+        volume_ml = float(parameters.get("volume_ml", DEFAULT_VOLUME_ML))
+        efflux_extra = float(
+            parameters.get("efflux_extra_seconds", DEFAULT_EFFLUX_EXTRA_SECONDS)
+        )
+        flow_rates = self._resolve_flow_rates(parameters, calibration)
+
+        controllers: dict[int, ControllerType] = {}
+        for vial in vials:
+            controllers[vial] = ChemostatController(
+                vial=vial,
+                dilution_rate_per_hour=dilution_rate,
+                bolus_interval_seconds=bolus_interval,
+                volume_ml=volume_ml,
+                flow_rate_ml_s=flow_rates[vial],
+                efflux_extra_seconds=efflux_extra,
+                pump_duration_cap_seconds=20.0,
+            )
+        return controllers
+
+    def _build_morbidostat_controllers(
+        self,
+        parameters: dict,
+        calibration: dict,
+        vials: list[int],
+    ) -> dict[int, ControllerType]:
+        # target_od accepts scalar or per-vial list (mirrors turbidostat
+        # thresholds). od_lower likewise.
+        target_od = _as_list_of_16(
+            parameters.get("target_od", 0.4), default=0.4, name="target_od",
+        )
+        od_lower = _as_list_of_16(
+            parameters.get("od_lower", 0.2), default=0.2, name="od_lower",
+        )
+        pump_wait_minutes = float(
+            parameters.get("pump_wait_minutes", DEFAULT_PUMP_WAIT_MINUTES)
+        )
+        pump_wait_seconds = pump_wait_minutes * 60.0
+        volume_ml = float(parameters.get("volume_ml", DEFAULT_VOLUME_ML))
+        efflux_extra = float(
+            parameters.get("efflux_extra_seconds", DEFAULT_EFFLUX_EXTRA_SECONDS)
+        )
+        history_window = int(parameters.get("history_window", DEFAULT_HISTORY_WINDOW))
+        # Same warmup gate as turbidostat (the inner controller is one).
+        min_samples_before_action = int(parameters.get(
+            "min_samples_before_action", 8
+        ))
+        flow_rates = self._resolve_flow_rates(parameters, calibration)
+
+        # Morbidostat-specific (scalar params, broadcast to all vials).
+        initial_drug = _as_list_of_16(
+            parameters.get("initial_drug_conc", 1.0),
+            default=1.0, name="initial_drug_conc",
+        )
+        drug_step = float(parameters.get("drug_step", 2.0))
+        mu_thresh = float(parameters.get("adaptation_threshold_per_hour", 0.4))
+        growth_window = float(parameters.get("growth_window_seconds", 1800.0))
+        growth_min_samples = int(parameters.get("growth_min_samples", 6))
+        escalation_cooldown = float(
+            parameters.get("escalation_cooldown_seconds", 3600.0)
+        )
+        reminder_interval = float(
+            parameters.get("escalation_reminder_interval_seconds", 1800.0)
+        )
+
+        controllers: dict[int, ControllerType] = {}
+        for vial in vials:
+            controllers[vial] = MorbidostatController(
+                vial=vial,
+                target_od=target_od[vial],
+                od_lower=od_lower[vial],
+                pump_wait_seconds=pump_wait_seconds,
+                flow_rate_ml_s=flow_rates[vial],
+                volume_ml=volume_ml,
+                efflux_extra_seconds=efflux_extra,
+                history_window=history_window,
+                pump_duration_cap_seconds=20.0,
+                min_samples_before_action=min_samples_before_action,
+                initial_drug_conc=initial_drug[vial],
+                drug_step=drug_step,
+                adaptation_threshold_per_hour=mu_thresh,
+                growth_window_seconds=growth_window,
+                growth_min_samples=growth_min_samples,
+                escalation_cooldown_seconds=escalation_cooldown,
+                escalation_reminder_interval_seconds=reminder_interval,
+            )
+        return controllers
+
+    # ------------------------------------------------------------------
+    # State persistence
+    # ------------------------------------------------------------------
+
+    def _save_state_locked(self) -> None:
+        if self._name is None:
+            return
+        exp_dir = self._experiments_root / self._name
+        if not exp_dir.is_dir():
+            return
+        payload: dict[str, Any] = {
+            "name": self._name,
+            "status": self._status,
+            "mode": (self._config or {}).get("mode"),
+            "vials": list(self._vials),
+            "parameters": (self._config or {}).get("parameters", {}),
+            "calibration": (self._config or {}).get("calibration", {}),
+            "media": (self._config or {}).get("media"),
+            "created": self._created_at.isoformat(timespec="seconds") if self._created_at else None,
+            "started": self._started_at.isoformat(timespec="seconds") if self._started_at else None,
+            "stopped": self._stopped_at.isoformat(timespec="seconds") if self._stopped_at else None,
+            "stop_reason": self._stop_reason,
+            "setpoint_raw": dict(self._setpoint_raw),
+            "setpoint_stir": self._setpoint_stir,
+            "controllers": {
+                str(v): c.to_state() for v, c in self._controllers.items()
+            },
+            "vial_faults": {str(k): v for k, v in self._vial_faults.items()},
+            "nan_streak": {str(k): v for k, v in self._nan_streak.items()},
+            "media_state": self._media_runtime_state_locked(),
+            "maintenance": {
+                "active": self._maintenance_active,
+                "entered_at": (
+                    self._maintenance_entered_at.isoformat(timespec="seconds")
+                    if self._maintenance_entered_at else None
+                ),
+            },
+            "last_persisted": _iso_now(),
+        }
+        state_path = exp_dir / "state.json"
+        tmp_path = exp_dir / "state.json.tmp"
+        with tmp_path.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=4)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+        # On Windows, replace() handles the case where state.json already exists.
+        os.replace(tmp_path, state_path)
+
+    def _load_state(self, name: str) -> dict:
+        state_path = self._experiments_root / name / "state.json"
+        if not state_path.is_file():
+            return {"status": ExperimentStatus.CREATED}
+        return json.loads(state_path.read_text(encoding="utf-8"))
+
+    def resume_on_startup(self) -> Optional[str]:
+        """Scan experiments/ for any directory whose state.json shows
+        status=RUNNING. If exactly one, rebuild its controllers, re-send
+        actuators, activate the DataLogger, and transition to RUNNING.
+
+        If multiple are marked RUNNING (corruption from a crashed write):
+        pick the most recently started, mark the others as ERROR.
+        """
+        candidates: list[tuple[str, dict]] = []
+        if not self._experiments_root.exists():
+            return None
+        for entry in sorted(self._experiments_root.iterdir()):
+            if not entry.is_dir():
+                continue
+            state_path = entry / "state.json"
+            if not state_path.is_file():
+                continue
+            try:
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+            except Exception:
+                log.exception("failed to read %s on resume scan", state_path)
+                continue
+            if state.get("status") == ExperimentStatus.RUNNING:
+                candidates.append((entry.name, state))
+
+        if not candidates:
+            return None
+
+        # Pick most-recently-started; demote the rest.
+        def _started_key(item: tuple[str, dict]) -> str:
+            return (item[1].get("started") or "") + item[0]
+        candidates.sort(key=_started_key, reverse=True)
+        winner, state = candidates[0]
+
+        for other_name, other_state in candidates[1:]:
+            log.warning(
+                "resume_on_startup: multiple RUNNING experiments; demoting '%s' to ERROR",
+                other_name,
+            )
+            other_state["status"] = ExperimentStatus.ERROR
+            other_state["stop_reason"] = "resume_conflict"
+            other_state["stopped"] = _iso_now()
+            (self._experiments_root / other_name / "state.json").write_text(
+                json.dumps(other_state, indent=4), encoding="utf-8"
+            )
+
+        # Resume the winner
+        with self._lock:
+            self._status = ExperimentStatus.RUNNING
+            self._name = winner
+            self._config = {
+                "name": winner,
+                "mode": state.get("mode"),
+                "vials": state.get("vials", []),
+                "parameters": state.get("parameters", {}),
+                "calibration": state.get("calibration", {}),
+                "media": state.get("media"),
+                "notes": state.get("notes", ""),
+                "created": state.get("created"),
+            }
+            self._vials = sorted(int(v) for v in state.get("vials", []))
+            self._setpoint_stir = int(state.get("setpoint_stir", 0))
+            self._setpoint_raw = {
+                int(k): int(v) for k, v in (state.get("setpoint_raw") or {}).items()
+            }
+            for vial in self._vials:
+                self._setpoint_raw.setdefault(vial, HEATER_OFF_SETPOINT)
+            self._vial_faults = {
+                int(k): v for k, v in (state.get("vial_faults") or {}).items()
+            }
+            for vial in self._vials:
+                self._vial_faults.setdefault(vial, None)
+            self._nan_streak = {
+                int(k): int(v) for k, v in (state.get("nan_streak") or {}).items()
+            }
+            for vial in self._vials:
+                self._nan_streak.setdefault(vial, 0)
+            self._created_at = _parse_iso(state.get("created"))
+            self._started_at = _parse_iso(state.get("started"))
+
+            # Rebuild controllers and restore their state
+            self._controllers = self._build_controllers(
+                self._config.get("mode", "turbidostat"),
+                self._config["parameters"],
+                self._config["calibration"],
+                self._vials,
+            )
+            saved_controllers = state.get("controllers") or {}
+            for vial in self._vials:
+                cstate = saved_controllers.get(str(vial))
+                if cstate is not None:
+                    self._controllers[vial].restore_state(cstate)
+
+            # Restore media tracking from the persisted snapshot (no-op when
+            # the experiment was created without media config).
+            self._restore_media_runtime_locked(
+                self._config.get("media"), state.get("media_state")
+            )
+
+            # Restore maintenance flag. Pending pump actions are intentionally
+            # NOT persisted — they may be hours stale by the time the server
+            # restarts and firing them blindly could over-dilute. Controllers
+            # decide fresh on the first cycle after resume.
+            maint = state.get("maintenance") or {}
+            if maint.get("active"):
+                entered = _parse_iso(maint.get("entered_at"))
+                if entered is not None:
+                    self._maintenance_active = True
+                    self._maintenance_entered_at = entered
+                    self._pending_pump_actions = {}
+                    log.info(
+                        "resumed in maintenance mode (entered at %s)",
+                        entered.isoformat(timespec="seconds"),
+                    )
+
+            # Re-activate the data logger with the original start timestamp so
+            # elapsed_hours in CSVs stays continuous.
+            try:
+                self._data_logger.activate_experiment(winner, start=self._started_at or _now_utc())
+            except RuntimeError:
+                log.exception("data_logger.activate_experiment failed on resume")
+                raise
+
+            # Re-send the heater + stir setpoints
+            try:
+                self._apply_temperature_locked()
+                self._resend_stir_locked()
+            except Exception:
+                log.exception("resume: re-send actuators failed")
+
+        self._broadcast_event({"type": "resumed", "name": winner, "vials": self._vials})
+        log.info("experiment '%s' resumed on startup", winner)
+        return winner
+
+    # ------------------------------------------------------------------
+    # Misc helpers
+    # ------------------------------------------------------------------
+
+    def _unload_locked(self) -> None:
+        """Clear loaded-experiment state (called when the user creates a
+        new experiment while the previous is STOPPED/ERROR)."""
+        self._status = ExperimentStatus.IDLE
+        self._name = None
+        self._config = None
+        self._vials = []
+        self._controllers = {}
+        self._setpoint_raw = {}
+        self._setpoint_stir = 0
+        self._nan_streak = {}
+        self._vial_faults = {}
+        self._created_at = None
+        self._started_at = None
+        self._stopped_at = None
+        self._stop_reason = None
+        self._media_bottles = {}
+        self._vial_to_bottle = {}
+        self._bottle_consumed_ml = {}
+        self._bottle_alerted_low = {}
+        self._waste_config = None
+        self._waste_filled_ml = 0.0
+        self._waste_alerted_high = False
+        self._maintenance_active = False
+        self._maintenance_entered_at = None
+        self._pending_pump_actions = {}
+
+    def _load_media_locked(self, media_config: Optional[dict]) -> None:
+        """Initialise media tracking state from `config.media`. Called at
+        start_experiment and resume_on_startup. No-op when media is absent."""
+        if not media_config:
+            self._media_bottles = {}
+            self._vial_to_bottle = {}
+            self._bottle_consumed_ml = {}
+            self._bottle_alerted_low = {}
+            self._waste_config = None
+            self._waste_filled_ml = 0.0
+            self._waste_alerted_high = False
+            return
+        self._media_bottles = {b["id"]: dict(b) for b in media_config["bottles"]}
+        self._vial_to_bottle = {
+            int(k): v for k, v in media_config["vial_to_bottle"].items()
+        }
+        self._bottle_consumed_ml = {bid: 0.0 for bid in self._media_bottles}
+        self._bottle_alerted_low = {bid: False for bid in self._media_bottles}
+        self._waste_config = dict(media_config["waste"])
+        self._waste_filled_ml = 0.0
+        self._waste_alerted_high = False
+
+    def _assert_status(self, *allowed: str) -> None:
+        if self._status not in allowed:
+            raise InvalidExperimentStateError(
+                f"operation not allowed in status={self._status!r}; "
+                f"allowed: {allowed}"
+            )
+
+    def _broadcast_event(self, payload: dict) -> None:
+        if self._on_event is None:
+            return
+        try:
+            payload = dict(payload)
+            payload.setdefault("timestamp", _iso_now())
+            self._on_event(payload)
+        except Exception:
+            log.exception("on_event callback failed")
+
+    def _broadcast_alert(self, *, level: str, message: str, vial: Optional[int] = None) -> None:
+        if self._on_alert is None:
+            return
+        try:
+            payload = {"level": level, "message": message, "timestamp": _iso_now()}
+            if vial is not None:
+                payload["vial"] = vial
+            self._on_alert(payload)
+        except Exception:
+            log.exception("on_alert callback failed")
+
+
+def _parse_iso(s: Optional[str]) -> Optional[datetime]:
+    if s is None:
+        return None
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(s)
+    except ValueError:
+        return None
