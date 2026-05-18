@@ -22,7 +22,7 @@ This project modernizes the control software for a 2016-era eVOLVER continuous c
         v
 [16 Smart Sleeves: heaters, thermistors, LEDs, photodiodes, stir motors]
         |
-[Auxiliary Board: 48 peristaltic pumps (3 per vial: influx, efflux, spare)]
+[Auxiliary Board: 32 peristaltic pumps (2 per vial: influx + efflux)]
 ```
 
 ### Raspberry Pi
@@ -54,10 +54,9 @@ Each vial sleeve contains:
 - Stir motor (drives magnetic stir bar, PWM speed control)
 
 ### Fluidics
-- 48 peristaltic pumps total (3 per vial)
-- Per vial: influx pump (fresh media in), efflux pump (culture out), spare
+- 32 peristaltic pumps total (2 per vial: influx + efflux)
 - Controlled by a separate SAMD21 on the Auxiliary Board
-- Pump addressing uses binary codes: influx = 2^vial, efflux = 2^(vial+16)
+- Pump addressing uses binary codes: influx = 2^vial, efflux = 2^(vial+16) — 32 addresses total (range 0..31)
 
 ## RS485 serial protocol
 
@@ -89,7 +88,19 @@ All communication goes through /dev/ttyAMA0 at 9600 baud. The exp_manager (evolv
 
 The exp_manager parses responses by checking: `response[:4] == prefix` and `response[-3:] == 'end'`, then extracts the data as `response[4:-3]`.
 
-Stir and fluidics are write-only — Arduinos acknowledge but don't return sensor data for these.
+Stir and fluidics are write-only on the active code path — Arduinos may acknowledge but the exp_manager never reads a response for these. (A `Fluidic_status()` function exists in `evolver_UPD.py` but is only called from a commented-out "without queue" branch.)
+
+### Fluidics sub-protocol
+
+The `st` address prefix is a namespace; the first character of the payload selects one of three sub-modes. Only `mac_original/` actually writes these — the legacy single-fire form is the only one that turbidostat experiments use.
+
+| Sub-mode             | Wire format                                                   | Used by                                          |
+|----------------------|---------------------------------------------------------------|--------------------------------------------------|
+| Single fire          | `st<binary_pump_code>,0,<seconds>, !`                         | `custom_script.py` turbidostat (line 112)        |
+| Stop / multi-fire    | `stt,<32-bit pump mask>,<time0>,<time1>,…,<time15>, !`        | `eVOLVER_module.stop_all_pumps` (line 199)       |
+| Chemostat (rates)    | `stc,<rate0>,…,<rate15>,<bolus>, !`                           | `eVOLVER_module.update_chemo` (lines 92–101)     |
+
+Note: `extras/pump_rs485.py` also sends a bare `st !` between commands; its meaning isn't documented in the legacy and the Arduino firmware source is not available, so treat it as undefined behaviour.
 
 ## Current software architecture (being replaced)
 
@@ -112,10 +123,10 @@ Arduino ──RS485──> exp_manager ──writes──> data file ──read 
 ```
 
 Config files (written by UDP servers, consumed by exp_manager):
-- `fan_config.txt` — stir PWM values
-- `temp_config.txt` — temperature PWM values
-- `OD_config.txt` — OD LED power values
-- `fluid_config.txt` — pump commands
+- `fan_config.txt` — stir PWM values (overwritten each UDP write)
+- `temp_config.txt` — temperature setpoint values (overwritten each UDP write)
+- `OD_config.txt` — OD LED power values (overwritten each UDP write)
+- `fluid_config.txt` — pump commands, **appended** by UDP_FLUIDICS (queue). exp_manager drains up to 3 lines per loop iteration and `delete_line()`s each. This is the one config file that behaves as a queue rather than a single-slot mailbox.
 
 Data files (written by exp_manager, read by UDP servers):
 - `temp_data.txt` — raw ADC temperature readings (16 values, comma-separated)
@@ -128,7 +139,7 @@ All files are in `/home/pi/eVOLVER_UDP/`.
 | Port | Process       | Subsystem  | Responds? | Notes                                        |
 |------|---------------|------------|-----------|----------------------------------------------|
 | 5551 | UDP_FAN       | Stir       | No        | Write-only, response line is commented out    |
-| 5552 | UDP_FLUIDICS  | Fluidics   | Yes       | Returns "Message Recieved" (sic)              |
+| 5552 | UDP_FLUIDICS  | Fluidics   | Yes (UDP) | UDP server replies "Message Recieved" (sic); the RS485/Arduino side is write-only |
 | 5553 | UDP_TEMP      | Temperature| Yes       | Non-'clear' msg: writes config, returns data  |
 | 5554 | UDP_OD        | OD         | Yes       | Non-'clear' msg: writes config, returns data  |
 
@@ -168,8 +179,10 @@ Each function:
 
 ### Temperature calibration (`temp_calibration.txt`)
 - 2 rows x 16 columns (slope and intercept per vial)
-- Conversion: `temp_celsius = (raw_adc * slope[vial]) + intercept[vial]`
-- Inverse (for setting): `pwm_value = (target_celsius - intercept[vial]) / slope[vial]`
+- Row 0 = slopes (typically ≈ −0.11, **negative**), Row 1 = intercepts (typically ≈ 80–86)
+- Reading (raw thermistor ADC → °C): `temp_celsius = (raw_adc * slope[vial]) + intercept[vial]`
+- Setting (target °C → `xr` setpoint integer): `setpoint = (target_celsius - intercept[vial]) / slope[vial]`
+- Because slope is negative, **larger setpoint corresponds to a colder target**. The Arduino's closed loop drives the heater PWM until the thermistor ADC reading reaches this setpoint, so the `xr` value is best thought of as a "target ADC reading," not as a PWM duty cycle. See the warning at the top of the Testing section.
 
 ### OD calibration (`OD_cal.txt`)
 - 4 rows x 16 columns
@@ -177,11 +190,14 @@ Each function:
 ```python
 OD = od_cal[2,vial] - (log10((od_cal[1,vial] - od_cal[0,vial]) / (raw_adc - od_cal[0,vial]) - 1)) / od_cal[3,vial]
 ```
-- Row 0: dark reading (LEDs off)
-- Row 1: saturation reading (LEDs on, no culture)
-- Row 2, Row 3: curve fit parameters
+- Row 0: dark reading — ADC value when LEDs are off (lower asymptote of the sigmoid)
+- Row 1: saturation reading — ADC value with LEDs on and no culture present (upper asymptote)
+- Row 2: OD value at the sigmoid inflection point (the centre of the calibration curve)
+- Row 3: Hill coefficient — slope/steepness of the logistic (larger = sharper transition)
 
 ## Pump command format
+
+Each Mac-side `MESSAGE` shown below is the *payload* written into `fluid_config.txt`. exp_manager prepends the address prefix `st` before sending over RS485, so e.g. payload `t,11…,0,…` goes on the wire as `stt,11…,0,…, !`.
 
 ```python
 # Binary addressing: each pump has a power-of-2 address
@@ -189,16 +205,29 @@ control = np.power(2, range(0, 32))
 # Vial N influx: control[N] = 2^N
 # Vial N efflux: control[N+16] = 2^(N+16)
 
-# Command to run both influx and efflux for vial 0 for 10 seconds:
+# --- Single-fire sub-mode (wire: st<binary>,0,<sec>, !) ---
+
+# Both influx and efflux for vial 0 for 10 seconds:
 MESSAGE = "{0:b}".format(control[0] + control[16]) + ",0,10,"
-# = "10000000000000001,0,10,"
+# payload = "10000000000000001,0,10,"  →  wire = "st10000000000000001,0,10, !"
 
 # Efflux only for vial 0 for 5 seconds:
 MESSAGE = "{0:b}".format(control[16]) + ",0,5,"
-# = "10000000000000000,0,5,"
+# payload = "10000000000000000,0,5,"  →  wire = "st10000000000000000,0,5, !"
 
-# Stop all pumps:
+# --- Stop / multi-fire sub-mode (wire: stt,<32-bit mask>,<16 times>, !) ---
+
+# Stop all pumps (mask all-ones, all times zero):
 MESSAGE = "t,11111111111111111111111111111111,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,"
+# wire = "stt,<32 ones>,<16 zeros>, !"
+# Sub-prefix "t," tells the pump Arduino "this is the multi-fire/all-stop form."
+
+# --- Chemostat sub-mode (wire: stc,<16 rates>,<bolus>, !) ---
+
+# Set continuous chemostat rates per vial plus a bolus volume:
+MESSAGE = "c," + ",".join(str(int(r)) for r in chemo_rates) + "," + str(int(bolus)) + ","
+# wire = "stc,<r0>,<r1>,…,<r15>,<bolus>, !"
+# See `eVOLVER_module.update_chemo` for the exact dispatch in legacy code.
 ```
 
 ## Turbidostat control logic (from custom_script.py)
@@ -212,12 +241,14 @@ Key parameters:
 - `time_out` — extra seconds for efflux pump to prevent overflow (default: 5)
 
 Algorithm per vial per cycle:
-1. Average the last 5 OD readings
+0. Warmup gate: dormant until `len(OD_history) > 7` — turbidostat does nothing for the first 8 measurement cycles (`custom_script.py:83`).
+1. Average the last 5 OD readings (most recent 5, equal weight).
 2. Hysteresis: if avg OD > upper_thresh, set target = lower_thresh
-3. Hysteresis: if avg OD < midpoint, set target = upper_thresh (stop diluting)
+3. Hysteresis: if avg OD < midpoint, set target = upper_thresh (stop diluting). Midpoint = `lower_thresh + (upper_thresh - lower_thresh)/2`.
 4. If avg OD > current target:
    - Calculate pump time: `time_in = -(ln(lower_thresh/avg_OD) * volume) / flow_rate`
    - Cap at 20 seconds max
+   - Cast to integer seconds — the legacy formats `time_in` with `%d`, so sub-second pump targets truncate to 0 and no pump fires.
    - Check that `pump_wait` minutes have elapsed since last pump event
    - Fire influx + efflux for `time_in` seconds
    - Fire efflux alone for `time_out` additional seconds
@@ -286,10 +317,12 @@ python3 app.py  # or python app.py
 
 ## Testing
 
-- Stir: send address `zv` + 16 comma-separated PWM values + ` !`. Values 0-15 typical. 0=off.
-- Temperature: send address `xr` + 16 PWM values + ` !`. 0=off, 200=mild, 500=hot. Read response with prefix `temp`.
-- OD: send address `we` + 16 LED power values + ` !`. 2125 is standard. Read response with prefix `turb`.
-- Fluidics: send address `st` + pump binary code + ` !`. Verify water flows.
+> ⚠ **Heater control convention is inverted.** The `xr` value is **not a raw PWM** — it is a setpoint that the temperature Arduino's closed loop drives the thermistor ADC reading toward. The calibration slope is **negative**, so **lower `xr` = hotter target**. `xr=0` requests ~82 °C (heater pinned to MAX); `xr=4095` is unreachably cold and is the only definitive "off." Any code or doc that treats `xr` like a PWM (where 0 means off) is wrong.
+
+- Stir: send address `zv` + 16 comma-separated PWM values + ` !`. Values 0-15 typical. 0=off (this one really is a raw PWM).
+- Temperature: send address `xr` + 16 setpoint integers + ` !`. Practical operating range ≈ 400 (≈ 37 °C) to 700 (≈ 14 °C); 4095 = off; 0 = drive heater to ~82 °C (avoid). Read response with prefix `temp` (16 raw thermistor ADC values).
+- OD: send address `we` + 16 LED power values + ` !`. 2125 is standard. Read response with prefix `turb` (16 raw photodiode ADC values).
+- Fluidics: send address `st` + pump binary code + ` !`. Verify water flows. See "Fluidics sub-protocol" for the three command sub-modes.
 - All 16 vials have been hardware-verified as functional (stir, temp, OD, fluidics all pass).
 
 ## Repository structure
