@@ -1,0 +1,3340 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>eVOLVER Control</title>
+  <style>
+    :root {
+      --bg: #f5f7fa;
+      --card: #ffffff;
+      --border: #e5e7eb;
+      --border-strong: #d1d5db;
+      --text: #0f172a;
+      --text-muted: #64748b;
+      --text-faint: #94a3b8;
+
+      --status-ok: #16a34a;
+      --status-warn: #f97316;
+      --status-critical: #dc2626;
+      --status-idle: #94a3b8;
+      --status-info: #2563eb;
+
+      --danger: #dc2626;
+      --danger-hover: #b91c1c;
+      --danger-active: #991b1b;
+
+      --shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.04);
+      --shadow-md: 0 4px 12px rgba(15, 23, 42, 0.06);
+    }
+
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; height: 100%; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+                   Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      font-size: 14px;
+      line-height: 1.5;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+    }
+
+    /* ---------- Header ---------- */
+    header.app-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 24px;
+      padding: 14px 24px;
+      background: var(--card);
+      border-bottom: 1px solid var(--border);
+      position: sticky;
+      top: 0;
+      z-index: 50;
+    }
+    .brand {
+      display: flex;
+      align-items: baseline;
+      gap: 10px;
+      min-width: 0;
+    }
+    .brand h1 {
+      margin: 0;
+      font-size: 17px;
+      font-weight: 600;
+      letter-spacing: -0.01em;
+    }
+    .brand .subtitle {
+      color: var(--text-muted);
+      font-size: 13px;
+      white-space: nowrap;
+    }
+    .header-status {
+      display: flex;
+      align-items: center;
+      gap: 18px;
+      color: var(--text-muted);
+      font-size: 13px;
+      flex: 1;
+      justify-content: flex-end;
+    }
+    .conn {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      font-weight: 500;
+    }
+    .conn .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--status-idle);
+      transition: background 0.2s ease, box-shadow 0.2s ease;
+    }
+    .conn.connected .dot {
+      background: var(--status-ok);
+      box-shadow: 0 0 0 3px rgba(22, 163, 74, 0.15);
+    }
+    .conn.disconnected .dot {
+      background: var(--status-critical);
+      box-shadow: 0 0 0 3px rgba(220, 38, 38, 0.15);
+    }
+    .timestamp {
+      font-variant-numeric: tabular-nums;
+      color: var(--text-faint);
+    }
+
+    .btn-emergency {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      background: var(--danger);
+      color: #ffffff;
+      border: 1px solid var(--danger);
+      padding: 9px 18px;
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      border-radius: 6px;
+      cursor: pointer;
+      transition: background 0.15s ease, transform 0.05s ease,
+                  box-shadow 0.15s ease;
+      box-shadow: var(--shadow-sm);
+      white-space: nowrap;
+    }
+    .btn-emergency::before {
+      content: "";
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #fff;
+      box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.35);
+    }
+    .btn-emergency:hover {
+      background: var(--danger-hover);
+      border-color: var(--danger-hover);
+    }
+    .btn-emergency:active {
+      background: var(--danger-active);
+      transform: translateY(1px);
+    }
+    .btn-emergency:disabled {
+      opacity: 0.7;
+      cursor: progress;
+    }
+    .btn-emergency:focus-visible {
+      outline: 2px solid var(--danger);
+      outline-offset: 3px;
+    }
+
+    /* ---------- Main ---------- */
+    main {
+      max-width: 1280px;
+      margin: 0 auto;
+      padding: 24px;
+    }
+    .section-head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      margin: 0 4px 14px;
+    }
+    .section-title {
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      margin: 0;
+    }
+    .section-meta {
+      font-size: 12px;
+      color: var(--text-faint);
+      font-variant-numeric: tabular-nums;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+    }
+    @media (max-width: 980px) {
+      .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    @media (max-width: 460px) {
+      .grid { grid-template-columns: 1fr; }
+    }
+
+    /* ---------- Vial card ---------- */
+    .vial {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 14px 16px 16px;
+      box-shadow: var(--shadow-sm);
+      position: relative;
+      transition: border-color 0.2s ease, box-shadow 0.2s ease,
+                  transform 0.05s ease;
+    }
+    .vial:hover {
+      border-color: var(--border-strong);
+      box-shadow: var(--shadow-md);
+    }
+    .vial[data-status="critical"] {
+      border-color: var(--status-critical);
+      box-shadow: 0 0 0 1px var(--status-critical),
+                  0 4px 12px rgba(220, 38, 38, 0.12);
+    }
+    .vial[data-status="warn"] {
+      border-color: rgba(249, 115, 22, 0.55);
+    }
+
+    .vial-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 14px;
+    }
+    .vial-name {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text);
+      letter-spacing: -0.005em;
+    }
+    .vial-status {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--status-idle);
+      transition: background 0.2s ease, box-shadow 0.2s ease;
+      flex-shrink: 0;
+    }
+    .vial-status[data-status="ok"] {
+      background: var(--status-ok);
+      box-shadow: 0 0 0 3px rgba(22, 163, 74, 0.15);
+    }
+    .vial-status[data-status="warn"] {
+      background: var(--status-warn);
+      box-shadow: 0 0 0 3px rgba(249, 115, 22, 0.18);
+    }
+    .vial-status[data-status="critical"] {
+      background: var(--status-critical);
+      box-shadow: 0 0 0 3px rgba(220, 38, 38, 0.2);
+    }
+
+    .metric + .metric { margin-top: 10px; }
+    .metric-label {
+      display: block;
+      font-size: 10px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--text-faint);
+      margin-bottom: 2px;
+      font-weight: 600;
+    }
+    .metric-value {
+      font-family: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas,
+                   monospace;
+      font-variant-numeric: tabular-nums;
+      font-size: 19px;
+      font-weight: 500;
+      color: var(--text);
+      letter-spacing: -0.01em;
+      line-height: 1.2;
+    }
+    .metric-value .unit {
+      font-size: 12px;
+      color: var(--text-muted);
+      margin-left: 4px;
+      font-weight: 400;
+    }
+    .metric-value.placeholder {
+      color: var(--text-faint);
+      font-weight: 400;
+    }
+
+    /* ---------- Vial card click affordance ---------- */
+    .vial { cursor: pointer; }
+    .vial:focus-visible {
+      outline: 2px solid var(--status-info);
+      outline-offset: 2px;
+    }
+
+    /* ---------- Modal ---------- */
+    .modal-backdrop {
+      position: fixed;
+      inset: 0;
+      background: rgba(15, 23, 42, 0.45);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 80;
+      padding: 24px;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.15s ease;
+    }
+    .modal-backdrop.open {
+      opacity: 1;
+      pointer-events: auto;
+    }
+    .modal {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      box-shadow: 0 20px 50px rgba(15, 23, 42, 0.18);
+      width: min(520px, 100%);
+      max-height: calc(100vh - 48px);
+      overflow-y: auto;
+      transform: translateY(8px);
+      transition: transform 0.15s ease;
+    }
+    .modal-backdrop.open .modal { transform: translateY(0); }
+
+    .modal-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 16px 20px;
+      border-bottom: 1px solid var(--border);
+    }
+    .modal-header h2 {
+      margin: 0;
+      font-size: 16px;
+      font-weight: 600;
+    }
+    .modal-close {
+      appearance: none;
+      background: transparent;
+      border: 0;
+      font-size: 22px;
+      line-height: 1;
+      color: var(--text-muted);
+      cursor: pointer;
+      padding: 4px 8px;
+      border-radius: 4px;
+    }
+    .modal-close:hover { background: var(--bg); color: var(--text); }
+    .modal-close:focus-visible {
+      outline: 2px solid var(--status-info);
+      outline-offset: 2px;
+    }
+
+    .modal-body { padding: 18px 20px 20px; }
+
+    .modal-readings {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+      padding: 12px 14px;
+      background: var(--bg);
+      border-radius: 8px;
+      margin-bottom: 18px;
+    }
+    .modal-readings .metric-label { margin-bottom: 4px; }
+    .modal-readings .metric-value { font-size: 17px; }
+
+    .control-block {
+      padding: 14px 0;
+      border-top: 1px solid var(--border);
+    }
+    .control-block:first-of-type { border-top: 0; padding-top: 0; }
+    .control-block h3 {
+      margin: 0 0 10px;
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+    .slider-row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .slider-row input[type="range"] {
+      flex: 1;
+      accent-color: var(--status-info);
+    }
+    .slider-value {
+      min-width: 72px;
+      text-align: right;
+      font-family: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+      font-variant-numeric: tabular-nums;
+      font-size: 14px;
+      font-weight: 500;
+    }
+    .slider-meta {
+      display: block;
+      margin-top: 4px;
+      font-size: 11px;
+      color: var(--text-faint);
+      font-variant-numeric: tabular-nums;
+    }
+
+    .control-actions {
+      display: flex;
+      gap: 8px;
+      margin-top: 10px;
+    }
+    .btn {
+      appearance: none;
+      border: 1px solid var(--border-strong);
+      background: var(--card);
+      color: var(--text);
+      padding: 8px 14px;
+      font-size: 13px;
+      font-weight: 500;
+      border-radius: 6px;
+      cursor: pointer;
+      transition: background 0.15s ease, border-color 0.15s ease;
+    }
+    .btn:hover { background: var(--bg); }
+    .btn:focus-visible {
+      outline: 2px solid var(--status-info);
+      outline-offset: 2px;
+    }
+    .btn:disabled { opacity: 0.6; cursor: not-allowed; }
+    .btn-primary {
+      background: var(--status-info);
+      border-color: var(--status-info);
+      color: #ffffff;
+    }
+    .btn-primary:hover {
+      background: #1d4ed8;
+      border-color: #1d4ed8;
+    }
+
+    .pump-row {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 10px 12px;
+      align-items: center;
+    }
+    .pump-row label {
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+    .pump-row input[type="number"] {
+      width: 100%;
+      padding: 7px 10px;
+      border: 1px solid var(--border-strong);
+      border-radius: 6px;
+      font-size: 13px;
+      font-family: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+      font-variant-numeric: tabular-nums;
+    }
+    .pump-buttons {
+      grid-column: 1 / -1;
+      display: flex;
+      gap: 8px;
+      margin-top: 4px;
+    }
+    .pump-buttons .btn { flex: 1; }
+
+    /* ---------- Toast ---------- */
+    .toast {
+      position: fixed;
+      bottom: 28px;
+      left: 50%;
+      transform: translateX(-50%) translateY(16px);
+      padding: 11px 18px;
+      background: var(--text);
+      color: #ffffff;
+      border-radius: 6px;
+      font-size: 13px;
+      font-weight: 500;
+      box-shadow: var(--shadow-md);
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.2s ease, transform 0.2s ease;
+      z-index: 100;
+      max-width: calc(100% - 48px);
+    }
+    .toast.show {
+      opacity: 1;
+      transform: translateX(-50%) translateY(0);
+    }
+    .toast.ok { background: var(--status-ok); }
+    .toast.error { background: var(--danger); }
+
+    /* ---------- Experiment section (below the vial grid) ---------- */
+    .exp-section {
+      margin-top: 24px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      box-shadow: var(--shadow-sm);
+      overflow: hidden;
+    }
+    .exp-section .exp-section-head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      padding: 12px 18px 8px;
+    }
+    .exp-section .exp-section-title {
+      margin: 0;
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+    .exp-bar {
+      padding: 10px 18px 14px;
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      font-size: 13px;
+    }
+    .exp-bar .dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--status-idle);
+      flex-shrink: 0;
+      transition: background 0.2s ease, box-shadow 0.2s ease;
+    }
+    .exp-bar[data-status="running"] .dot {
+      background: var(--status-info);
+      box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.18);
+    }
+    .exp-bar[data-status="error"] .dot {
+      background: var(--status-critical);
+      box-shadow: 0 0 0 3px rgba(220, 38, 38, 0.18);
+    }
+    .exp-bar[data-status="created"] .dot {
+      background: var(--status-warn);
+      box-shadow: 0 0 0 3px rgba(249, 115, 22, 0.18);
+    }
+    .exp-bar-text { flex: 1; color: var(--text); }
+    .exp-bar-text strong { font-weight: 600; }
+    .exp-bar-text .muted { color: var(--text-muted); }
+    .exp-bar-text .pump-count {
+      font-family: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+      font-variant-numeric: tabular-nums;
+      color: var(--text);
+    }
+    .exp-bar-actions { display: flex; gap: 8px; }
+    .btn-danger {
+      background: var(--danger);
+      border-color: var(--danger);
+      color: #ffffff;
+    }
+    .btn-danger:hover {
+      background: var(--danger-hover);
+      border-color: var(--danger-hover);
+    }
+
+    /* ---------- "New experiment" header button ---------- */
+    .btn-header {
+      appearance: none;
+      background: var(--card);
+      border: 1px solid var(--border-strong);
+      color: var(--text);
+      padding: 8px 14px;
+      font-size: 13px;
+      font-weight: 500;
+      border-radius: 6px;
+      cursor: pointer;
+      transition: background 0.15s ease, border-color 0.15s ease;
+    }
+    .btn-header:hover { background: var(--bg); }
+    .btn-header:focus-visible {
+      outline: 2px solid var(--status-info);
+      outline-offset: 2px;
+    }
+
+    /* ---------- Locked vial card overlay ---------- */
+    .vial.locked {
+      border: 2px solid var(--status-info);
+      background: linear-gradient(0deg, rgba(37, 99, 235, 0.04),
+                                        rgba(37, 99, 235, 0.04)),
+                  var(--card);
+      /* Compensate for the thicker border so the card doesn't shift. */
+      padding: 13px 15px 15px;
+    }
+    .vial.locked::after {
+      content: "exp: " attr(data-exp);
+      position: absolute;
+      top: 7px;
+      right: 11px;
+      font-size: 10px;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--status-info);
+      background: rgba(37, 99, 235, 0.1);
+      padding: 2px 6px;
+      border-radius: 4px;
+    }
+
+    /* ---------- Pump-flash animation ---------- */
+    @keyframes pump-pulse {
+      0%   { box-shadow: 0 0 0 0 rgba(37, 99, 235, 0.55); }
+      40%  { box-shadow: 0 0 0 10px rgba(37, 99, 235, 0.0); }
+      100% { box-shadow: 0 0 0 0 rgba(37, 99, 235, 0.0); }
+    }
+    .vial.pump-flash {
+      animation: pump-pulse 1s ease-out;
+    }
+    .vial .pump-indicator {
+      position: absolute;
+      top: 7px;
+      right: 11px;
+      font-size: 10px;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: #ffffff;
+      background: var(--status-info);
+      padding: 2px 6px;
+      border-radius: 4px;
+      opacity: 0;
+      transition: opacity 0.15s ease;
+      pointer-events: none;
+    }
+    .vial .pump-indicator.show { opacity: 1; }
+    /* When both locked and pumping, the pump indicator overrides the
+       `exp:` label so the user sees the live event first. */
+    .vial.locked.pumping::after { content: none; }
+
+    /* ---------- Setup wizard modal ---------- */
+    .modal.large { width: min(680px, 100%); }
+    .wizard-steps {
+      display: flex;
+      gap: 6px;
+      padding: 12px 20px 0;
+      font-size: 11px;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+    .wizard-step {
+      flex: 1;
+      padding: 6px 4px;
+      border-bottom: 2px solid var(--border);
+      text-align: center;
+      font-weight: 500;
+    }
+    .wizard-step.active {
+      color: var(--status-info);
+      border-bottom-color: var(--status-info);
+    }
+    .wizard-step.done {
+      color: var(--status-ok);
+      border-bottom-color: var(--status-ok);
+    }
+    .wizard-pane { display: none; }
+    .wizard-pane.active { display: block; }
+
+    .field-row {
+      margin-bottom: 14px;
+    }
+    .field-row label.field-label {
+      display: block;
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--text-muted);
+      margin-bottom: 5px;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+    .field-row input[type="text"],
+    .field-row textarea {
+      width: 100%;
+      padding: 8px 11px;
+      border: 1px solid var(--border-strong);
+      border-radius: 6px;
+      font-size: 13px;
+      font-family: inherit;
+    }
+    .field-row textarea { resize: vertical; min-height: 60px; }
+    .field-help {
+      display: block;
+      font-size: 11px;
+      color: var(--text-faint);
+      margin-top: 4px;
+    }
+
+    /* Vial selection grid in wizard step 2 */
+    .vial-select-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 6px;
+    }
+    .vial-select-cell {
+      padding: 12px 8px;
+      border: 1px solid var(--border-strong);
+      border-radius: 6px;
+      background: var(--card);
+      font-size: 13px;
+      font-weight: 500;
+      cursor: pointer;
+      text-align: center;
+      user-select: none;
+      transition: background 0.1s ease, border-color 0.1s ease;
+    }
+    .vial-select-cell:hover { background: var(--bg); }
+    .vial-select-cell.selected {
+      background: rgba(37, 99, 235, 0.08);
+      border-color: var(--status-info);
+      color: var(--status-info);
+      font-weight: 600;
+    }
+    .vial-select-cell.locked-other {
+      opacity: 0.4;
+      cursor: not-allowed;
+      background: var(--bg);
+    }
+
+    /* Parameter sliders in wizard step 4 */
+    .param-row {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 4px 16px;
+      align-items: center;
+      padding: 10px 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .param-row:last-child { border-bottom: 0; }
+    .param-row .pl { font-size: 13px; font-weight: 500; }
+    .param-row .pv {
+      font-family: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+      font-size: 13px;
+      font-variant-numeric: tabular-nums;
+      color: var(--text);
+      min-width: 90px;
+      text-align: right;
+    }
+    .param-row input[type="range"] {
+      grid-column: 1 / -1;
+      accent-color: var(--status-info);
+      margin-top: 4px;
+    }
+
+    /* Mode picker (step 3) */
+    .mode-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 10px;
+    }
+    .mode-card {
+      padding: 14px;
+      border: 1px solid var(--border-strong);
+      border-radius: 8px;
+      background: var(--card);
+      cursor: pointer;
+      text-align: left;
+      font-size: 13px;
+      position: relative;
+    }
+    .mode-card.selected {
+      border-color: var(--status-info);
+      background: rgba(37, 99, 235, 0.05);
+    }
+    .mode-card[disabled] {
+      opacity: 0.55;
+      cursor: not-allowed;
+    }
+    .mode-card .mode-name {
+      font-weight: 600;
+      font-size: 14px;
+      margin-bottom: 4px;
+    }
+    .mode-card .phase-badge {
+      position: absolute;
+      top: 8px;
+      right: 10px;
+      font-size: 10px;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      padding: 2px 6px;
+      border-radius: 4px;
+      background: var(--bg);
+      color: var(--text-muted);
+    }
+
+    /* Review pane */
+    .review-block {
+      background: var(--bg);
+      padding: 12px 14px;
+      border-radius: 8px;
+      font-size: 13px;
+      line-height: 1.7;
+    }
+    .review-block dt { font-weight: 600; }
+    .review-block dt::after { content: ":"; }
+    .review-block dl {
+      margin: 0;
+      display: grid;
+      grid-template-columns: 130px 1fr;
+      gap: 6px 14px;
+    }
+
+    .wizard-footer {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 16px 20px;
+      border-top: 1px solid var(--border);
+    }
+    .wizard-footer .right { display: flex; gap: 8px; }
+
+    /* ---------- Media wizard + dashboard ---------- */
+    .bottle-list {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .bottle-row {
+      display: grid;
+      grid-template-columns: 14px 1fr 1fr 110px 36px;
+      gap: 8px;
+      align-items: center;
+      padding: 10px;
+      border: 1px solid var(--border-strong);
+      border-radius: 6px;
+      background: var(--card);
+    }
+    .bottle-row .swatch {
+      width: 14px;
+      height: 14px;
+      border-radius: 50%;
+      border: 1px solid rgba(15, 23, 42, 0.12);
+    }
+    .bottle-row input[type="text"],
+    .bottle-row input[type="number"] {
+      width: 100%;
+      padding: 6px 8px;
+      border: 1px solid var(--border-strong);
+      border-radius: 4px;
+      font-size: 13px;
+    }
+    .bottle-row input[type="number"] {
+      font-variant-numeric: tabular-nums;
+      font-family: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+    }
+    .bottle-row .remove {
+      appearance: none;
+      background: transparent;
+      border: 1px solid var(--border-strong);
+      color: var(--text-muted);
+      width: 32px;
+      height: 32px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 16px;
+      line-height: 1;
+    }
+    .bottle-row .remove:hover {
+      color: var(--danger);
+      border-color: var(--danger);
+    }
+    .add-bottle {
+      margin-top: 10px;
+      font-size: 13px;
+    }
+
+    /* Vial-to-bottle assignment grid */
+    .vial-bottle-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 6px;
+    }
+    .vial-bottle-cell {
+      padding: 12px 8px;
+      border: 1px solid var(--border-strong);
+      border-radius: 6px;
+      background: var(--card);
+      font-size: 13px;
+      font-weight: 500;
+      cursor: pointer;
+      text-align: center;
+      user-select: none;
+      position: relative;
+      transition: background 0.1s ease, border-color 0.1s ease;
+    }
+    .vial-bottle-cell:hover { background: var(--bg); }
+    .vial-bottle-cell .vial-name {
+      display: block;
+      margin-bottom: 4px;
+    }
+    .vial-bottle-cell .bottle-tag {
+      display: block;
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--text-muted);
+      letter-spacing: 0.02em;
+    }
+    .vial-bottle-cell.assigned {
+      color: var(--text);
+    }
+    .vial-bottle-cell.assigned .bottle-tag { color: inherit; }
+    .vial-bottle-cell.locked-other {
+      opacity: 0.4;
+      cursor: not-allowed;
+      background: var(--bg);
+    }
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px 18px;
+      padding: 10px 0 4px;
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+    .legend .swatch {
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      display: inline-block;
+      margin-right: 6px;
+      vertical-align: -1px;
+      border: 1px solid rgba(15, 23, 42, 0.12);
+    }
+
+    /* Waste step */
+    .waste-row {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      align-items: center;
+      gap: 4px 16px;
+      padding: 10px 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .waste-row:last-child { border-bottom: 0; }
+    .waste-row .pl { font-size: 13px; font-weight: 500; }
+    .waste-row input[type="text"],
+    .waste-row input[type="number"] {
+      grid-column: 1 / -1;
+      padding: 8px 11px;
+      border: 1px solid var(--border-strong);
+      border-radius: 6px;
+      font-size: 13px;
+      font-family: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+      font-variant-numeric: tabular-nums;
+    }
+    .waste-row input[type="text"] { font-family: inherit; }
+
+    /* Dashboard media panel */
+    .media-panel {
+      padding: 10px 18px 14px;
+      border-top: 1px solid var(--border);
+      display: none;   /* shown only when an experiment with media is loaded */
+    }
+    .media-panel.show { display: block; }
+    .media-panel h3 {
+      margin: 0 0 10px;
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+    .media-row {
+      display: grid;
+      grid-template-columns: 14px 130px 1fr 120px;
+      gap: 10px;
+      align-items: center;
+      padding: 4px 0;
+      font-size: 13px;
+    }
+    .media-row .swatch {
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      border: 1px solid rgba(15, 23, 42, 0.12);
+    }
+    .media-row .label {
+      color: var(--text);
+      font-weight: 500;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .media-row .bar {
+      height: 8px;
+      background: var(--bg);
+      border-radius: 4px;
+      overflow: hidden;
+    }
+    .media-row .fill {
+      height: 100%;
+      background: var(--status-info);
+      transition: width 0.3s ease;
+    }
+    .media-row.bottle.warn .fill { background: var(--status-warn); }
+    .media-row.waste .fill { background: var(--text-muted); }
+    .media-row.waste.warn .fill { background: var(--status-warn); }
+    .media-row .num {
+      font-family: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+      font-variant-numeric: tabular-nums;
+      font-size: 12px;
+      color: var(--text-muted);
+      text-align: right;
+    }
+
+    /* Dashboard morbidostat panel */
+    .morbidostat-panel {
+      padding: 10px 18px 14px;
+      border-top: 1px solid var(--border);
+      display: none;
+    }
+    .morbidostat-panel.show { display: block; }
+    .morbidostat-panel h3 {
+      margin: 0 0 10px;
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+    .morb-row {
+      display: grid;
+      grid-template-columns: 80px 100px 110px 1fr;
+      gap: 10px;
+      align-items: center;
+      padding: 6px 8px;
+      margin: 4px 0;
+      font-size: 13px;
+      border: 1px solid transparent;
+      border-radius: 6px;
+      transition: border-color 0.2s ease, background 0.2s ease;
+    }
+    .morb-row.pending {
+      border-color: var(--status-warn);
+      background: rgba(245, 158, 11, 0.08);
+    }
+    .morb-row .label { font-weight: 500; }
+    .morb-row .num {
+      font-family: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+      font-variant-numeric: tabular-nums;
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+    .morb-row .escalate-btn {
+      justify-self: end;
+    }
+
+    /* ---------- Maintenance banner ---------- */
+    .maint-banner {
+      position: sticky;
+      top: 56px;  /* sits just under the app-header */
+      z-index: 45;
+      display: none;
+      align-items: center;
+      gap: 14px;
+      padding: 10px 24px;
+      background: var(--status-warn);
+      color: #ffffff;
+      font-size: 13px;
+      font-weight: 600;
+      border-bottom: 1px solid rgba(0, 0, 0, 0.08);
+      box-shadow: 0 1px 4px rgba(15, 23, 42, 0.1);
+    }
+    .maint-banner.show { display: flex; }
+    .maint-banner .icon {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 22px;
+      height: 22px;
+      border-radius: 50%;
+      background: rgba(255, 255, 255, 0.2);
+      flex-shrink: 0;
+    }
+    .maint-banner .text { flex: 1; }
+    .maint-banner .countdown {
+      font-family: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+      font-variant-numeric: tabular-nums;
+      opacity: 0.9;
+    }
+    .maint-banner .actions { display: flex; gap: 8px; }
+    .maint-banner .btn {
+      background: rgba(255, 255, 255, 0.95);
+      color: var(--status-warn);
+      border-color: rgba(255, 255, 255, 0.95);
+    }
+    .maint-banner .btn:hover {
+      background: #ffffff;
+    }
+    .maint-banner .btn-light {
+      background: transparent;
+      color: #ffffff;
+      border-color: rgba(255, 255, 255, 0.55);
+    }
+    .maint-banner .btn-light:hover {
+      background: rgba(255, 255, 255, 0.15);
+    }
+
+    /* ---------- Refill modal ---------- */
+    .refill-row {
+      display: grid;
+      grid-template-columns: 14px 1fr 110px 90px;
+      gap: 10px;
+      align-items: center;
+      padding: 8px 10px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      margin-bottom: 8px;
+    }
+    .refill-row .swatch {
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      border: 1px solid rgba(15, 23, 42, 0.12);
+    }
+    .refill-row .label {
+      font-size: 13px;
+      font-weight: 500;
+    }
+    .refill-row .label .muted {
+      display: block;
+      font-size: 11px;
+      font-weight: 400;
+      color: var(--text-muted);
+      margin-top: 2px;
+    }
+    .refill-row input[type="number"] {
+      width: 100%;
+      padding: 6px 8px;
+      border: 1px solid var(--border-strong);
+      border-radius: 4px;
+      font-size: 13px;
+      font-family: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+      font-variant-numeric: tabular-nums;
+    }
+    .refill-row .mark-full {
+      font-size: 11px;
+      padding: 4px 8px;
+    }
+    .refill-actions {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      margin-top: 14px;
+      padding-top: 14px;
+      border-top: 1px solid var(--border);
+    }
+    .refill-actions .right { display: flex; gap: 8px; }
+
+    /* Bottle-color dot on locked vial cards */
+    .vial .bottle-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      border: 1px solid rgba(15, 23, 42, 0.12);
+      display: inline-block;
+      margin-right: 6px;
+      vertical-align: -1px;
+    }
+
+    /* Locked-modal note */
+    .locked-note {
+      background: rgba(37, 99, 235, 0.08);
+      color: var(--status-info);
+      padding: 10px 12px;
+      border-radius: 6px;
+      font-size: 13px;
+      margin-bottom: 14px;
+      display: none;
+    }
+    .locked-note.show { display: block; }
+    .locked-note + .control-block .control-actions .btn,
+    .locked-note + .control-block + .control-block .control-actions .btn,
+    .locked-note + .control-block + .control-block + .control-block .pump-buttons .btn,
+    .locked-note + .control-block + .control-block + .control-block input,
+    .locked-note + .control-block input,
+    .locked-note + .control-block + .control-block input {
+      pointer-events: none;
+      opacity: 0.6;
+    }
+  </style>
+</head>
+<body>
+  <header class="app-header" role="banner">
+    <div class="brand">
+      <h1>eVOLVER</h1>
+      <span class="subtitle">Control System</span>
+    </div>
+    <div class="header-status">
+      <span class="conn disconnected" id="conn" aria-live="polite">
+        <span class="dot" aria-hidden="true"></span>
+        <span class="conn-text">Connecting…</span>
+      </span>
+      <span class="timestamp" id="last-update" title="Last sensor update">—</span>
+    </div>
+    <button id="new-experiment"
+            class="btn-header"
+            type="button"
+            aria-label="Set up a new experiment">
+      + New Experiment
+    </button>
+    <button id="emergency"
+            class="btn-emergency"
+            type="button"
+            aria-label="Emergency stop — zero all actuators immediately">
+      Emergency Stop
+    </button>
+  </header>
+
+  <div class="maint-banner" id="maint-banner" role="status" aria-live="polite">
+    <span class="icon" aria-hidden="true">⏸</span>
+    <span class="text">
+      <strong>MAINTENANCE MODE</strong> — pumps disabled.
+      <span class="countdown" id="maint-countdown"></span>
+    </span>
+    <span class="actions">
+      <button class="btn btn-light" id="maint-refill-btn" type="button">Update levels</button>
+      <button class="btn" id="maint-resume-btn" type="button">Resume</button>
+    </span>
+  </div>
+
+  <main>
+    <div class="section-head">
+      <h2 class="section-title">Vials</h2>
+      <span class="section-meta" id="grid-meta">16 vials</span>
+    </div>
+    <section class="grid" id="grid" aria-label="Vial sensor readings"></section>
+
+    <section class="exp-section" aria-labelledby="exp-section-title">
+      <div class="exp-section-head">
+        <h2 class="exp-section-title" id="exp-section-title">Experiment</h2>
+      </div>
+      <div class="exp-bar" id="exp-bar" data-status="idle" role="status">
+        <span class="dot" aria-hidden="true"></span>
+        <span class="exp-bar-text" id="exp-bar-text">
+          <span class="muted">No experiment running.</span>
+        </span>
+        <span class="exp-bar-actions" id="exp-bar-actions"></span>
+      </div>
+      <div class="media-panel" id="media-panel">
+        <h3>Media</h3>
+        <div id="media-rows"></div>
+      </div>
+      <div class="morbidostat-panel" id="morbidostat-panel" hidden>
+        <h3>Morbidostat</h3>
+        <div id="morbidostat-rows"></div>
+      </div>
+    </section>
+  </main>
+
+  <div class="modal-backdrop" id="vial-modal" hidden>
+    <div class="modal"
+         role="dialog"
+         aria-modal="true"
+         aria-labelledby="modal-title">
+      <div class="modal-header">
+        <h2 id="modal-title">Vial</h2>
+        <button class="modal-close"
+                id="modal-close"
+                type="button"
+                aria-label="Close detail panel">×</button>
+      </div>
+      <div class="modal-body">
+        <div class="modal-readings">
+          <div class="metric">
+            <span class="metric-label">Temperature</span>
+            <div class="metric-value placeholder" id="modal-temp">—<span class="unit">°C</span></div>
+          </div>
+          <div class="metric">
+            <span class="metric-label">Optical Density</span>
+            <div class="metric-value placeholder" id="modal-od">—</div>
+          </div>
+        </div>
+
+        <section class="control-block">
+          <h3>Temperature setpoint</h3>
+          <div class="slider-row">
+            <input type="range"
+                   id="temp-slider"
+                   min="22" max="45" step="0.5" value="37"
+                   aria-label="Temperature setpoint in degrees Celsius">
+            <span class="slider-value" id="temp-slider-value">37.0 °C</span>
+          </div>
+          <span class="slider-meta" id="temp-slider-meta">xr setpoint: 0 (currently off)</span>
+          <div class="control-actions">
+            <button class="btn btn-primary" id="apply-temp" type="button">Apply Temperature</button>
+          </div>
+        </section>
+
+        <section class="control-block">
+          <h3>Stir speed</h3>
+          <div class="slider-row">
+            <input type="range"
+                   id="stir-slider"
+                   min="0" max="15" step="1" value="0"
+                   aria-label="Stir speed">
+            <span class="slider-value" id="stir-slider-value">0</span>
+          </div>
+          <span class="slider-meta" id="stir-slider-meta">currently 0</span>
+          <div class="control-actions">
+            <button class="btn btn-primary" id="apply-stir" type="button">Apply Stir</button>
+          </div>
+        </section>
+
+        <section class="control-block">
+          <h3>Pumps</h3>
+          <div class="pump-row">
+            <label for="pump-seconds">Duration (s)</label>
+            <input type="number"
+                   id="pump-seconds"
+                   min="0.1" max="60" step="0.1" value="5">
+            <div class="pump-buttons">
+              <button class="btn" id="pump-influx" type="button">Run Influx</button>
+              <button class="btn" id="pump-efflux" type="button">Run Efflux</button>
+            </div>
+          </div>
+        </section>
+      </div>
+    </div>
+  </div>
+
+  <!-- ---------- Refill modal (maintenance mode) ---------- -->
+  <div class="modal-backdrop" id="refill-modal" hidden>
+    <div class="modal"
+         role="dialog"
+         aria-modal="true"
+         aria-labelledby="refill-modal-title">
+      <div class="modal-header">
+        <h2 id="refill-modal-title">Update levels</h2>
+        <button class="modal-close"
+                id="refill-modal-close"
+                type="button"
+                aria-label="Close levels form">×</button>
+      </div>
+      <div class="modal-body">
+        <p class="field-help" style="margin: 0 0 12px;">
+          Set the current remaining volume for each bottle and the waste fill
+          level. Useful when you refill a bottle or empty the carboy.
+        </p>
+        <div id="refill-bottles"></div>
+        <div id="refill-waste"></div>
+        <div class="refill-actions">
+          <button class="btn" id="refill-cancel" type="button">Cancel</button>
+          <span class="right">
+            <button class="btn btn-primary" id="refill-apply" type="button">Apply</button>
+            <button class="btn btn-primary" id="refill-apply-resume" type="button">Apply & Resume</button>
+          </span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ---------- Morbidostat escalation confirmation modal ---------- -->
+  <div class="modal-backdrop" id="escalation-modal" hidden>
+    <div class="modal"
+         role="dialog"
+         aria-modal="true"
+         aria-labelledby="escalation-modal-title">
+      <div class="modal-header">
+        <h2 id="escalation-modal-title">Confirm escalation</h2>
+        <button class="modal-close"
+                id="escalation-modal-close"
+                type="button"
+                aria-label="Close escalation form">×</button>
+      </div>
+      <div class="modal-body">
+        <p class="field-help" style="margin: 0 0 12px;">
+          The engine detected growth recovery on this vial. Physically swap
+          the bottle for higher-strength media, then record the new
+          concentration here.
+        </p>
+        <div id="escalation-summary" class="muted" style="margin-bottom: 12px;"></div>
+        <div class="field-row">
+          <label class="field-label" for="escalation-conc">New drug conc (x)</label>
+          <input type="number" id="escalation-conc" min="0.1" step="0.1" value="2.0">
+        </div>
+        <div class="field-row">
+          <label class="field-label" for="escalation-contents">New bottle contents (optional)</label>
+          <input type="text" id="escalation-contents"
+                 placeholder="e.g. LB + chloramphenicol 10 ug/mL"
+                 maxlength="256">
+        </div>
+        <div class="refill-actions">
+          <button class="btn" id="escalation-cancel" type="button">Cancel</button>
+          <span class="right">
+            <button class="btn btn-primary" id="escalation-apply" type="button">Confirm escalation</button>
+          </span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ---------- Experiment setup wizard (SPEC §11) ---------- -->
+  <div class="modal-backdrop" id="exp-modal" hidden>
+    <div class="modal large"
+         role="dialog"
+         aria-modal="true"
+         aria-labelledby="exp-modal-title">
+      <div class="modal-header">
+        <h2 id="exp-modal-title">New experiment</h2>
+        <button class="modal-close"
+                id="exp-modal-close"
+                type="button"
+                aria-label="Close setup wizard">×</button>
+      </div>
+      <div class="wizard-steps" id="wizard-steps">
+        <div class="wizard-step active" data-step="1">1 · Name</div>
+        <div class="wizard-step" data-step="2">2 · Media</div>
+        <div class="wizard-step" data-step="3">3 · Vials</div>
+        <div class="wizard-step" data-step="4">4 · Waste</div>
+        <div class="wizard-step" data-step="5">5 · Mode</div>
+        <div class="wizard-step" data-step="6">6 · Parameters</div>
+        <div class="wizard-step" data-step="7">7 · Review</div>
+      </div>
+      <div class="modal-body">
+        <div class="wizard-pane active" data-pane="1">
+          <div class="field-row">
+            <label class="field-label" for="exp-name">Experiment name</label>
+            <input type="text" id="exp-name"
+                   placeholder="adapt_001"
+                   autocomplete="off"
+                   maxlength="64">
+            <span class="field-help">
+              Letters, numbers, hyphens, and underscores only. Used as the directory name.
+            </span>
+          </div>
+          <div class="field-row">
+            <label class="field-label" for="exp-notes">Notes (optional)</label>
+            <textarea id="exp-notes" rows="3"
+                      placeholder="Strain, media, expected duration…"></textarea>
+          </div>
+        </div>
+        <div class="wizard-pane" data-pane="2">
+          <p class="field-help" style="margin: 0 0 12px;">
+            Define the media bottles. Each can feed one or more vials via the manifold.
+          </p>
+          <div class="bottle-list" id="bottle-list"></div>
+          <button class="btn add-bottle" id="add-bottle-btn" type="button">+ Add bottle</button>
+        </div>
+        <div class="wizard-pane" data-pane="3">
+          <p class="field-help" style="margin: 0 0 12px;">
+            Click a vial to cycle through media bottles. Vials assigned to a bottle are included in the experiment.
+          </p>
+          <div class="vial-bottle-grid" id="vial-bottle-grid"></div>
+          <div class="legend" id="vial-bottle-legend"></div>
+        </div>
+        <div class="wizard-pane" data-pane="4">
+          <div class="waste-row">
+            <div class="pl">Container name (optional)</div>
+            <input type="text" id="w-name" placeholder="Waste carboy" autocomplete="off">
+          </div>
+          <div class="waste-row">
+            <div class="pl">Capacity</div>
+            <input type="number" id="w-capacity" min="100" step="50" value="4000">
+          </div>
+          <div class="waste-row">
+            <div class="pl">Alert when filled above (mL)</div>
+            <input type="number" id="w-high" min="0" step="50" value="3600">
+          </div>
+        </div>
+        <div class="wizard-pane" data-pane="5">
+          <div class="mode-grid" id="mode-grid">
+            <button class="mode-card selected"
+                    type="button"
+                    data-mode="turbidostat">
+              <div class="mode-name">Turbidostat</div>
+              <div class="muted">Maintain OD between thresholds via dilution.</div>
+            </button>
+            <button class="mode-card" type="button" data-mode="chemostat">
+              <div class="mode-name">Chemostat</div>
+              <div class="muted">Constant dilution rate via fixed-interval boli.</div>
+            </button>
+            <button class="mode-card" type="button" data-mode="morbidostat">
+              <div class="mode-name">Morbidostat</div>
+              <div class="muted">Turbidostat dilution + manual drug-escalation prompts.</div>
+            </button>
+            <button class="mode-card" type="button" data-mode="growth_rate" disabled>
+              <div class="mode-name">Growth-rate feedback</div>
+              <div class="muted">PI control on growth-rate setpoint.</div>
+              <span class="phase-badge">Future</span>
+            </button>
+          </div>
+        </div>
+        <div class="wizard-pane" data-pane="6">
+          <div class="params-shared">
+            <div class="param-row">
+              <div class="pl">Temperature</div>
+              <div class="pv" id="pv-temp">37.0 °C</div>
+              <input type="range" id="p-temp" min="20" max="50" step="0.5" value="37">
+            </div>
+            <div class="param-row">
+              <div class="pl">Stir rate</div>
+              <div class="pv" id="pv-stir">10</div>
+              <input type="range" id="p-stir" min="0" max="15" step="1" value="10">
+            </div>
+            <div class="param-row">
+              <div class="pl">Vial volume</div>
+              <div class="pv" id="pv-vol">25 mL</div>
+              <input type="range" id="p-vol" min="10" max="40" step="1" value="25">
+            </div>
+          </div>
+          <div class="params-mode" data-params-mode="turbidostat">
+            <div class="param-row">
+              <div class="pl">Lower OD threshold</div>
+              <div class="pv" id="pv-lower">0.20</div>
+              <input type="range" id="p-lower" min="0.05" max="2.0" step="0.01" value="0.20">
+            </div>
+            <div class="param-row">
+              <div class="pl">Upper OD threshold</div>
+              <div class="pv" id="pv-upper">0.40</div>
+              <input type="range" id="p-upper" min="0.1" max="3.0" step="0.01" value="0.40">
+            </div>
+            <div class="param-row">
+              <div class="pl">Pump wait</div>
+              <div class="pv" id="pv-wait">15 min</div>
+              <input type="range" id="p-wait" min="5" max="60" step="1" value="15">
+            </div>
+          </div>
+          <div class="params-mode" data-params-mode="chemostat" hidden>
+            <div class="param-row">
+              <div class="pl">Dilution rate</div>
+              <div class="pv" id="pv-D">0.50 vol/hr</div>
+              <input type="range" id="p-D" min="0.05" max="5.0" step="0.05" value="0.50">
+            </div>
+            <div class="param-row">
+              <div class="pl">Bolus interval</div>
+              <div class="pv" id="pv-T">60 s</div>
+              <input type="range" id="p-T" min="10" max="600" step="10" value="60">
+            </div>
+          </div>
+          <div class="params-mode" data-params-mode="morbidostat" hidden>
+            <div class="param-row">
+              <div class="pl">Target OD</div>
+              <div class="pv" id="pv-target">0.40</div>
+              <input type="range" id="p-target" min="0.1" max="2.0" step="0.01" value="0.40">
+            </div>
+            <div class="param-row">
+              <div class="pl">Lower OD (dilution math)</div>
+              <div class="pv" id="pv-lowerm">0.20</div>
+              <input type="range" id="p-lowerm" min="0.05" max="2.0" step="0.01" value="0.20">
+            </div>
+            <div class="param-row">
+              <div class="pl">Pump wait</div>
+              <div class="pv" id="pv-waitm">15 min</div>
+              <input type="range" id="p-waitm" min="1" max="60" step="1" value="15">
+            </div>
+            <div class="param-row">
+              <div class="pl">Initial drug conc</div>
+              <div class="pv" id="pv-drugc">1.00x</div>
+              <input type="range" id="p-drugc" min="0.1" max="20" step="0.1" value="1.0">
+            </div>
+            <div class="param-row">
+              <div class="pl">Escalation step</div>
+              <div class="pv" id="pv-drugstep">2.0x</div>
+              <input type="range" id="p-drugstep" min="1.1" max="10" step="0.1" value="2.0">
+            </div>
+            <div class="param-row">
+              <div class="pl">Adaptation threshold</div>
+              <div class="pv" id="pv-muthresh">0.40 /hr</div>
+              <input type="range" id="p-muthresh" min="0.05" max="2.0" step="0.05" value="0.40">
+            </div>
+            <div class="param-row">
+              <div class="pl">Growth window</div>
+              <div class="pv" id="pv-growthwin">30 min</div>
+              <input type="range" id="p-growthwin" min="10" max="120" step="5" value="30">
+            </div>
+          </div>
+        </div>
+        <div class="wizard-pane" data-pane="7">
+          <div class="review-block">
+            <dl id="exp-review-dl"></dl>
+          </div>
+        </div>
+      </div>
+      <div class="wizard-footer">
+        <button class="btn" id="wizard-back" type="button" disabled>Back</button>
+        <div class="right">
+          <button class="btn" id="wizard-cancel" type="button">Cancel</button>
+          <button class="btn btn-primary" id="wizard-next" type="button">Next</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+  <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+  <script>
+    "use strict";
+
+    const N_VIALS = 16;
+    const grid = document.getElementById("grid");
+    const connEl = document.getElementById("conn");
+    const lastEl = document.getElementById("last-update");
+    const toastEl = document.getElementById("toast");
+    const emergencyBtn = document.getElementById("emergency");
+
+    // Cached setpoints + limits + calibration, fetched on connect.
+    // Slider POSTs send the full 16-value array per SPEC §6, so we maintain
+    // the array client-side and mutate only the open vial's slot.
+    //
+    // ``temperatureSetpointRaw`` is the INVERTED `xr` integer the Arduino
+    // last received (lower value = hotter target; HEATER_OFF_SETPOINT
+    // is parked off). Default is HEATER_OFF_SETPOINT (4095), NOT 0 —
+    // initialising to 0 would imply "heater pinned at ~82 C" under the
+    // real convention.
+    const HEATER_OFF_SETPOINT = 4095;
+    const actuatorState = {
+      temperatureSetpointRaw: new Array(N_VIALS).fill(HEATER_OFF_SETPOINT),
+      stir: new Array(N_VIALS).fill(0),
+      limits: {
+        temp_min_c: 22,
+        temp_max_c: 45,
+        heater_off_setpoint: HEATER_OFF_SETPOINT,
+        stir_max: 15,
+        pump_max_seconds: 60,
+      },
+      tempCalibration: null,   // {slope:[16], intercept:[16]} or null
+      loaded: false,
+    };
+
+    const modalState = { vial: null };
+    const modalEl = document.getElementById("vial-modal");
+    const modalTitle = document.getElementById("modal-title");
+    const modalTempEl = document.getElementById("modal-temp");
+    const modalOdEl = document.getElementById("modal-od");
+    const tempSlider = document.getElementById("temp-slider");
+    const tempSliderValue = document.getElementById("temp-slider-value");
+    const tempSliderMeta = document.getElementById("temp-slider-meta");
+    const stirSlider = document.getElementById("stir-slider");
+    const stirSliderValue = document.getElementById("stir-slider-value");
+    const stirSliderMeta = document.getElementById("stir-slider-meta");
+    const pumpSecondsEl = document.getElementById("pump-seconds");
+    const applyTempBtn = document.getElementById("apply-temp");
+    const applyStirBtn = document.getElementById("apply-stir");
+    const pumpInfluxBtn = document.getElementById("pump-influx");
+    const pumpEffluxBtn = document.getElementById("pump-efflux");
+    const modalCloseBtn = document.getElementById("modal-close");
+
+    // --- Build cards ---
+    for (let i = 0; i < N_VIALS; i++) {
+      const card = document.createElement("div");
+      card.className = "vial";
+      card.id = `vial-${i}`;
+      card.dataset.status = "idle";
+      card.dataset.vial = String(i);
+      card.tabIndex = 0;
+      card.setAttribute("role", "button");
+      card.setAttribute("aria-label", `Vial ${i} — open controls`);
+      card.innerHTML = `
+        <span class="pump-indicator" id="pump-ind-${i}" aria-hidden="true"></span>
+        <div class="vial-header">
+          <span class="vial-name">Vial ${i}</span>
+          <span class="vial-status"
+                data-status="idle"
+                id="status-${i}"
+                role="img"
+                aria-label="Status: idle"></span>
+        </div>
+        <div class="metric">
+          <span class="metric-label">Temperature</span>
+          <div class="metric-value placeholder" id="temp-${i}">—<span class="unit">°C</span></div>
+        </div>
+        <div class="metric">
+          <span class="metric-label">Optical Density</span>
+          <div class="metric-value placeholder" id="od-${i}">—</div>
+        </div>
+      `;
+      card.addEventListener("click", () => openVialModal(i));
+      card.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          openVialModal(i);
+        }
+      });
+      grid.appendChild(card);
+    }
+
+    // --- Status classification (SPEC §11 color system) ---
+    // No experiment setpoints in Phase 1, so we key the color off the
+    // safety-relevant temperature ranges rather than setpoint deviation.
+    function temperatureStatus(temp) {
+      if (temp == null || !Number.isFinite(temp)) return "idle";
+      if (temp >= 50) return "critical";          // SPEC §10 heater safety
+      if (temp >= 45 || temp < 15) return "warn"; // approaching limits
+      return "ok";
+    }
+
+    function setStatus(i, status) {
+      const dot = document.getElementById(`status-${i}`);
+      const card = document.getElementById(`vial-${i}`);
+      if (dot) {
+        dot.dataset.status = status;
+        dot.setAttribute("aria-label", `Status: ${status}`);
+      }
+      if (card) card.dataset.status = status;
+    }
+
+    // --- Formatting ---
+    function formatTime(iso) {
+      try {
+        const d = new Date(iso);
+        if (Number.isNaN(d.getTime())) return iso;
+        return d.toLocaleTimeString([], {
+          hour: "2-digit",
+          minute: "2-digit",
+          second: "2-digit",
+        });
+      } catch (_e) {
+        return iso;
+      }
+    }
+
+    // --- Latest sensor snapshot (used by modal too) ---
+    const latest = {
+      temperature: new Array(N_VIALS).fill(null),
+      od: new Array(N_VIALS).fill(null),
+    };
+
+    // --- Apply sensor update ---
+    function updateVials(msg) {
+      const temps = (msg.temperature && msg.temperature.calibrated) || [];
+      const ods = (msg.od && msg.od.calibrated) || [];
+      for (let i = 0; i < N_VIALS; i++) {
+        const t = temps[i];
+        const o = ods[i];
+        latest.temperature[i] = Number.isFinite(t) ? t : null;
+        latest.od[i] = Number.isFinite(o) ? o : null;
+        const tEl = document.getElementById(`temp-${i}`);
+        const oEl = document.getElementById(`od-${i}`);
+        if (Number.isFinite(t)) {
+          tEl.innerHTML = `${t.toFixed(2)}<span class="unit">°C</span>`;
+          tEl.classList.remove("placeholder");
+        }
+        if (Number.isFinite(o)) {
+          oEl.textContent = o.toFixed(3);
+          oEl.classList.remove("placeholder");
+        }
+        setStatus(i, temperatureStatus(t));
+      }
+      lastEl.textContent = formatTime(msg.timestamp);
+      if (modalState.vial !== null) renderModalReadings();
+
+      // Server includes a compact experiment summary on every sensor tick
+      // so the dashboard's status section updates without polling.
+      if (msg.experiment && msg.experiment.name) {
+        expState.name = msg.experiment.name;
+        expState.status = msg.experiment.status;
+        expState.vials = msg.experiment.vials || [];
+        if (typeof msg.experiment.elapsed_hours === "number") {
+          expState.elapsed_hours = msg.experiment.elapsed_hours;
+        }
+        // Authoritative maintenance state from the server keeps the banner
+        // countdown drift-free (the client-side ticker just fills the gap
+        // between 10 s updates).
+        if (msg.experiment.maintenance) {
+          expState.maintenance = msg.experiment.maintenance;
+        }
+        renderExpBar();
+        applyVialLocks();
+        renderMaintenanceBanner();
+        // Merge media-percent updates into the cached snapshot (full bottle
+        // metadata stays in expState.media from the /status fetch).
+        _applyMediaSummary(msg.experiment.media_summary);
+        if (Array.isArray(msg.experiment.escalation_pending_vials)) {
+          expState.escalationPendingVials = msg.experiment.escalation_pending_vials;
+        }
+        if (typeof msg.experiment.mode === "string") {
+          expState.mode = msg.experiment.mode;
+        }
+        renderMorbidostatPanel();
+      } else if (expState.name && !msg.experiment) {
+        // Server reports no loaded experiment but we still have state cached;
+        // a stop must have happened. Refresh from the authoritative source.
+        refreshExperimentStatus();
+      }
+    }
+
+    // --- Connection state ---
+    function setConnection(state) {
+      connEl.classList.remove("connected", "disconnected");
+      connEl.classList.add(state);
+      const text = state === "connected" ? "Live" : "Disconnected";
+      connEl.querySelector(".conn-text").textContent = text;
+    }
+
+    // --- Toast ---
+    let toastTimer = null;
+    function showToast(message, kind) {
+      toastEl.textContent = message;
+      toastEl.classList.remove("ok", "error");
+      if (kind) toastEl.classList.add(kind);
+      toastEl.classList.add("show");
+      clearTimeout(toastTimer);
+      toastTimer = setTimeout(() => toastEl.classList.remove("show"), 3500);
+    }
+
+    // --- Emergency stop ---
+    emergencyBtn.addEventListener("click", async () => {
+      emergencyBtn.disabled = true;
+      const originalText = emergencyBtn.textContent;
+      emergencyBtn.textContent = "Stopping…";
+      try {
+        const res = await fetch("/api/actuators/emergency_stop", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: "{}",
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          throw new Error(data.error || `HTTP ${res.status}`);
+        }
+        showToast(data.message || "All actuators zeroed", "ok");
+      } catch (err) {
+        showToast(`Emergency stop failed: ${err.message}`, "error");
+      } finally {
+        emergencyBtn.disabled = false;
+        emergencyBtn.textContent = originalText;
+      }
+    });
+
+    // --- Actuator state fetch ---
+    async function fetchActuatorState() {
+      try {
+        const res = await fetch("/api/actuators/state");
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        if (Array.isArray(data.temperature_setpoint_raw) &&
+            data.temperature_setpoint_raw.length === N_VIALS) {
+          actuatorState.temperatureSetpointRaw = data.temperature_setpoint_raw.slice();
+        }
+        if (Array.isArray(data.stir) && data.stir.length === N_VIALS) {
+          actuatorState.stir = data.stir.slice();
+        }
+        if (data.limits) Object.assign(actuatorState.limits, data.limits);
+        if (data.temp_calibration &&
+            Array.isArray(data.temp_calibration.slope) &&
+            Array.isArray(data.temp_calibration.intercept)) {
+          actuatorState.tempCalibration = data.temp_calibration;
+        }
+        actuatorState.loaded = true;
+        if (modalState.vial !== null) syncModalFromState(modalState.vial);
+      } catch (err) {
+        // Non-fatal: sliders default to zeros / 37 °C until user moves them.
+        console.warn("actuator state fetch failed:", err.message);
+      }
+    }
+
+    // --- °C ↔ raw setpoint conversion (per-vial linear calibration) ---
+    // CLAUDE.md / SPEC.md: raw = (target_C - intercept[vial]) / slope[vial]
+    //
+    // IMPORTANT: the calibration slope is NEGATIVE (~ -0.11), so a higher
+    // target °C yields a *smaller* raw integer. These helpers are only
+    // used for display — the slider POSTs `values_c` directly and the
+    // server does the conversion via the authoritative SerialManager
+    // calibration path.
+    //
+    // Uncalibrated fallback uses a representative negative-slope model
+    // (slope=-0.11, intercept=82). Pre-fix this fallback assumed a
+    // positive slope and would silently mis-calibrate.
+    const FALLBACK_SLOPE = -0.11;
+    const FALLBACK_INTERCEPT = 82;
+    function celsiusToRaw(vial, tempC) {
+      const cal = actuatorState.tempCalibration;
+      let slope = FALLBACK_SLOPE;
+      let intercept = FALLBACK_INTERCEPT;
+      if (cal && Number.isFinite(cal.slope[vial]) && cal.slope[vial] !== 0) {
+        slope = cal.slope[vial];
+        intercept = cal.intercept[vial];
+      }
+      return (tempC - intercept) / slope;
+    }
+    function rawToCelsius(vial, raw) {
+      const cal = actuatorState.tempCalibration;
+      let slope = FALLBACK_SLOPE;
+      let intercept = FALLBACK_INTERCEPT;
+      if (cal && Number.isFinite(cal.slope[vial])) {
+        slope = cal.slope[vial];
+        intercept = cal.intercept[vial];
+      }
+      return raw * slope + intercept;
+    }
+    function clampRaw(raw) {
+      return Math.max(0, Math.min(HEATER_OFF_SETPOINT, Math.round(raw)));
+    }
+    function isHeaterParkedOff(vial) {
+      const raw = actuatorState.temperatureSetpointRaw[vial] | 0;
+      return raw >= HEATER_OFF_SETPOINT;
+    }
+
+    // --- Modal ---
+    function renderModalReadings() {
+      const i = modalState.vial;
+      if (i === null) return;
+      const t = latest.temperature[i];
+      const o = latest.od[i];
+      if (Number.isFinite(t)) {
+        modalTempEl.innerHTML = `${t.toFixed(2)}<span class="unit">°C</span>`;
+        modalTempEl.classList.remove("placeholder");
+      } else {
+        modalTempEl.innerHTML = `—<span class="unit">°C</span>`;
+        modalTempEl.classList.add("placeholder");
+      }
+      if (Number.isFinite(o)) {
+        modalOdEl.textContent = o.toFixed(3);
+        modalOdEl.classList.remove("placeholder");
+      } else {
+        modalOdEl.textContent = "—";
+        modalOdEl.classList.add("placeholder");
+      }
+    }
+
+    function syncModalFromState(vial) {
+      // Convert the stored raw setpoint to Celsius via the calibration.
+      // If the heater is parked off (HEATER_OFF_SETPOINT) the converted
+      // Celsius is below ambient; default the slider to ambient in that
+      // case so it reflects the actual passive equilibrium rather than
+      // showing a nonsense sub-zero target. No "if raw === 0" special
+      // case — under the inverted convention raw=0 means ~82 C, not off.
+      const min = actuatorState.limits.temp_min_c ?? 22;
+      const max = actuatorState.limits.temp_max_c ?? 45;
+      let sliderC;
+      if (isHeaterParkedOff(vial)) {
+        sliderC = min;
+      } else {
+        const currentRaw = actuatorState.temperatureSetpointRaw[vial] | 0;
+        const currentC = rawToCelsius(vial, currentRaw);
+        sliderC = Math.max(min, Math.min(max, currentC));
+      }
+      tempSlider.value = sliderC.toFixed(1);
+      updateTempSliderDisplay();
+
+      const currentStir = actuatorState.stir[vial] | 0;
+      stirSlider.value = String(currentStir);
+      updateStirSliderDisplay();
+    }
+
+    function updateTempSliderDisplay() {
+      const i = modalState.vial;
+      const c = parseFloat(tempSlider.value);
+      tempSliderValue.textContent = `${c.toFixed(1)} °C`;
+      if (i === null) return;
+      const rawPreview = clampRaw(celsiusToRaw(i, c));
+      const currentRaw = actuatorState.temperatureSetpointRaw[i] | 0;
+      const calNote = actuatorState.tempCalibration ? "" : " (uncal)";
+      const currentLabel = currentRaw >= HEATER_OFF_SETPOINT
+        ? `off`
+        : `raw ${currentRaw}`;
+      tempSliderMeta.textContent =
+        `xr setpoint: ${rawPreview}${calNote} (currently ${currentLabel})`;
+    }
+
+    function updateStirSliderDisplay() {
+      const i = modalState.vial;
+      const v = parseInt(stirSlider.value, 10);
+      stirSliderValue.textContent = String(v);
+      if (i === null) {
+        stirSliderMeta.textContent = "";
+        return;
+      }
+      const current = actuatorState.stir[i] | 0;
+      stirSliderMeta.textContent = `currently ${current}`;
+    }
+
+    function openVialModal(vial) {
+      modalState.vial = vial;
+      modalTitle.textContent = `Vial ${vial}`;
+      modalEl.hidden = false;
+      // Reflow so the transition runs.
+      requestAnimationFrame(() => modalEl.classList.add("open"));
+      renderModalReadings();
+      syncModalFromState(vial);
+    }
+
+    function closeVialModal() {
+      modalState.vial = null;
+      modalEl.classList.remove("open");
+      // Wait for transition before hiding to avoid focus traps.
+      setTimeout(() => { if (!modalEl.classList.contains("open")) modalEl.hidden = true; }, 160);
+    }
+
+    modalCloseBtn.addEventListener("click", closeVialModal);
+    modalEl.addEventListener("click", (e) => {
+      if (e.target === modalEl) closeVialModal();
+    });
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && modalState.vial !== null) closeVialModal();
+    });
+    tempSlider.addEventListener("input", updateTempSliderDisplay);
+    stirSlider.addEventListener("input", updateStirSliderDisplay);
+
+    // --- Actuator POSTs ---
+    async function postJson(url, body) {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      return data;
+    }
+
+    applyTempBtn.addEventListener("click", async () => {
+      const i = modalState.vial;
+      if (i === null) return;
+      const c = parseFloat(tempSlider.value);
+      // Slider is the source of truth; the server converts °C -> raw via
+      // its loaded calibration. We build a 16-element values_c payload
+      // by reading back each vial's current setpoint as Celsius.
+      const values_c = actuatorState.temperatureSetpointRaw.map((raw, vial) =>
+        // For vials currently parked off, request ambient so the server's
+        // safety logic doesn't reject the array; the manager will translate
+        // ambient back to a near-off raw setpoint via the calibration.
+        raw >= HEATER_OFF_SETPOINT
+          ? (actuatorState.limits.temp_min_c ?? 22)
+          : Math.max(
+              actuatorState.limits.temp_min_c ?? 22,
+              Math.min(actuatorState.limits.temp_max_c ?? 45, rawToCelsius(vial, raw))
+            )
+      );
+      values_c[i] = c;
+      applyTempBtn.disabled = true;
+      const original = applyTempBtn.textContent;
+      applyTempBtn.textContent = "Applying…";
+      try {
+        const data = await postJson("/api/actuators/temperature", { values_c });
+        if (Array.isArray(data.temperature_setpoint_raw) &&
+            data.temperature_setpoint_raw.length === N_VIALS) {
+          actuatorState.temperatureSetpointRaw = data.temperature_setpoint_raw.slice();
+        }
+        updateTempSliderDisplay();
+        showToast(`Vial ${i}: heater set to ${c.toFixed(1)} °C`, "ok");
+      } catch (err) {
+        showToast(`Set temperature failed: ${err.message}`, "error");
+      } finally {
+        applyTempBtn.disabled = false;
+        applyTempBtn.textContent = original;
+      }
+    });
+
+    applyStirBtn.addEventListener("click", async () => {
+      const i = modalState.vial;
+      if (i === null) return;
+      const v = parseInt(stirSlider.value, 10);
+      const next = actuatorState.stir.slice();
+      next[i] = v;
+      applyStirBtn.disabled = true;
+      const original = applyStirBtn.textContent;
+      applyStirBtn.textContent = "Applying…";
+      try {
+        await postJson("/api/actuators/stir", { values: next });
+        actuatorState.stir = next;
+        updateStirSliderDisplay();
+        showToast(`Vial ${i}: stir set to ${v}`, "ok");
+      } catch (err) {
+        showToast(`Set stir failed: ${err.message}`, "error");
+      } finally {
+        applyStirBtn.disabled = false;
+        applyStirBtn.textContent = original;
+      }
+    });
+
+    async function firePump(direction) {
+      const i = modalState.vial;
+      if (i === null) return;
+      const seconds = parseFloat(pumpSecondsEl.value);
+      if (!Number.isFinite(seconds) || seconds <= 0) {
+        showToast("Pump duration must be > 0", "error");
+        return;
+      }
+      const btn = direction === "influx" ? pumpInfluxBtn : pumpEffluxBtn;
+      const original = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = "Running…";
+      try {
+        await postJson("/api/actuators/pump", { vial: i, direction, seconds });
+        showToast(`Vial ${i}: ${direction} for ${seconds}s`, "ok");
+      } catch (err) {
+        showToast(`Pump failed: ${err.message}`, "error");
+      } finally {
+        btn.disabled = false;
+        btn.textContent = original;
+      }
+    }
+    pumpInfluxBtn.addEventListener("click", () => firePump("influx"));
+    pumpEffluxBtn.addEventListener("click", () => firePump("efflux"));
+
+    // =================================================================
+    // Experiment state, status bar, vial locks, and setup wizard
+    // =================================================================
+
+    // Snapshot of the currently-loaded experiment, refreshed on connect
+    // and on every `experiment_event` from the server.
+    const expState = {
+      name: null,
+      status: "idle",    // idle / created / running / stopped / error
+      mode: null,        // turbidostat / chemostat / morbidostat
+      vials: [],
+      pumpCount: 0,      // counts pump events since the experiment started
+      media: null,       // {bottles: [...], vial_to_bottle: {...}, waste: {...}}
+                         // from /status — bottles get an index used for color lookup.
+      maintenance: null, // {active, entered_at, auto_resume_in_seconds, queued_pump_count}
+      morbidostat: null, // {per_vial: {"3": {drug_conc, growth_rate_per_hour, ...}}}
+      escalationPendingVials: [], // from sensor_update.experiment.escalation_pending_vials
+    };
+
+    const expBar = document.getElementById("exp-bar");
+    const expBarText = document.getElementById("exp-bar-text");
+    const expBarActions = document.getElementById("exp-bar-actions");
+    const newExperimentBtn = document.getElementById("new-experiment");
+
+    // --- Render the experiment section ---
+    function renderExpBar() {
+      expBar.dataset.status = expState.status;
+      const name = expState.name ? `<strong>${escapeHtml(expState.name)}</strong>` : "";
+      const pumpStr = expState.pumpCount > 0
+        ? ` · <span class="pump-count">${expState.pumpCount} pump${expState.pumpCount === 1 ? "" : "s"}</span>`
+        : "";
+      let text;
+      let actions = "";
+      switch (expState.status) {
+        case "running": {
+          const elapsed = expState.elapsed_hours;
+          const elapsedStr = (typeof elapsed === "number")
+            ? `${elapsed.toFixed(2)} h elapsed`
+            : "live";
+          text = `Experiment ${name} running — <span class="muted">${elapsedStr} · ${expState.vials.length} vials${pumpStr}</span>`;
+          const maintBtn = (expState.maintenance && expState.maintenance.active)
+            ? ""  // banner has the resume button when in maintenance
+            : `<button class="btn" id="exp-maint-btn" type="button">Maintenance</button>`;
+          actions = `<button class="btn" id="exp-new-btn" type="button">New experiment</button>
+                     ${maintBtn}
+                     <button class="btn btn-danger" id="exp-stop-btn" type="button">Stop Experiment</button>`;
+          break;
+        }
+        case "created":
+          text = `Experiment ${name} created (not started) — <span class="muted">${expState.vials.length} vials</span>`;
+          actions = `<button class="btn btn-primary" id="exp-start-btn" type="button">Start</button>
+                     <button class="btn" id="exp-delete-btn" type="button">Delete</button>`;
+          break;
+        case "stopped":
+          text = `Experiment ${name} <span class="muted">stopped${pumpStr ? " ·" + pumpStr.slice(pumpStr.indexOf("<span")) : ""}</span>`;
+          actions = `<button class="btn btn-primary" id="exp-new-btn" type="button">New experiment</button>
+                     <button class="btn" id="exp-delete-btn" type="button">Delete</button>`;
+          break;
+        case "error":
+          text = `Experiment ${name} <span class="muted">ERROR — see alerts${pumpStr}</span>`;
+          actions = `<button class="btn btn-danger" id="exp-stop-btn" type="button">Stop (clean up)</button>`;
+          break;
+        default:
+          text = `<span class="muted">No experiment running.</span>`;
+          actions = `<button class="btn btn-primary" id="exp-new-btn" type="button">New Experiment</button>`;
+      }
+      expBarText.innerHTML = text;
+      expBarActions.innerHTML = actions;
+      const stopBtn = document.getElementById("exp-stop-btn");
+      if (stopBtn) stopBtn.addEventListener("click", stopExperiment);
+      const startBtn = document.getElementById("exp-start-btn");
+      if (startBtn) startBtn.addEventListener("click", startCreatedExperiment);
+      const deleteBtn = document.getElementById("exp-delete-btn");
+      if (deleteBtn) deleteBtn.addEventListener("click", deleteCurrentExperiment);
+      const newBtn = document.getElementById("exp-new-btn");
+      if (newBtn) newBtn.addEventListener("click", openExpModal);
+      const maintBtn = document.getElementById("exp-maint-btn");
+      if (maintBtn) maintBtn.addEventListener("click", enterMaintenance);
+    }
+
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, c => ({
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+      }[c]));
+    }
+
+    // --- Refresh vial card locks based on expState ---
+    function applyVialLocks() {
+      const lockedSet = new Set(expState.status === "running" ? expState.vials : []);
+      const v2b = (expState.media && expState.media.vial_to_bottle) || {};
+      const bottleIdxById = {};
+      if (expState.media && expState.media.bottles) {
+        expState.media.bottles.forEach((b, idx) => { bottleIdxById[b.id] = idx; });
+      }
+      for (let i = 0; i < N_VIALS; i++) {
+        const card = document.getElementById(`vial-${i}`);
+        if (!card) continue;
+        if (lockedSet.has(i)) {
+          card.classList.add("locked");
+          card.dataset.exp = expState.name || "";
+          _setVialBottleDot(card, i, v2b, bottleIdxById);
+        } else {
+          card.classList.remove("locked");
+          card.removeAttribute("data-exp");
+          _clearVialBottleDot(card);
+        }
+      }
+      // If the vial modal is open on a locked vial, refresh its disabled state.
+      if (modalState.vial !== null) updateModalLockedState();
+    }
+
+    function _setVialBottleDot(card, vial, v2b, bottleIdxById) {
+      const bid = v2b[String(vial)];
+      if (!bid) {
+        _clearVialBottleDot(card);
+        return;
+      }
+      const idx = bottleIdxById[bid];
+      const color = idx != null ? BOTTLE_PALETTE[idx % BOTTLE_PALETTE.length] : "#9ca3af";
+      const nameEl = card.querySelector(".vial-name");
+      if (!nameEl) return;
+      let dot = nameEl.querySelector(".bottle-dot");
+      if (!dot) {
+        dot = document.createElement("span");
+        dot.className = "bottle-dot";
+        nameEl.prepend(dot);
+      }
+      dot.style.background = color;
+      dot.title = `Media: ${bid}`;
+    }
+    function _clearVialBottleDot(card) {
+      const dot = card.querySelector(".bottle-dot");
+      if (dot) dot.remove();
+    }
+
+    // --- Maintenance banner + countdown ---
+    const maintBanner = document.getElementById("maint-banner");
+    const maintCountdownEl = document.getElementById("maint-countdown");
+    const maintRefillBtn = document.getElementById("maint-refill-btn");
+    const maintResumeBtn = document.getElementById("maint-resume-btn");
+
+    function renderMaintenanceBanner() {
+      const m = expState.maintenance;
+      if (!m || !m.active) {
+        maintBanner.classList.remove("show");
+        maintCountdownEl.textContent = "";
+        return;
+      }
+      maintBanner.classList.add("show");
+      const seconds = Math.max(0, Math.floor(Number(m.auto_resume_in_seconds) || 0));
+      const min = Math.floor(seconds / 60);
+      const sec = seconds % 60;
+      const queued = Number(m.queued_pump_count || 0);
+      const queuedStr = queued > 0 ? ` · ${queued} pump${queued === 1 ? "" : "s"} queued` : "";
+      maintCountdownEl.textContent =
+        `Auto-resume in ${min}:${String(sec).padStart(2, "0")}${queuedStr}`;
+    }
+
+    // Countdown ticks every second purely client-side. The authoritative
+    // value comes from the server on each sensor_update (every 10 s) and
+    // overrides any drift.
+    let _maintCountdownTimer = null;
+    function startMaintCountdown() {
+      if (_maintCountdownTimer) return;
+      _maintCountdownTimer = setInterval(() => {
+        const m = expState.maintenance;
+        if (!m || !m.active) return;
+        if (typeof m.auto_resume_in_seconds === "number" && m.auto_resume_in_seconds > 0) {
+          m.auto_resume_in_seconds = Math.max(0, m.auto_resume_in_seconds - 1);
+          renderMaintenanceBanner();
+        }
+      }, 1000);
+    }
+    startMaintCountdown();
+
+    async function enterMaintenance() {
+      if (!confirm("Enter maintenance mode? Pumps will be suppressed until you resume.")) return;
+      try {
+        await postJson("/api/maintenance/enter", {});
+        showToast("Maintenance mode entered — pumps disabled", "ok");
+        await refreshExperimentStatus();
+      } catch (err) {
+        showToast(`Enter maintenance failed: ${err.message}`, "error");
+      }
+    }
+    async function exitMaintenance() {
+      try {
+        const r = await postJson("/api/maintenance/exit", {});
+        const fired = r.fired || 0;
+        showToast(
+          fired > 0
+            ? `Resumed — fired ${fired} queued pump action${fired === 1 ? "" : "s"}`
+            : "Resumed",
+          "ok",
+        );
+        await refreshExperimentStatus();
+      } catch (err) {
+        showToast(`Resume failed: ${err.message}`, "error");
+      }
+    }
+    maintResumeBtn.addEventListener("click", exitMaintenance);
+
+    // --- Refill modal ---
+    const refillModal = document.getElementById("refill-modal");
+    const refillBottlesEl = document.getElementById("refill-bottles");
+    const refillWasteEl = document.getElementById("refill-waste");
+    const refillCloseBtn = document.getElementById("refill-modal-close");
+    const refillCancelBtn = document.getElementById("refill-cancel");
+    const refillApplyBtn = document.getElementById("refill-apply");
+    const refillApplyResumeBtn = document.getElementById("refill-apply-resume");
+
+    function openRefillModal() {
+      buildRefillForm();
+      refillModal.hidden = false;
+      requestAnimationFrame(() => refillModal.classList.add("open"));
+    }
+    function closeRefillModal() {
+      refillModal.classList.remove("open");
+      setTimeout(() => {
+        if (!refillModal.classList.contains("open")) refillModal.hidden = true;
+      }, 160);
+    }
+    maintRefillBtn.addEventListener("click", openRefillModal);
+    refillCloseBtn.addEventListener("click", closeRefillModal);
+    refillCancelBtn.addEventListener("click", closeRefillModal);
+    refillModal.addEventListener("click", (e) => {
+      if (e.target === refillModal) closeRefillModal();
+    });
+
+    function buildRefillForm() {
+      refillBottlesEl.innerHTML = "";
+      refillWasteEl.innerHTML = "";
+      if (!expState.media) return;
+      (expState.media.bottles || []).forEach((b, idx) => {
+        const color = BOTTLE_PALETTE[idx % BOTTLE_PALETTE.length];
+        const row = document.createElement("div");
+        row.className = "refill-row";
+        row.dataset.bottleId = b.id;
+        const remaining = Number(b.remaining_ml || 0).toFixed(0);
+        const initial = Number(b.initial_volume_ml || 0).toFixed(0);
+        row.innerHTML = `
+          <span class="swatch" style="background:${color}"></span>
+          <span class="label">${escapeHtml(b.name)}
+            <span class="muted">currently ${remaining} / ${initial} mL</span>
+          </span>
+          <input type="number" class="bottle-remaining"
+                 min="0" max="${b.initial_volume_ml}" step="10"
+                 value="${remaining}">
+          <button class="btn mark-full" type="button" data-fill="${b.initial_volume_ml}">Mark full</button>
+        `;
+        row.querySelector("[data-fill]").addEventListener("click", (e) => {
+          row.querySelector(".bottle-remaining").value = e.target.dataset.fill;
+        });
+        refillBottlesEl.appendChild(row);
+      });
+      if (expState.media.waste) {
+        const w = expState.media.waste;
+        const filled = Number(w.filled_ml || 0).toFixed(0);
+        const cap = Number(w.capacity_ml || 0).toFixed(0);
+        refillWasteEl.innerHTML = `
+          <div class="refill-row" data-waste="1">
+            <span class="swatch" style="background:#9ca3af"></span>
+            <span class="label">${escapeHtml(w.name || "Waste")}
+              <span class="muted">currently ${filled} / ${cap} mL</span>
+            </span>
+            <input type="number" class="waste-filled"
+                   min="0" max="${w.capacity_ml}" step="10" value="${filled}">
+            <button class="btn mark-full" type="button" data-empty="0">Mark empty</button>
+          </div>
+        `;
+        refillWasteEl.querySelector("[data-empty]").addEventListener("click", (e) => {
+          refillWasteEl.querySelector(".waste-filled").value = e.target.dataset.empty;
+        });
+      }
+    }
+
+    function collectRefillPayload() {
+      const bottles = {};
+      refillBottlesEl.querySelectorAll(".refill-row").forEach((row) => {
+        const v = parseFloat(row.querySelector(".bottle-remaining").value);
+        if (Number.isFinite(v)) bottles[row.dataset.bottleId] = v;
+      });
+      const wasteRow = refillWasteEl.querySelector(".refill-row");
+      let waste = null;
+      if (wasteRow) {
+        const v = parseFloat(wasteRow.querySelector(".waste-filled").value);
+        if (Number.isFinite(v)) waste = { filled_ml: v };
+      }
+      return { bottles, waste };
+    }
+
+    async function applyRefill(thenResume) {
+      const payload = collectRefillPayload();
+      try {
+        await postJson("/api/maintenance/refill", payload);
+        showToast("Levels updated", "ok");
+        if (thenResume) {
+          await exitMaintenance();
+        } else {
+          await refreshExperimentStatus();
+        }
+        closeRefillModal();
+      } catch (err) {
+        showToast(`Refill failed: ${err.message}`, "error");
+      }
+    }
+    refillApplyBtn.addEventListener("click", () => applyRefill(false));
+    refillApplyResumeBtn.addEventListener("click", () => applyRefill(true));
+
+    // --- Morbidostat confirm-escalation modal ---
+    const escalationModal = document.getElementById("escalation-modal");
+    const escalationCloseBtn = document.getElementById("escalation-modal-close");
+    const escalationCancelBtn = document.getElementById("escalation-cancel");
+    const escalationApplyBtn = document.getElementById("escalation-apply");
+    const escalationSummary = document.getElementById("escalation-summary");
+    const escalationConcEl = document.getElementById("escalation-conc");
+    const escalationContentsEl = document.getElementById("escalation-contents");
+    let _escalationVial = null;
+
+    function openEscalationModal(vial, currentConc, proposedConc) {
+      if (!Number.isFinite(vial)) return;
+      _escalationVial = vial;
+      const cur = Number.isFinite(currentConc) ? currentConc : null;
+      const prop = Number.isFinite(proposedConc) ? proposedConc : null;
+      escalationSummary.innerHTML = `
+        Vial ${vial} — current drug conc:
+        <strong>${cur !== null ? cur.toFixed(2) + "x" : "?"}</strong>
+        &nbsp;->&nbsp; proposed:
+        <strong>${prop !== null ? prop.toFixed(2) + "x" : "?"}</strong>
+      `;
+      escalationConcEl.value = prop !== null
+        ? prop.toFixed(2)
+        : (cur !== null ? (cur * 2).toFixed(2) : "2.0");
+      // Pre-fill the contents text with the assigned bottle's current contents.
+      let suggestion = "";
+      if (expState.media && expState.media.vial_to_bottle && expState.media.bottles) {
+        const bid = expState.media.vial_to_bottle[String(vial)];
+        if (bid) {
+          const bottle = expState.media.bottles.find(b => b.id === bid);
+          if (bottle) suggestion = bottle.contents || "";
+        }
+      }
+      escalationContentsEl.value = suggestion;
+      escalationModal.hidden = false;
+      requestAnimationFrame(() => escalationModal.classList.add("open"));
+    }
+    function closeEscalationModal() {
+      escalationModal.classList.remove("open");
+      setTimeout(() => { escalationModal.hidden = true; }, 150);
+      _escalationVial = null;
+    }
+    escalationCloseBtn.addEventListener("click", closeEscalationModal);
+    escalationCancelBtn.addEventListener("click", closeEscalationModal);
+    escalationModal.addEventListener("click", (e) => {
+      if (e.target === escalationModal) closeEscalationModal();
+    });
+
+    async function applyEscalation() {
+      if (_escalationVial == null || !expState.name) return;
+      const conc = parseFloat(escalationConcEl.value);
+      if (!Number.isFinite(conc) || conc <= 0) {
+        showToast("New drug conc must be > 0.", "error");
+        return;
+      }
+      const body = { vial: _escalationVial, new_drug_conc: conc };
+      const contents = escalationContentsEl.value.trim();
+      if (contents) body.new_bottle_contents = contents;
+      escalationApplyBtn.disabled = true;
+      try {
+        await postJson(
+          `/api/experiments/${encodeURIComponent(expState.name)}/morbidostat/confirm_escalation`,
+          body,
+        );
+        showToast(`Vial ${_escalationVial} escalated to ${conc.toFixed(2)}x`, "ok");
+        closeEscalationModal();
+        await refreshExperimentStatus();
+      } catch (err) {
+        showToast(`Escalation failed: ${err.message}`, "error");
+      } finally {
+        escalationApplyBtn.disabled = false;
+      }
+    }
+    escalationApplyBtn.addEventListener("click", applyEscalation);
+
+    // --- Dashboard media panel ---
+    const mediaPanel = document.getElementById("media-panel");
+    const mediaRows = document.getElementById("media-rows");
+
+    function renderMediaPanel() {
+      if (!expState.media || expState.status !== "running") {
+        mediaPanel.classList.remove("show");
+        return;
+      }
+      const bottles = expState.media.bottles || [];
+      const waste = expState.media.waste;
+      if (!bottles.length) {
+        mediaPanel.classList.remove("show");
+        return;
+      }
+      mediaPanel.classList.add("show");
+      const rows = bottles.map((b, idx) => {
+        const color = BOTTLE_PALETTE[idx % BOTTLE_PALETTE.length];
+        const pct = Math.max(0, Math.min(100, Number(b.remaining_pct) || 0));
+        const warn = b.alerted_low || pct <= 10;
+        return `
+          <div class="media-row bottle ${warn ? "warn" : ""}">
+            <span class="swatch" style="background:${color}"></span>
+            <span class="label" title="${escapeHtml(b.contents || "")}">${escapeHtml(b.name)}</span>
+            <div class="bar"><div class="fill" style="width:${pct}%"></div></div>
+            <span class="num">${(b.remaining_ml || 0).toFixed(0)} / ${(b.initial_volume_ml || 0).toFixed(0)} mL</span>
+          </div>
+        `;
+      }).join("");
+      let wasteRow = "";
+      if (waste) {
+        const pct = Math.max(0, Math.min(100, Number(waste.filled_pct) || 0));
+        const warn = waste.alerted_high || pct >= 90;
+        wasteRow = `
+          <div class="media-row waste ${warn ? "warn" : ""}">
+            <span class="swatch" style="background:#9ca3af"></span>
+            <span class="label">${escapeHtml(waste.name || "Waste")}</span>
+            <div class="bar"><div class="fill" style="width:${pct}%"></div></div>
+            <span class="num">${(waste.filled_ml || 0).toFixed(0)} / ${(waste.capacity_ml || 0).toFixed(0)} mL</span>
+          </div>
+        `;
+      }
+      mediaRows.innerHTML = rows + wasteRow;
+    }
+
+    const morbidostatPanel = document.getElementById("morbidostat-panel");
+    const morbidostatRows = document.getElementById("morbidostat-rows");
+
+    function renderMorbidostatPanel() {
+      if (
+        !expState.morbidostat
+        || expState.mode !== "morbidostat"
+        || expState.status !== "running"
+      ) {
+        morbidostatPanel.classList.remove("show");
+        return;
+      }
+      const perVial = expState.morbidostat.per_vial || {};
+      const pendingSet = new Set(expState.escalationPendingVials || []);
+      const vials = Object.keys(perVial).map(Number).sort((a, b) => a - b);
+      if (vials.length === 0) {
+        morbidostatPanel.classList.remove("show");
+        return;
+      }
+      morbidostatPanel.classList.add("show");
+      morbidostatRows.innerHTML = vials.map(v => {
+        const r = perVial[String(v)] || {};
+        const isPending = pendingSet.has(v) || r.awaiting_escalation_confirm;
+        const mu = (typeof r.growth_rate_per_hour === "number")
+          ? `${r.growth_rate_per_hour.toFixed(2)} /hr`
+          : "<span class='muted'>—</span>";
+        const btn = isPending
+          ? `<button class="btn btn-primary escalate-btn" data-vial="${v}"
+                     data-proposed="${r.proposed_new_drug_conc ?? ""}"
+                     data-current="${r.drug_conc ?? ""}"
+                     type="button">Confirm escalation</button>`
+          : "";
+        return `
+          <div class="morb-row ${isPending ? "pending" : ""}">
+            <span class="label">Vial ${v}</span>
+            <span class="num">drug: ${(r.drug_conc ?? 1).toFixed(2)}x</span>
+            <span class="num">growth: ${mu}</span>
+            <span class="escalate-btn">${btn}</span>
+          </div>
+        `;
+      }).join("");
+      morbidostatRows.querySelectorAll(".escalate-btn[data-vial]").forEach(btn => {
+        btn.addEventListener("click", () => {
+          const vial = Number(btn.dataset.vial);
+          const proposed = parseFloat(btn.dataset.proposed);
+          const current = parseFloat(btn.dataset.current);
+          openEscalationModal(vial, current, proposed);
+        });
+      });
+    }
+
+
+    function _applyMediaSummary(summary) {
+      // Merge percentage updates from sensor_update.experiment.media_summary
+      // into the cached expState.media so the panel can re-render without polling.
+      if (!summary || !expState.media) return;
+      const byIdSummary = {};
+      (summary.bottles || []).forEach(s => { byIdSummary[s.id] = s; });
+      (expState.media.bottles || []).forEach(b => {
+        const s = byIdSummary[b.id];
+        if (s && typeof s.remaining_pct === "number") {
+          b.remaining_pct = s.remaining_pct;
+          // Recompute remaining_ml from the pct + initial so the row updates.
+          if (b.initial_volume_ml > 0) {
+            b.remaining_ml = b.initial_volume_ml * s.remaining_pct / 100;
+            b.consumed_ml = b.initial_volume_ml - b.remaining_ml;
+          }
+        }
+      });
+      if (summary.waste && expState.media.waste) {
+        const pct = summary.waste.filled_pct;
+        if (typeof pct === "number") {
+          expState.media.waste.filled_pct = pct;
+          if (expState.media.waste.capacity_ml > 0) {
+            expState.media.waste.filled_ml =
+              expState.media.waste.capacity_ml * pct / 100;
+            expState.media.waste.remaining_ml =
+              expState.media.waste.capacity_ml - expState.media.waste.filled_ml;
+          }
+        }
+      }
+      renderMediaPanel();
+    }
+
+    // --- Vial modal: show / hide "controlled by experiment" note ---
+    const lockedNote = document.createElement("div");
+    lockedNote.className = "locked-note";
+    lockedNote.id = "locked-note";
+    document.querySelector("#vial-modal .modal-readings").after(lockedNote);
+
+    function updateModalLockedState() {
+      const i = modalState.vial;
+      const lockedSet = new Set(expState.status === "running" ? expState.vials : []);
+      const isLocked = i !== null && lockedSet.has(i);
+      const note = document.getElementById("locked-note");
+      if (isLocked) {
+        note.textContent = `Vial ${i} is controlled by experiment "${expState.name}". ` +
+                           `Stop the experiment to take manual control.`;
+        note.classList.add("show");
+      } else {
+        note.classList.remove("show");
+      }
+      // Disable input affordances when locked.
+      tempSlider.disabled = isLocked;
+      stirSlider.disabled = isLocked;
+      pumpSecondsEl.disabled = isLocked;
+      applyTempBtn.disabled = isLocked;
+      applyStirBtn.disabled = isLocked;
+      pumpInfluxBtn.disabled = isLocked;
+      pumpEffluxBtn.disabled = isLocked;
+    }
+
+    // --- Fetch the current experiment ---
+    async function refreshExperimentStatus() {
+      try {
+        const res = await fetch("/api/experiments");
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        // Find any running, else created, else most recent stopped.
+        const list = data.experiments || [];
+        const running = list.find(e => e.status === "running");
+        const created = list.find(e => e.status === "created");
+        const errored = list.find(e => e.status === "error");
+        const loaded = running || created || errored;
+        if (loaded) {
+          // Get richer status from the per-experiment endpoint.
+          try {
+            const r2 = await fetch(`/api/experiments/${encodeURIComponent(loaded.name)}/status`);
+            if (r2.ok) {
+              const s = await r2.json();
+              expState.name = s.name;
+              expState.status = s.status;
+              expState.mode = s.mode || null;
+              expState.vials = s.vials || loaded.vials || [];
+              expState.elapsed_hours = s.elapsed_hours;
+              expState.media = s.media || null;
+              expState.maintenance = s.maintenance || null;
+              expState.morbidostat = s.morbidostat || null;
+            } else {
+              expState.name = loaded.name;
+              expState.status = loaded.status;
+              expState.mode = loaded.mode || null;
+              expState.vials = loaded.vials || [];
+              expState.elapsed_hours = null;
+              expState.media = null;
+              expState.maintenance = null;
+              expState.morbidostat = null;
+            }
+          } catch {
+            expState.name = loaded.name;
+            expState.status = loaded.status;
+            expState.mode = loaded.mode || null;
+            expState.vials = loaded.vials || [];
+            expState.media = null;
+            expState.maintenance = null;
+            expState.morbidostat = null;
+          }
+        } else {
+          expState.name = null;
+          expState.status = "idle";
+          expState.mode = null;
+          expState.vials = [];
+          expState.media = null;
+          expState.maintenance = null;
+          expState.morbidostat = null;
+          expState.escalationPendingVials = [];
+        }
+        renderExpBar();
+        applyVialLocks();
+        renderMediaPanel();
+        renderMaintenanceBanner();
+        renderMorbidostatPanel();
+      } catch (err) {
+        console.warn("refreshExperimentStatus failed:", err.message);
+      }
+    }
+
+    // --- Stop / start / delete from the status bar ---
+    async function stopExperiment() {
+      if (!expState.name) return;
+      if (!confirm(`Stop experiment "${expState.name}"? Actuators on its vials will be zeroed.`)) return;
+      try {
+        await postJson(`/api/experiments/${encodeURIComponent(expState.name)}/stop`, {});
+        showToast(`Experiment "${expState.name}" stopped`, "ok");
+        // experiment_event will refresh state; refresh proactively too.
+        await refreshExperimentStatus();
+      } catch (err) {
+        showToast(`Stop failed: ${err.message}`, "error");
+      }
+    }
+
+    async function startCreatedExperiment() {
+      if (!expState.name) return;
+      try {
+        await postJson(`/api/experiments/${encodeURIComponent(expState.name)}/start`, {});
+        showToast(`Experiment "${expState.name}" started`, "ok");
+        await refreshExperimentStatus();
+      } catch (err) {
+        showToast(`Start failed: ${err.message}`, "error");
+      }
+    }
+
+    async function deleteCurrentExperiment() {
+      if (!expState.name) return;
+      if (!confirm(`Delete experiment "${expState.name}" and all its data? This cannot be undone.`)) return;
+      try {
+        const res = await fetch(`/api/experiments/${encodeURIComponent(expState.name)}`,
+                                 { method: "DELETE" });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+        showToast(`Experiment "${expState.name}" deleted`, "ok");
+        expState.name = null;
+        expState.status = "idle";
+        expState.vials = [];
+        renderExpBar();
+        applyVialLocks();
+      } catch (err) {
+        showToast(`Delete failed: ${err.message}`, "error");
+      }
+    }
+
+    // =================================================================
+    // Setup wizard
+    // =================================================================
+
+    const WIZARD_STEPS = 7;
+    const REVIEW_STEP = 7;
+    const BOTTLE_PALETTE = ["#2563eb", "#16a34a", "#f97316", "#a855f7", "#0ea5e9", "#dc2626"];
+
+    const expModal = document.getElementById("exp-modal");
+    const expModalClose = document.getElementById("exp-modal-close");
+    const wizardBack = document.getElementById("wizard-back");
+    const wizardNext = document.getElementById("wizard-next");
+    const wizardCancel = document.getElementById("wizard-cancel");
+    const bottleListEl = document.getElementById("bottle-list");
+    const addBottleBtn = document.getElementById("add-bottle-btn");
+    const vialBottleGrid = document.getElementById("vial-bottle-grid");
+    const vialBottleLegend = document.getElementById("vial-bottle-legend");
+    const wasteNameEl = document.getElementById("w-name");
+    const wasteCapacityEl = document.getElementById("w-capacity");
+    const wasteHighEl = document.getElementById("w-high");
+    const reviewDl = document.getElementById("exp-review-dl");
+    const modeGrid = document.getElementById("mode-grid");
+
+    function _bottleColor(index) {
+      return BOTTLE_PALETTE[index % BOTTLE_PALETTE.length];
+    }
+    function _bottleColorById(bottleId) {
+      const idx = wizardState.media.bottles.findIndex(b => b.id === bottleId);
+      return idx >= 0 ? _bottleColor(idx) : "#9ca3af";
+    }
+
+    const wizardState = {
+      step: 1,
+      name: "",
+      notes: "",
+      mode: "turbidostat",
+      params: {
+        // Shared across all modes
+        temperature: 37,
+        stir: 10,
+        volume: 25,         // mL
+        // Turbidostat
+        lower: 0.20,
+        upper: 0.40,
+        wait: 15,           // minutes
+        // Chemostat
+        D: 0.5,             // dilution rate (vol/hr)
+        T: 60,              // bolus interval (seconds)
+        // Morbidostat
+        target_od: 0.40,
+        od_lower_m: 0.20,
+        wait_m: 15,         // minutes
+        drug_conc: 1.0,
+        drug_step: 2.0,
+        mu_thresh: 0.40,    // per hour
+        growth_window: 30,  // minutes
+      },
+      media: {
+        bottles: [],           // {id, name, contents, initial_volume_ml, low_volume_alert_ml}
+        vialToBottle: {},      // {"0": "bottle_a", ...}
+        waste: { name: "", capacity_ml: 4000, high_fill_alert_ml: 3600 },
+      },
+    };
+    function _derivedVials() {
+      return Object.keys(wizardState.media.vialToBottle)
+        .map(Number).sort((a, b) => a - b);
+    }
+    function _nextBottleId() {
+      const used = new Set(wizardState.media.bottles.map(b => b.id));
+      for (let i = 0; i < 26; i++) {
+        const id = "bottle_" + String.fromCharCode(97 + i);
+        if (!used.has(id)) return id;
+      }
+      return "bottle_" + Date.now();
+    }
+
+    function openExpModal() {
+      // Reset
+      wizardState.step = 1;
+      wizardState.name = "";
+      wizardState.notes = "";
+      wizardState.mode = "turbidostat";
+      wizardState.media = {
+        bottles: [],
+        vialToBottle: {},
+        waste: { name: "", capacity_ml: 4000, high_fill_alert_ml: 3600 },
+      };
+      // Seed with one bottle so the user has something to start with.
+      _appendBottle();
+      document.getElementById("exp-name").value = "";
+      document.getElementById("exp-notes").value = "";
+      wasteNameEl.value = "";
+      wasteCapacityEl.value = "4000";
+      wasteHighEl.value = "3600";
+      renderBottleList();
+      buildVialBottleGrid();
+      // Select default mode card visually
+      [...modeGrid.querySelectorAll(".mode-card")].forEach(c => {
+        c.classList.toggle("selected", c.dataset.mode === wizardState.mode);
+      });
+      // Show the parameter pane that matches the current mode.
+      applyParamPaneVisibility();
+      gotoStep(1);
+      expModal.hidden = false;
+      requestAnimationFrame(() => expModal.classList.add("open"));
+      document.getElementById("exp-name").focus();
+    }
+
+    function _appendBottle() {
+      const id = _nextBottleId();
+      wizardState.media.bottles.push({
+        id,
+        name: "",
+        contents: "",
+        initial_volume_ml: 1000,
+        low_volume_alert_ml: 100,
+      });
+    }
+    function closeExpModal() {
+      expModal.classList.remove("open");
+      setTimeout(() => {
+        if (!expModal.classList.contains("open")) expModal.hidden = true;
+      }, 160);
+    }
+    newExperimentBtn.addEventListener("click", openExpModal);
+    expModalClose.addEventListener("click", closeExpModal);
+    wizardCancel.addEventListener("click", closeExpModal);
+    expModal.addEventListener("click", (e) => {
+      if (e.target === expModal) closeExpModal();
+    });
+
+    function gotoStep(step) {
+      wizardState.step = step;
+      document.querySelectorAll(".wizard-step").forEach((s) => {
+        const n = parseInt(s.dataset.step, 10);
+        s.classList.toggle("active", n === step);
+        s.classList.toggle("done", n < step);
+      });
+      document.querySelectorAll(".wizard-pane").forEach((p) => {
+        p.classList.toggle("active", parseInt(p.dataset.pane, 10) === step);
+      });
+      wizardBack.disabled = step === 1;
+      wizardNext.textContent = step === REVIEW_STEP ? "Create & Start" : "Next";
+      // Refresh the vial grid whenever we land on it (bottles list may have changed).
+      if (step === 3) buildVialBottleGrid();
+      if (step === REVIEW_STEP) renderReview();
+    }
+
+    wizardBack.addEventListener("click", () => {
+      if (wizardState.step > 1) gotoStep(wizardState.step - 1);
+    });
+    wizardNext.addEventListener("click", () => {
+      if (!validateStep(wizardState.step)) return;
+      if (wizardState.step === REVIEW_STEP) {
+        submitExperiment();
+      } else {
+        gotoStep(wizardState.step + 1);
+      }
+    });
+
+    function validateStep(step) {
+      if (step === 1) {
+        wizardState.name = document.getElementById("exp-name").value.trim();
+        wizardState.notes = document.getElementById("exp-notes").value.trim();
+        if (!/^[A-Za-z0-9][A-Za-z0-9_\-]{0,63}$/.test(wizardState.name)) {
+          showToast("Name must start with alphanumeric, then [a-zA-Z0-9_-], up to 64 chars.", "error");
+          return false;
+        }
+      }
+      if (step === 2) {
+        // Media bottles
+        readBottleList();
+        if (wizardState.media.bottles.length === 0) {
+          showToast("Add at least one media bottle.", "error");
+          return false;
+        }
+        for (const b of wizardState.media.bottles) {
+          if (!b.name.trim()) {
+            showToast("Every bottle needs a name.", "error");
+            return false;
+          }
+          if (!(b.initial_volume_ml > 0)) {
+            showToast(`Bottle '${b.name}' needs a positive initial volume.`, "error");
+            return false;
+          }
+        }
+      }
+      if (step === 3) {
+        if (_derivedVials().length === 0) {
+          showToast("Assign at least one vial to a media bottle.", "error");
+          return false;
+        }
+      }
+      if (step === 4) {
+        const cap = parseFloat(wasteCapacityEl.value);
+        const high = parseFloat(wasteHighEl.value);
+        if (!(cap > 0)) {
+          showToast("Waste capacity must be > 0.", "error");
+          return false;
+        }
+        if (!(high >= 0) || high > cap) {
+          showToast("Waste alert threshold must be in [0, capacity].", "error");
+          return false;
+        }
+        wizardState.media.waste = {
+          name: wasteNameEl.value.trim(),
+          capacity_ml: cap,
+          high_fill_alert_ml: high,
+        };
+      }
+      if (step === 5) {
+        if (!["turbidostat", "chemostat", "morbidostat"].includes(wizardState.mode)) {
+          showToast(`Mode "${wizardState.mode}" is not implemented.`, "error");
+          return false;
+        }
+      }
+      if (step === 6) {
+        const p = wizardState.params;
+        if (wizardState.mode === "turbidostat") {
+          if (p.lower >= p.upper) {
+            showToast("Lower OD threshold must be less than upper.", "error");
+            return false;
+          }
+        } else if (wizardState.mode === "chemostat") {
+          if (!(p.D > 0)) {
+            showToast("Dilution rate must be > 0.", "error");
+            return false;
+          }
+          if (!(p.T > 0)) {
+            showToast("Bolus interval must be > 0.", "error");
+            return false;
+          }
+        } else if (wizardState.mode === "morbidostat") {
+          if (p.od_lower_m >= p.target_od) {
+            showToast("Lower OD must be less than target OD.", "error");
+            return false;
+          }
+          if (!(p.drug_step > 1.0)) {
+            showToast("Escalation step must be > 1.0x.", "error");
+            return false;
+          }
+        }
+      }
+      return true;
+    }
+
+    // Show only the parameter pane matching the currently-selected mode.
+    function applyParamPaneVisibility() {
+      document.querySelectorAll(".params-mode").forEach(el => {
+        el.hidden = el.dataset.paramsMode !== wizardState.mode;
+      });
+    }
+
+    // ---- Bottle list management (step 2) ----
+    function renderBottleList() {
+      bottleListEl.innerHTML = "";
+      wizardState.media.bottles.forEach((b, idx) => {
+        const row = document.createElement("div");
+        row.className = "bottle-row";
+        row.dataset.idx = String(idx);
+        const color = _bottleColor(idx);
+        row.innerHTML = `
+          <span class="swatch" style="background:${color}"></span>
+          <input type="text" class="b-name" placeholder="Bottle name (e.g. LB)" value="${escapeHtml(b.name)}">
+          <input type="text" class="b-contents" placeholder="Contents (optional)" value="${escapeHtml(b.contents || "")}">
+          <input type="number" class="b-vol" min="1" step="50" value="${b.initial_volume_ml}" title="Initial volume (mL)">
+          <button class="remove" type="button" aria-label="Remove">×</button>
+        `;
+        row.querySelector(".b-name").addEventListener("input", (e) => {
+          wizardState.media.bottles[idx].name = e.target.value;
+        });
+        row.querySelector(".b-contents").addEventListener("input", (e) => {
+          wizardState.media.bottles[idx].contents = e.target.value;
+        });
+        row.querySelector(".b-vol").addEventListener("input", (e) => {
+          const v = parseFloat(e.target.value);
+          if (Number.isFinite(v)) {
+            wizardState.media.bottles[idx].initial_volume_ml = v;
+            // Auto-track the default low-alert at 10 % unless the user
+            // overrides it later.
+            wizardState.media.bottles[idx].low_volume_alert_ml = v * 0.10;
+          }
+        });
+        row.querySelector(".remove").addEventListener("click", () => {
+          const removed = wizardState.media.bottles.splice(idx, 1)[0];
+          // Cascade: drop any vial assignments that pointed at this bottle.
+          for (const [k, v] of Object.entries(wizardState.media.vialToBottle)) {
+            if (v === removed.id) delete wizardState.media.vialToBottle[k];
+          }
+          renderBottleList();
+        });
+        bottleListEl.appendChild(row);
+      });
+    }
+    function readBottleList() {
+      // Pull current text-input values back into wizardState.media.bottles
+      // before validation (oninput already does this, but be safe).
+      bottleListEl.querySelectorAll(".bottle-row").forEach((row, idx) => {
+        const b = wizardState.media.bottles[idx];
+        if (!b) return;
+        b.name = row.querySelector(".b-name").value;
+        b.contents = row.querySelector(".b-contents").value;
+        const v = parseFloat(row.querySelector(".b-vol").value);
+        if (Number.isFinite(v)) b.initial_volume_ml = v;
+      });
+    }
+    addBottleBtn.addEventListener("click", () => {
+      _appendBottle();
+      renderBottleList();
+    });
+
+    // ---- Vial-to-bottle assignment (step 3) ----
+    function buildVialBottleGrid() {
+      vialBottleGrid.innerHTML = "";
+      vialBottleLegend.innerHTML = "";
+      const lockedOther = new Set(
+        expState.status === "running" || expState.status === "created"
+          ? expState.vials : []
+      );
+      // Legend
+      wizardState.media.bottles.forEach((b, idx) => {
+        const tag = document.createElement("span");
+        const color = _bottleColor(idx);
+        tag.innerHTML = `<span class="swatch" style="background:${color}"></span>${escapeHtml(b.name || `(bottle ${idx + 1})`)}`;
+        vialBottleLegend.appendChild(tag);
+      });
+      // Grid
+      for (let i = 0; i < N_VIALS; i++) {
+        const cell = document.createElement("button");
+        cell.type = "button";
+        cell.className = "vial-bottle-cell";
+        cell.dataset.vial = String(i);
+        const assigned = wizardState.media.vialToBottle[String(i)];
+        const bIdx = assigned
+          ? wizardState.media.bottles.findIndex(b => b.id === assigned)
+          : -1;
+        const color = bIdx >= 0 ? _bottleColor(bIdx) : "transparent";
+        cell.innerHTML = `
+          <span class="vial-name">Vial ${i}</span>
+          <span class="bottle-tag">${
+            bIdx >= 0
+              ? escapeHtml(wizardState.media.bottles[bIdx].name || `(bottle ${bIdx + 1})`)
+              : "<span class='muted'>unassigned</span>"
+          }</span>
+        `;
+        if (bIdx >= 0) {
+          cell.classList.add("assigned");
+          cell.style.borderColor = color;
+          cell.style.background = color + "14"; // ~8 % opacity tint
+        }
+        if (lockedOther.has(i)) {
+          cell.classList.add("locked-other");
+          cell.disabled = true;
+          cell.title = `Already in experiment "${expState.name}"`;
+        } else {
+          cell.addEventListener("click", () => _cycleVialAssignment(i));
+        }
+        vialBottleGrid.appendChild(cell);
+      }
+    }
+    function _cycleVialAssignment(vial) {
+      const bottles = wizardState.media.bottles;
+      if (bottles.length === 0) {
+        showToast("Add a bottle first (step 2).", "error");
+        return;
+      }
+      const current = wizardState.media.vialToBottle[String(vial)] || null;
+      let idx = current ? bottles.findIndex(b => b.id === current) : -1;
+      idx += 1;
+      if (idx >= bottles.length) {
+        delete wizardState.media.vialToBottle[String(vial)];
+      } else {
+        wizardState.media.vialToBottle[String(vial)] = bottles[idx].id;
+      }
+      buildVialBottleGrid();
+    }
+
+    // Mode selection (step 5 — was step 3 pre-media)
+    modeGrid.addEventListener("click", (e) => {
+      const card = e.target.closest(".mode-card");
+      if (!card || card.disabled) return;
+      [...modeGrid.querySelectorAll(".mode-card")].forEach(c => c.classList.remove("selected"));
+      card.classList.add("selected");
+      wizardState.mode = card.dataset.mode;
+      applyParamPaneVisibility();
+    });
+
+    // Parameters (step 4)
+    function bindParamSlider(id, key, format) {
+      const slider = document.getElementById(`p-${id}`);
+      const display = document.getElementById(`pv-${id}`);
+      slider.addEventListener("input", () => {
+        const v = parseFloat(slider.value);
+        wizardState.params[key] = v;
+        display.textContent = format(v);
+      });
+      // Initialise display
+      display.textContent = format(parseFloat(slider.value));
+      wizardState.params[key] = parseFloat(slider.value);
+    }
+    bindParamSlider("temp", "temperature", v => `${v.toFixed(1)} °C`);
+    bindParamSlider("stir", "stir", v => `${v}`);
+    bindParamSlider("vol", "volume", v => `${v} mL`);
+    // Turbidostat
+    bindParamSlider("lower", "lower", v => v.toFixed(2));
+    bindParamSlider("upper", "upper", v => v.toFixed(2));
+    bindParamSlider("wait", "wait", v => `${v} min`);
+    // Chemostat
+    bindParamSlider("D", "D", v => `${v.toFixed(2)} vol/hr`);
+    bindParamSlider("T", "T", v => `${v} s`);
+    // Morbidostat
+    bindParamSlider("target", "target_od", v => v.toFixed(2));
+    bindParamSlider("lowerm", "od_lower_m", v => v.toFixed(2));
+    bindParamSlider("waitm", "wait_m", v => `${v} min`);
+    bindParamSlider("drugc", "drug_conc", v => `${v.toFixed(2)}x`);
+    bindParamSlider("drugstep", "drug_step", v => `${v.toFixed(1)}x`);
+    bindParamSlider("muthresh", "mu_thresh", v => `${v.toFixed(2)} /hr`);
+    bindParamSlider("growthwin", "growth_window", v => `${v} min`);
+
+    // Review (step 7)
+    function renderReview() {
+      const p = wizardState.params;
+      const vials = _derivedVials();
+      const bottles = wizardState.media.bottles;
+      // Group vials by bottle for a compact display.
+      const byBottle = {};
+      for (const [v, bid] of Object.entries(wizardState.media.vialToBottle)) {
+        if (!byBottle[bid]) byBottle[bid] = [];
+        byBottle[bid].push(Number(v));
+      }
+      const mediaSummary = bottles.length === 0
+        ? "<span class='muted'>—</span>"
+        : bottles.map((b, idx) => {
+            const color = _bottleColor(idx);
+            const vs = (byBottle[b.id] || []).sort((a, b) => a - b);
+            return `<div><span class="swatch" style="background:${color};width:10px;height:10px;border-radius:50%;display:inline-block;margin-right:6px;vertical-align:-1px;"></span>${escapeHtml(b.name)} — ${b.initial_volume_ml} mL → vials [${vs.join(", ") || "(none)"}]</div>`;
+          }).join("");
+      const w = wizardState.media.waste;
+      const sharedRows = `
+        <dt>Name</dt><dd>${escapeHtml(wizardState.name)}</dd>
+        <dt>Notes</dt><dd>${escapeHtml(wizardState.notes) || "<span class='muted'>—</span>"}</dd>
+        <dt>Vials</dt><dd>${vials.join(", ")}
+                          <span class="muted">(${vials.length})</span></dd>
+        <dt>Media</dt><dd>${mediaSummary}</dd>
+        <dt>Waste</dt><dd>${escapeHtml(w.name) || "Carboy"} — ${w.capacity_ml} mL (alert at ${w.high_fill_alert_ml})</dd>
+        <dt>Mode</dt><dd>${escapeHtml(wizardState.mode)}</dd>
+        <dt>Temperature</dt><dd>${p.temperature.toFixed(1)} °C</dd>
+        <dt>Stir</dt><dd>${p.stir}</dd>
+        <dt>Volume</dt><dd>${p.volume} mL</dd>
+      `;
+      const modeRows = {
+        turbidostat: () => `
+          <dt>OD bounds</dt><dd>${p.lower.toFixed(2)} -> ${p.upper.toFixed(2)}</dd>
+          <dt>Pump wait</dt><dd>${p.wait} min</dd>
+        `,
+        chemostat: () => `
+          <dt>Dilution rate</dt><dd>${p.D.toFixed(2)} vol/hr</dd>
+          <dt>Bolus interval</dt><dd>${p.T} s</dd>
+        `,
+        morbidostat: () => `
+          <dt>Target OD</dt><dd>${p.target_od.toFixed(2)}</dd>
+          <dt>OD lower (math)</dt><dd>${p.od_lower_m.toFixed(2)}</dd>
+          <dt>Pump wait</dt><dd>${p.wait_m} min</dd>
+          <dt>Drug conc / step</dt><dd>${p.drug_conc.toFixed(2)}x -> x${p.drug_step.toFixed(1)} per escalation</dd>
+          <dt>Adaptation threshold</dt><dd>${p.mu_thresh.toFixed(2)} /hr</dd>
+          <dt>Growth window</dt><dd>${p.growth_window} min</dd>
+        `,
+      };
+      const renderRows = modeRows[wizardState.mode] || modeRows.turbidostat;
+      reviewDl.innerHTML = sharedRows + renderRows();
+    }
+
+    // Submit: create then start
+    async function submitExperiment() {
+      const p = wizardState.params;
+      const sharedParams = {
+        temperature_c: p.temperature,
+        stir_rate: p.stir,
+        volume_ml: p.volume,
+      };
+      const modeParams = ({
+        turbidostat: () => ({
+          od_lower_thresh: p.lower,
+          od_upper_thresh: p.upper,
+          pump_wait_minutes: p.wait,
+        }),
+        chemostat: () => ({
+          dilution_rate_per_hour: p.D,
+          bolus_interval_seconds: p.T,
+        }),
+        morbidostat: () => ({
+          target_od: p.target_od,
+          od_lower: p.od_lower_m,
+          pump_wait_minutes: p.wait_m,
+          initial_drug_conc: p.drug_conc,
+          drug_step: p.drug_step,
+          adaptation_threshold_per_hour: p.mu_thresh,
+          growth_window_seconds: p.growth_window * 60,
+        }),
+      }[wizardState.mode] || (() => ({})))();
+      const body = {
+        name: wizardState.name,
+        notes: wizardState.notes,
+        mode: wizardState.mode,
+        // vials are derived server-side from media.vial_to_bottle, but we
+        // send them explicitly for clarity (the server validates the match).
+        vials: _derivedVials(),
+        params: { ...sharedParams, ...modeParams },
+        media: {
+          bottles: wizardState.media.bottles.map(b => ({
+            id: b.id,
+            name: b.name.trim(),
+            contents: (b.contents || "").trim(),
+            initial_volume_ml: b.initial_volume_ml,
+            low_volume_alert_ml: b.low_volume_alert_ml,
+          })),
+          vial_to_bottle: { ...wizardState.media.vialToBottle },
+          waste: {
+            name: wizardState.media.waste.name,
+            capacity_ml: wizardState.media.waste.capacity_ml,
+            high_fill_alert_ml: wizardState.media.waste.high_fill_alert_ml,
+          },
+        },
+      };
+      wizardNext.disabled = true;
+      const original = wizardNext.textContent;
+      wizardNext.textContent = "Creating…";
+      try {
+        await postJson("/api/experiments/create", body);
+        wizardNext.textContent = "Starting…";
+        await postJson(`/api/experiments/${encodeURIComponent(wizardState.name)}/start`, {});
+        showToast(`Experiment "${wizardState.name}" started`, "ok");
+        closeExpModal();
+        await refreshExperimentStatus();
+      } catch (err) {
+        showToast(`Failed: ${err.message}`, "error");
+      } finally {
+        wizardNext.disabled = false;
+        wizardNext.textContent = original;
+      }
+    }
+
+    // --- Socket.IO ---
+    const socket = io({ transports: ["websocket", "polling"] });
+    socket.on("connect", () => {
+      setConnection("connected");
+      if (!actuatorState.loaded) fetchActuatorState();
+      refreshExperimentStatus();
+    });
+    socket.on("disconnect", () => setConnection("disconnected"));
+    socket.on("sensor_update", updateVials);
+    socket.on("alert", (msg) => {
+      const kind = msg.level === "critical" ? "error" : "ok";
+      showToast(msg.message || "Alert", kind);
+    });
+    socket.on("experiment_event", (msg) => {
+      if (msg && msg.type === "pump" && typeof msg.vial === "number") {
+        // Pump fired — count it (one PumpAction = two physical pumps,
+        // influx + efflux; count the dilution event, i.e. the influx).
+        if (msg.direction === "influx") {
+          expState.pumpCount = (expState.pumpCount || 0) + 1;
+          renderExpBar();
+        }
+        flashPump(msg.vial, msg.direction, msg.duration_seconds);
+      }
+      if (["created", "started", "stopped", "resumed", "error",
+           "maintenance_entered", "maintenance_exited",
+           "escalation_proposed", "escalation_confirmed"].includes(msg && msg.type)) {
+        // Reset pump count when a new experiment starts or the current one
+        // ends so the displayed total reflects the active run.
+        if (msg.type === "started" || msg.type === "created") {
+          expState.pumpCount = 0;
+        }
+        refreshExperimentStatus();
+      }
+    });
+
+    // --- Pump flash on the vial card (brief 1 s visual indicator) ---
+    const _flashTimers = {};
+    function flashPump(vial, direction, durationSeconds) {
+      const card = document.getElementById(`vial-${vial}`);
+      const indicator = document.getElementById(`pump-ind-${vial}`);
+      if (!card || !indicator) return;
+      // Animation: pulse the box-shadow ring.
+      card.classList.remove("pump-flash");
+      // Force reflow so the animation restarts on rapid back-to-back fires.
+      void card.offsetWidth;
+      card.classList.add("pump-flash");
+      // Text indicator (overrides the locked "exp:" label briefly).
+      indicator.textContent = direction === "influx" ? "INFLUX" : "EFFLUX";
+      indicator.classList.add("show");
+      card.classList.add("pumping");
+      clearTimeout(_flashTimers[vial]);
+      _flashTimers[vial] = setTimeout(() => {
+        card.classList.remove("pump-flash", "pumping");
+        indicator.classList.remove("show");
+      }, 1000);
+    }
+
+    // Kick off the state fetch immediately too, in case socket connect is slow.
+    fetchActuatorState();
+    refreshExperimentStatus();
+    renderExpBar();
+  </script>
+</body>
+</html>
