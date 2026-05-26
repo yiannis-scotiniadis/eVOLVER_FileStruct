@@ -7,18 +7,24 @@ VENV_DIR="$REPO_DIR/.venv"
 SECRET_DIR="/etc/evolver"
 SECRET_FILE="$SECRET_DIR/secret.env"
 LOG_DIR="/var/log/evolver"
+PYTHON_BIN="/opt/python3.11/bin/python3.11"
 
 if [[ "$(pwd)" != "$REPO_DIR" ]]; then
     echo "ERROR: run this from $REPO_DIR (currently: $(pwd))" >&2
     exit 1
 fi
 
-echo "[1/6] Installing system packages (python3, python3-venv, python3-pip)..."
-sudo apt-get update
-sudo apt-get install -y python3 python3-venv python3-pip
+if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+    echo "ERROR: $PYTHON_BIN not found." >&2
+    echo "The system Python on this RPi is too old (Raspbian Jessie ships 3.4)." >&2
+    echo "Build Python 3.11 from source first per DEPLOY.md sections N3-N5." >&2
+    exit 1
+fi
+
+echo "[1/6] Skipping system python install (using $PYTHON_BIN built per DEPLOY.md N5)..."
 
 echo "[2/6] Creating Python virtualenv at $VENV_DIR..."
-python3 -m venv "$VENV_DIR"
+"$PYTHON_BIN" -m venv "$VENV_DIR"
 "$VENV_DIR/bin/pip" install --upgrade pip
 "$VENV_DIR/bin/pip" install -r "$REPO_DIR/requirements.txt"
 

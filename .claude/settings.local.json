@@ -1,0 +1,33 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c ' *)",
+      "Bash(python server/test_turbidostat.py)",
+      "Bash(python server/test_experiment_engine.py)",
+      "Bash(python server/test_data_logger.py)",
+      "Bash(python server/test_watchdog.py)",
+      "Bash(python server/test_serial_manager.py)",
+      "Bash(python server/test_mock_serial_manager.py)",
+      "Bash(python test_serial_manager.py)",
+      "Bash(python test_watchdog.py)",
+      "Bash(python test_turbidostat.py)",
+      "Bash(python test_chemostat.py)",
+      "Bash(python test_morbidostat.py)",
+      "Bash(python test_data_logger.py)",
+      "Bash(python -c \"import sys; sys.path.insert\\(0, '.'\\); import app; print\\('app.py imports OK'\\)\")",
+      "Bash(git -C \"c:\\\\Research\\\\BIOLOGY\\\\PersonalResearch\\\\EVOLVER_GUI_DEV\\\\eVOLVER_FileStruct\" status --short)",
+      "Bash(dir /s /b)",
+      "PowerShell(Get-ChildItem -Path \"c:\\\\Research\\\\BIOLOGY\\\\PersonalResearch\\\\EVOLVER_GUI_DEV\\\\eVOLVER_FileStruct\" -Recurse -Exclude \".git\", \"__pycache__\", \".pytest_cache\" | Where-Object {$_.PSIsContainer -eq $false} | Select-Object FullName | ForEach-Object {$_.FullName -replace [regex]::Escape\\(\"c:\\\\Research\\\\BIOLOGY\\\\PersonalResearch\\\\EVOLVER_GUI_DEV\\\\eVOLVER_FileStruct\"\\), \".\"})",
+      "Bash(Get-ChildItem -Recurse -Directory)",
+      "Bash(Select-Object FullName)",
+      "Bash(git -C \"c:\\\\Research\\\\BIOLOGY\\\\PersonalResearch\\\\EVOLVER_GUI_DEV\\\\eVOLVER_FileStruct\" show 0c3d7f6:rpi_original/evolver_UPD.py)",
+      "Bash(dir server\\\\test_*.py)",
+      "Bash(pip show *)",
+      "Bash(findstr /i \"name version\")",
+      "PowerShell($tests = @\\('test_serial_manager.py','test_mock_serial_manager.py','test_turbidostat.py','test_chemostat.py','test_morbidostat.py','test_data_logger.py','test_watchdog.py','test_experiment_engine.py'\\); foreach \\($t in $tests\\) { Write-Host \"--- $t ---\"; & python \"server/$t\" 2>&1 | Select-Object -Last 8; Write-Host \"exit=$LASTEXITCODE`n\" })",
+      "PowerShell(python server/test_mock_serial_manager.py 2>&1 | Select-Object -Last 20; Write-Host \"exit=$LASTEXITCODE\")",
+      "PowerShell(python server/test_mock_serial_manager.py 2>&1 | Select-Object -Last 15; Write-Host \"exit=$LASTEXITCODE\")",
+      "Bash(python server/app.py --mock)"
+    ]
+  }
+}

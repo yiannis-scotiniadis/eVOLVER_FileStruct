@@ -6,6 +6,88 @@ The runbook assumes Phases 0–2 of the deployment plan are already complete (te
 
 ---
 
+## Prerequisites — Python 3.11 on Raspbian Jessie
+
+The legacy RPi ships Python 3.4.2 (Jessie); the new server requires 3.10+ (Flask 3.x, numpy 1.25, `X | Y` union types). These steps build Python 3.11 into `/opt/python3.11` without touching the system Python (so the old supervisor processes keep working as a fallback). Skip this section if the RPi already has Python 3.11 (e.g. after a Bookworm reflash).
+
+### N1. Bring the RPi online via Ethernet
+
+Plug a LAN cable from the RPi's Ethernet port into the Netgear N300 router (WiFi is currently unavailable). SSH in over the wired link:
+
+```bash
+ssh pi@192.168.1.2
+ping -c 3 8.8.8.8        # need internet for apt + source downloads
+ping -c 3 192.168.1.1    # need the router
+```
+
+If the static IP `192.168.1.2` is only bound to the WiFi interface, edit `/etc/dhcpcd.conf` or `/etc/network/interfaces` to bind it to `eth0` too, then `sudo systemctl restart networking`.
+
+### N2. Stop the legacy supervisor processes
+
+```bash
+sudo supervisorctl stop all
+sudo supervisorctl status        # confirm STOPPED
+sudo fuser /dev/ttyAMA0          # must print nothing
+```
+
+If `fuser` shows a PID, kill it before continuing — neither the Python build nor the new server can share `/dev/ttyAMA0`.
+
+### N3. Refresh apt sources (Jessie's mirrors are dead → archive.debian.org)
+
+```bash
+sudo cp /etc/apt/sources.list /etc/apt/sources.list.bak
+sudo tee /etc/apt/sources.list >/dev/null <<'EOF'
+deb http://archive.raspbian.org/raspbian/ jessie main contrib non-free rpi
+deb http://archive.debian.org/debian/ jessie main contrib non-free
+deb http://archive.debian.org/debian-security/ jessie/updates main contrib non-free
+EOF
+sudo apt-get -o Acquire::Check-Valid-Until=false update
+```
+
+`Check-Valid-Until=false` is required because Jessie's `Release` files are years past expiry.
+
+### N4. Build OpenSSL 1.1.1 (Jessie ships 1.0.1, Python 3.10+ needs 1.1.1+)
+
+```bash
+sudo apt-get install -y build-essential gcc make wget pkg-config \
+    zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev \
+    libncursesw5-dev libffi-dev tk-dev uuid-dev libgdbm-dev liblzma-dev
+
+cd /tmp
+wget https://www.openssl.org/source/old/1.1.1/openssl-1.1.1w.tar.gz
+tar xzf openssl-1.1.1w.tar.gz
+cd openssl-1.1.1w
+./config --prefix=/opt/openssl-1.1.1 --openssldir=/opt/openssl-1.1.1 shared zlib
+make -j$(nproc)
+sudo make install
+```
+
+Goes into `/opt/openssl-1.1.1`; does not replace the system OpenSSL (`/usr/lib/...`) so any legacy program that links against it keeps working.
+
+### N5. Build Python 3.11 from source into `/opt/python3.11`
+
+```bash
+cd /tmp
+wget https://www.python.org/ftp/python/3.11.9/Python-3.11.9.tgz
+tar xzf Python-3.11.9.tgz
+cd Python-3.11.9
+LDFLAGS="-Wl,-rpath=/opt/openssl-1.1.1/lib" \
+./configure --prefix=/opt/python3.11 \
+    --with-openssl=/opt/openssl-1.1.1 \
+    --enable-optimizations
+make -j$(nproc)                   # 30–60 min on a Pi 2/3
+sudo make altinstall              # altinstall (not install) → only /opt/python3.11/bin/python3.11
+
+/opt/python3.11/bin/python3.11 --version
+/opt/python3.11/bin/python3.11 -c "import ssl; print(ssl.OPENSSL_VERSION)"
+```
+
+Expected: `Python 3.11.9` and `OpenSSL 1.1.1w  11 Sep 2023`.
+
+**If the build fails repeatedly** on missing headers or linker errors that apt-archive can't supply, fall back to **reflashing the SD card with current Raspberry Pi OS Bookworm** (ships Python 3.11 natively) — ~30 min if you have a spare card, and the old card stays intact as rollback.
+
+---
+
 ## Phase 3 — Deploy to the Raspberry Pi
 
 ### P3.1 SSH in and stop the old system
@@ -19,16 +101,15 @@ sudo fuser /dev/ttyAMA0        # must print nothing
 
 If `fuser` shows a PID, kill it before continuing — the new server cannot share `/dev/ttyAMA0`.
 
-### P3.2 Verify Python version
+### P3.2 Verify Python 3.11 is available
 
 ```bash
-python3 --version
+/opt/python3.11/bin/python3.11 --version            # expect: Python 3.11.9
+/opt/python3.11/bin/python3.11 -c "import ssl; print(ssl.OPENSSL_VERSION)"
+                                                    # expect: OpenSSL 1.1.1w
 ```
 
-- `≥ 3.10` (e.g. Raspbian Bookworm ships 3.11): proceed.
-- `3.9` or older (legacy Bullseye): `experiment_engine.py:52` uses the `X | Y` union syntax which fails at import. Two options:
-  - **Preferred:** upgrade to Bookworm (multi-hour, may affect other lab gear).
-  - **Pilot fix:** edit `experiment_engine.py` and rewrite the `ControllerType` union as `Union[X, Y]` from `typing`. One-line change.
+If `/opt/python3.11/bin/python3.11` is missing, complete the Prerequisites section above (N3–N5) first. `install.sh` will refuse to run without it.
 
 ### P3.3 Get the code onto the RPi
 
@@ -80,6 +161,8 @@ The first row of `temp_calibration.txt` must be 16 negative floats (e.g. `-0.103
 cd /home/pi/evolver-gui
 .venv/bin/python server/app.py --mock
 ```
+
+`.venv/bin/python` is a symlink to `/opt/python3.11/bin/python3.11` — verify with `ls -l .venv/bin/python*` if anything looks wrong.
 
 Hit `http://192.168.1.2:5000` from the lab Mac. Confirm:
 - Dashboard renders the 4×4 vial grid.
