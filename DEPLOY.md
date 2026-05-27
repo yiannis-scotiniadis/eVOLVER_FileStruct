@@ -54,7 +54,7 @@ sudo apt-get install -y build-essential gcc make wget pkg-config \
     libncursesw5-dev libffi-dev tk-dev uuid-dev libgdbm-dev liblzma-dev
 
 cd /tmp
-wget https://www.openssl.org/source/old/1.1.1/openssl-1.1.1w.tar.gz
+wget https://github.com/openssl/openssl/releases/download/OpenSSL_1_1_1w/openssl-1.1.1w.tar.gz
 tar xzf openssl-1.1.1w.tar.gz
 cd openssl-1.1.1w
 ./config --prefix=/opt/openssl-1.1.1 --openssldir=/opt/openssl-1.1.1 shared zlib
