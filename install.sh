@@ -7,21 +7,26 @@ VENV_DIR="$REPO_DIR/.venv"
 SECRET_DIR="/etc/evolver"
 SECRET_FILE="$SECRET_DIR/secret.env"
 LOG_DIR="/var/log/evolver"
-PYTHON_BIN="/opt/python3.11/bin/python3.11"
-
 if [[ "$(pwd)" != "$REPO_DIR" ]]; then
     echo "ERROR: run this from $REPO_DIR (currently: $(pwd))" >&2
     exit 1
 fi
 
-if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
-    echo "ERROR: $PYTHON_BIN not found." >&2
-    echo "The system Python on this RPi is too old (Raspbian Jessie ships 3.4)." >&2
-    echo "Build Python 3.11 from source first per DEPLOY.md sections N3-N5." >&2
+# Pick a Python 3.10+ interpreter: prefer the system python3 (Bookworm ships
+# 3.11, Trixie ships 3.13), fall back to a hand-built /opt/python3.11 (the
+# Jessie source-build escape path in DEPLOY.md Addendum 1).
+if python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' 2>/dev/null; then
+    PYTHON_BIN="$(command -v python3)"
+elif [[ -x /opt/python3.11/bin/python3.11 ]]; then
+    PYTHON_BIN="/opt/python3.11/bin/python3.11"
+else
+    echo "ERROR: need Python 3.10+ and none was found." >&2
+    echo "Modern Raspberry Pi OS (Bookworm/Trixie) ships it as python3." >&2
+    echo "On an ancient OS, build /opt/python3.11 per DEPLOY.md Addendum 1 (N3-N5)." >&2
     exit 1
 fi
 
-echo "[1/6] Skipping system python install (using $PYTHON_BIN built per DEPLOY.md N5)..."
+echo "[1/6] Using Python: $PYTHON_BIN ($("$PYTHON_BIN" --version 2>&1))"
 
 echo "[2/6] Creating Python virtualenv at $VENV_DIR..."
 "$PYTHON_BIN" -m venv "$VENV_DIR"
