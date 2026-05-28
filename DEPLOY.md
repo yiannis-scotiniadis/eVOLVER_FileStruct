@@ -307,10 +307,79 @@ After the pilot, restore `WATCHDOG_TIMEOUT_MINUTES = 30` in `server/app.py:66`.
 
 ## Operations
 
-- **Logs:** `sudo journalctl -u evolver -f` (live tail) or `/var/log/evolver/app.log` (persistent).
-- **Restart:** `sudo systemctl restart evolver` — triggers `resume_on_startup()` which rebuilds the in-flight experiment from `state.json`.
-- **Clean shutdown:** `sudo systemctl stop evolver` — fires the SIGTERM handler which zeros stir, parks heaters at 4095, and stops pumps before exit.
+- **Logs:** the server logs to `/var/log/evolver/app.log` (persistent) — tail it with `tail -f /var/log/evolver/app.log`. `sudo journalctl -u evolver -f` shows only systemd lifecycle events (start/stop), *not* the sensor-loop output, because the unit redirects stdout to the file.
+- **Clean shutdown / restart:** `sudo systemctl stop` (or `restart`) `evolver` fires the SIGTERM handler, which calls `stop_experiment(reason="shutdown")` — this **ends** any running experiment (marks it STOPPED; it cannot be re-`start`ed), zeros stir, parks heaters at 4095, and stops pumps. **A clean restart does NOT resume the experiment.**
+- **Crash recovery:** `resume_on_startup()` fires *only* after an **unclean** exit (power loss / crash that left `state.json` at RUNNING). On the next boot it rebuilds and resumes that experiment. A deliberate stop is never resumed.
 - **Source of truth for a running experiment:** `experiments/<name>/state.json`. Back this up before any risky operation.
+
+## Installing updates
+
+Future versions ship as git tags (`pilot-v0.1.2`, then `v0.2.0`, …). Follow this protocol to move the rig to a new version.
+
+**Principles**
+- **Deploy by tag, never a moving branch.** Always `git checkout <tag>`, never `git pull` on `main` — tags are reproducible and give a clean rollback target.
+- **Updates end the running experiment.** Stopping the service to apply an update fires the SIGTERM handler, which calls `stop_experiment` and marks the run STOPPED (it cannot be re-`start`ed — you'd create a fresh experiment). **Update between experiments, not mid-run.**
+- **Back up first, off the Pi.** SD cards fail; an update is a natural checkpoint.
+- **Test the new tag before it touches the live rig** — run the test suite on a dev machine and/or boot the new tag in `--mock` mode first.
+
+### Update an existing Pi to a new version
+
+```bash
+# 0. Pre-flight — confirm no experiment is running (or accept that it ends).
+#    Read the new tag's notes for state.json / calibration / requirements changes.
+cd /home/pi/evolver-gui
+git describe --tags                               # record CURRENT tag (rollback target)
+mkdir -p ~/backups/$(date +%F)
+cp -r experiments ~/backups/$(date +%F)/          # back up data
+cp calibration/*.txt ~/backups/$(date +%F)/       # back up calibration
+
+# 1. Stop the service (ends any running experiment, zeros actuators).
+sudo systemctl stop evolver
+
+# 2. Move to the new version.
+git fetch origin --tags
+git checkout <new-tag>
+
+# 3. Apply it. install.sh is idempotent: it updates the venv from
+#    requirements.txt and re-registers the systemd unit. For a major
+#    dependency jump (e.g. a numpy major version), rebuild the venv
+#    first: rm -rf .venv
+./install.sh
+
+# 4. Restart and verify.
+sudo systemctl start evolver
+systemctl status evolver --no-pager               # active (running)?
+tail -n 40 /var/log/evolver/app.log               # "loaded calibration", clean sensor cycles?
+curl -s localhost:5000/api/sensors/all | head -c 200; echo
+# Hard-refresh the dashboard; spot-check one manual control.
+```
+
+If `install.sh` fails at the pip step (e.g. an unresolvable dependency), the service stays down until you fix it or roll back — which is exactly why you test the new tag off the live rig first.
+
+### Rollback
+
+Symmetric, because you deploy by tag:
+
+```bash
+sudo systemctl stop evolver
+cd /home/pi/evolver-gui && git checkout <previous-tag>
+./install.sh
+sudo systemctl start evolver
+```
+
+Restore `experiments/` and `calibration/` from your backup if a bad version altered them.
+
+### Clean re-install (new SD card / new Pi)
+
+Use the full flow at the top of this runbook: flash current Raspberry Pi OS (64-bit) → static IP + UART (`disable-bt`) → `apt install python3-venv python3-pip git` → `git clone` → `git checkout <tag>` → `./install.sh` → mock test → Phase 4 hardware validation → `systemctl enable --now evolver`. On a modern OS the N1–N5 Python-build prerequisites do **not** apply — those exist only for the legacy Jessie escape path.
+
+### ⚠ Calibration is not update-safe yet
+
+`calibration/temp_calibration.txt` and `OD_cal.txt` are **tracked in git**. A `git checkout <tag>` will overwrite them if a future commit ever changes those files — and this rig's calibration is hardware-specific (*calibration is law*). Conversely, re-calibrating on the Pi without committing will make git **block** the next checkout. Until calibration is moved out of version control:
+- **Always** back up `calibration/*.txt` before an update (step 0 above).
+- **After** every update, confirm the values are still this rig's: `head -1 calibration/temp_calibration.txt` — the slopes must be the negative values for this hardware, not something a checkout swapped in.
+
+The durable fix is to stop tracking `calibration/` (gitignore it and treat it as on-Pi config like the secret and `experiments/`). Do that deliberately as its own change, not as part of a routine update.
 
 ## Abort criteria
 
