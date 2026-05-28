@@ -5,4 +5,8 @@
 flask==3.1.3
 flask-socketio==5.6.1
 pyserial==3.5
-numpy==1.25.2
+# numpy: major version locked for API stability, minor floats so pip can pick
+# a version with a wheel for the target Python. numpy 1.25 had no cp313 wheel
+# (Raspberry Pi OS Trixie ships Python 3.13); 2.x has cp311-cp313 aarch64
+# wheels. Verified: all 8 test suites pass on numpy 2.4.6.
+numpy>=2.1,<3
