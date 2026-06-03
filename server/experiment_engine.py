@@ -772,8 +772,21 @@ class ExperimentEngine:
                 # (1) sensor failure handling
                 if _is_nan(temp_c) or _is_nan(od):
                     self._nan_streak[vial] = self._nan_streak.get(vial, 0) + 1
-                    if self._nan_streak[vial] >= self._sensor_failure_threshold:
-                        self._latch_fault_locked(vial, "sensor_fail")
+                    # RS485 reads are lossy: dropped/garbled samples are normal
+                    # and recoverable. Skip this cycle's control decision (no
+                    # valid data) but DO NOT park the heater or latch a stopping
+                    # fault -- the Arduino keeps regulating temperature on its
+                    # own thermistor whether or not the Pi got this sample.
+                    # Warn once on crossing the threshold so a genuinely dead
+                    # sensor stays visible in the journal and the dashboard.
+                    if self._nan_streak[vial] == self._sensor_failure_threshold:
+                        _msg = (
+                            f"Vial {vial}: {self._nan_streak[vial]} consecutive "
+                            "dropped sensor reads (continuing -- lossy bus; "
+                            "heater unaffected)"
+                        )
+                        log.warning(_msg)
+                        self._broadcast_alert(level="warning", message=_msg, vial=vial)
                     continue
                 self._nan_streak[vial] = 0
 
@@ -1325,9 +1338,24 @@ class ExperimentEngine:
         setpoint_raw = self._setpoint_raw.get(vial, HEATER_OFF_SETPOINT)
         setpoint_c = self._raw_to_C(setpoint_raw, vial)
         if temp_c > self._heater_critical_C:
-            # Critical: latch fault, park heater off for this vial.
-            self._latch_fault_locked(vial, "overtemp")
+            # Debounce: the thermistor/RS485 bus is lossy and can spike
+            # spuriously, so a SINGLE over-critical sample must not park the
+            # heater. Require 3 consecutive over-critical reads before latching.
+            streak = getattr(self, "_overtemp_streak", None)
+            if streak is None:
+                streak = self._overtemp_streak = {}
+            streak[vial] = streak.get(vial, 0) + 1
+            if streak[vial] >= 3:
+                self._latch_fault_locked(vial, "overtemp")
+            else:
+                log.warning(
+                    "vial %d temp %.1f C over critical %.1f C (%d/3) -- "
+                    "watching, not latching yet",
+                    vial, temp_c, self._heater_critical_C, streak[vial],
+                )
             return
+        if getattr(self, "_overtemp_streak", None) is not None:
+            self._overtemp_streak[vial] = 0
         if temp_c > setpoint_c + self._heater_overrun_C:
             # Overrun: lower the target by DEFAULT_HEATER_STEP_DOWN_C (SPEC.md §10).
             new_target_c = max(22.0, setpoint_c - DEFAULT_HEATER_STEP_DOWN_C)

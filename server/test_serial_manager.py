@@ -56,6 +56,13 @@ class FakeSerial:
             return self.read_queue.pop(0)
         return b""  # simulates the 5 s timeout returning empty
 
+    def read_until(self, expected: bytes = b"\n", size=None) -> bytes:
+        # SerialManager now reads to the 'end' terminator instead of a newline;
+        # tests queue whole framed responses, so return one per call.
+        if self.read_queue:
+            return self.read_queue.pop(0)
+        return b""  # simulates the 5 s timeout returning empty
+
     def close(self) -> None:
         self.closed = True
 

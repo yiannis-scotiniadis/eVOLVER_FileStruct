@@ -284,11 +284,14 @@ def test_overtemp_fault_isolates_single_vial() -> None:
         engine.start_experiment("exp1")
         before_raw = manager.temp_setpoint_raw.copy()
 
-        # Drive run_cycle with vial 1 over critical, others normal.
+        # Drive run_cycle with vial 1 over critical, others normal. Overtemp
+        # is now debounced (3 consecutive over-critical reads) so a single
+        # noisy sample can't park the heater -- feed three cycles.
         temps = [37.0] * N_VIALS
         temps[1] = 51.0
         ods = [0.1] * N_VIALS
-        engine.run_cycle("2026-05-14T10:00:00+00:00", temps, ods)
+        for i in range(3):
+            engine.run_cycle(f"2026-05-14T10:00:0{i}+00:00", temps, ods)
 
         assert engine.status_string == ExperimentStatus.RUNNING, "engine should stay running"
         # Vial 1 heater parked OFF (HEATER_OFF_SETPOINT, NOT zero — under
@@ -305,7 +308,7 @@ def test_overtemp_fault_isolates_single_vial() -> None:
     print("PASS  overtemp fault parks affected vial off; others continue")
 
 
-def test_sensor_failure_latches_after_threshold() -> None:
+def test_dropped_reads_warn_but_do_not_latch() -> None:
     with TmpRoot() as root:
         engine, manager, dl, events, alerts = _fresh(root)
         engine.create_experiment(
@@ -315,19 +318,25 @@ def test_sensor_failure_latches_after_threshold() -> None:
                         "pump_wait_minutes": 1},
         )
         engine.start_experiment("exp1")
-        # Drive 3 cycles with vial 0 reading NaN
+        before_raw = manager.temp_setpoint_raw.copy()
+        # RS485 reads are lossy. A run of dropped reads (NaN) must NOT stop the
+        # vial or park its heater -- it should warn only, then recover.
         for i in range(3):
             temps = [37.0] * N_VIALS
             ods = [0.1] * N_VIALS
             ods[0] = float("nan")
-            engine.run_cycle(f"2026-05-14T10:00:{i:02d}+00:00", temps, ods)
-        # Vial 0 should be latched with fault=sensor_fail
-        assert engine._vial_faults[0] == "sensor_fail", engine._vial_faults
-        # Vial 1 unaffected
+            engine.run_cycle(f"2026-05-14T10:00:0{i}+00:00", temps, ods)
+        # Vial 0 must NOT be latched, and its heater must NOT be parked.
+        assert engine._vial_faults[0] is None, engine._vial_faults
+        assert manager.temp_setpoint_raw[0] == before_raw[0], (
+            "dropped reads must not park the heater"
+        )
         assert engine._vial_faults[1] is None
-        warns = [a for a in alerts if "sensor_fail" in a["message"]]
-        assert warns, "expected warning alert for sensor_fail"
-    print("PASS  sensor failure latches after threshold; other vials continue")
+        # A warning alert about dropped reads should have fired.
+        warns = [a for a in alerts
+                 if a["level"] == "warning" and "dropped" in a["message"].lower()]
+        assert warns, f"expected a dropped-read warning alert, got {alerts}"
+    print("PASS  lossy dropped reads warn but do not latch or park the heater")
 
 
 def test_emergency_stop_fully_stops_experiment() -> None:
@@ -1273,7 +1282,7 @@ def main() -> int:
     test_run_cycle_respects_pump_wait_gate()
     test_stop_zeros_experiment_vials_only()
     test_overtemp_fault_isolates_single_vial()
-    test_sensor_failure_latches_after_threshold()
+    test_dropped_reads_warn_but_do_not_latch()
     test_emergency_stop_fully_stops_experiment()
     test_get_data_reads_csv_rows()
     test_list_experiments_includes_status()

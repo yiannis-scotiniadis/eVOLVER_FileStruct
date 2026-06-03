@@ -168,7 +168,7 @@ class SerialManager:
 
     def _read_response(self, expected_prefix: str) -> Optional[list[float]]:
         try:
-            raw = self._ser.readline()
+            raw = self._ser.read_until(RESPONSE_TERMINATOR.encode("ascii"))
         except Exception:
             log.exception("serial read failed (expected '%s...end')", expected_prefix)
             return None
