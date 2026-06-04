@@ -1,0 +1,8 @@
+[Unit]
+Description=Keep Tailscale paths warm to every peer (per-peer reachability on hostile NAT)
+Wants=tailscaled.service
+After=tailscaled.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/ts-keepalive-pingall.sh

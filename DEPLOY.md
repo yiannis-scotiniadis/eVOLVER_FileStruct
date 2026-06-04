@@ -381,6 +381,20 @@ Use the full flow at the top of this runbook: flash current Raspberry Pi OS (64-
 
 The durable fix is to stop tracking `calibration/` (gitignore it and treat it as on-Pi config like the secret and `experiments/`). Do that deliberately as its own change, not as part of a routine update.
 
+## Remote access keepalive (Tailscale)
+
+eVOLVER-001 is reached over Tailscale. On Yale's symmetric-NAT WiFi the Pi's per-peer reachability decays when idle — a peer can only reach the Pi after the Pi has initiated a path to *that* peer. `deploy/ts-keepalive/` holds a systemd timer that, every 20 s, has the Pi `tailscale ping` every enrolled peer (self excluded) to keep all paths warm. Install on the Pi:
+
+```bash
+cd deploy/ts-keepalive
+sudo install -m 0755 ts-keepalive-pingall.sh /usr/local/bin/ts-keepalive-pingall.sh
+sudo install -m 0644 ts-keepalive.service /etc/systemd/system/ts-keepalive.service
+sudo install -m 0644 ts-keepalive.timer   /etc/systemd/system/ts-keepalive.timer
+sudo systemctl daemon-reload && sudo systemctl enable --now ts-keepalive.timer
+```
+
+This is a workaround for a hostile network; wired Ethernet (removes the symmetric NAT) is the real fix. A brand-new device may need a one-time `tailscale ping <device>` from the Pi until the Pi's netmap learns it. Full rationale in `deploy/ts-keepalive/README.md`.
+
 ## Abort criteria
 
 Any of these → stop and reassess:

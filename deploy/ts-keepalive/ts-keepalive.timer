@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the Tailscale ping-all keepalive every 20s
+
+[Timer]
+OnBootSec=20
+OnUnitActiveSec=20
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target
