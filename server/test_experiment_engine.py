@@ -187,7 +187,7 @@ def test_run_cycle_returns_pump_action_at_threshold() -> None:
         assert vial == 0
         # pump_time = -ln(0.2/0.5) * 25 / 1 = 22.91 -> capped at 20 by SPEC.
         assert 19.99 < action.pump_time <= 20.01
-        assert action.efflux_extra_seconds == 5.0
+        assert action.efflux_extra_seconds == 0.0  # DEFAULT_EFFLUX_EXTRA_SECONDS
         assert 0.49 < action.average_od < 0.51
 
         # Engine must not emit pump events on its own anymore.
@@ -653,19 +653,19 @@ def test_run_cycle_debits_correct_bottle_and_waste() -> None:
             ))
             clock_state["t"] += 10.0
 
-        # One PumpAction per vial — each capped at 20s influx + 5s efflux extra.
+        # One PumpAction per vial — each capped at 20s influx + 0s efflux extra.
         assert len(all_actions) == 2
         # Bottle A debited by vial 0's influx: 20 s * 1 ml/s = 20 mL
         assert abs(engine._bottle_consumed_ml["bottle_a"] - 20.0) < 1e-6
         # Bottle B debited by vial 1's influx
         assert abs(engine._bottle_consumed_ml["bottle_b"] - 20.0) < 1e-6
-        # Waste filled by both vials: each (20 + 5) s * 1 ml/s = 25 mL → 50 mL total
-        assert abs(engine._waste_filled_ml - 50.0) < 1e-6
+        # Waste filled by both vials: each (20 + 0) s * 1 ml/s = 20 mL → 40 mL total
+        assert abs(engine._waste_filled_ml - 40.0) < 1e-6
 
         s = engine.status()
         assert s["media"]["bottles"][0]["remaining_ml"] == 980.0  # 1000 - 20
         assert s["media"]["bottles"][1]["remaining_ml"] == 480.0  # 500 - 20
-        assert s["media"]["waste"]["filled_ml"] == 50.0
+        assert s["media"]["waste"]["filled_ml"] == 40.0
     print("PASS  run_cycle debits correct bottle and waste per pump action")
 
 

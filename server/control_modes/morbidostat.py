@@ -78,7 +78,7 @@ class MorbidostatController:
         pump_wait_seconds: float,
         flow_rate_ml_s: float,
         volume_ml: float,
-        efflux_extra_seconds: float = 5.0,
+        efflux_extra_seconds: float = 0.0,
         history_window: int = 5,
         pump_duration_cap_seconds: float = 20.0,
         min_samples_before_action: int = 8,

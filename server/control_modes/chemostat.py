@@ -40,7 +40,7 @@ class ChemostatController:
         bolus_interval_seconds: float,
         volume_ml: float,
         flow_rate_ml_s: float,
-        efflux_extra_seconds: float = 5.0,
+        efflux_extra_seconds: float = 0.0,
         pump_duration_cap_seconds: float = 20.0,
     ) -> None:
         if not (0 <= vial < 16):
