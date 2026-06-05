@@ -19,6 +19,7 @@ import argparse
 import atexit
 import json
 import logging
+import math
 import os
 import signal
 import sys
@@ -29,6 +30,7 @@ from pathlib import Path
 
 import numpy as np
 from flask import Flask, jsonify, render_template, request
+from flask.json.provider import DefaultJSONProvider
 from flask_socketio import SocketIO
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -179,6 +181,37 @@ def _read_od_pair(state: AppState) -> dict:
     return {"calibrated": values, "raw": list(values)}
 
 
+# --- NaN/Inf JSON safety ----------------------------------------------------
+# NaN and Infinity are NOT valid JSON. A bare NaN in an emitted payload
+# crashes the browser's Socket.IO parser ("parse error" -> reconnect storm)
+# and corrupts any jsonify() response that contains one. The control loop,
+# turbidostat, and CSV logger already treat NaN as a sensor-failure signal;
+# these shims make the wire format agree, at every serialization boundary.
+def _json_safe(obj):
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    return obj
+
+
+class _SafeJSON:
+    @staticmethod
+    def dumps(obj, **kw):
+        return json.dumps(_json_safe(obj), **kw)
+
+    @staticmethod
+    def loads(s, **kw):
+        return json.loads(s, **kw)
+
+
+class _SafeJSONProvider(DefaultJSONProvider):
+    def dumps(self, obj, **kwargs):
+        return super().dumps(_json_safe(obj), **kwargs)
+
+
 def create_app(use_mock: bool):
     if use_mock:
         manager = MockSerialManager()
@@ -213,7 +246,15 @@ def create_app(use_mock: bool):
     flask_app.config["SECRET_KEY"] = os.environ.get(
         "EVOLVER_SECRET_KEY", "dev-not-secret"
     )
-    socketio = SocketIO(flask_app, cors_allowed_origins="*", async_mode="threading")
+    flask_app.json = _SafeJSONProvider(flask_app)
+    socketio = SocketIO(
+        flask_app,
+        cors_allowed_origins="*",
+        async_mode="threading",
+        json=_SafeJSON,
+        ping_interval=25,
+        ping_timeout=60,
+    )
 
     # ---------------------- Watchdog (SPEC §10) ------------------------------
     # Runs in its own thread; the sensor loop pets it every cycle. If the
