@@ -44,7 +44,16 @@ import numpy as np
 from control_modes.chemostat import ChemostatController
 from control_modes.morbidostat import EscalationEvent, MorbidostatController
 from control_modes.turbidostat import PumpAction, TurbidostatController
-from serial_manager import HEATER_OFF_SETPOINT, MAX_SAFE_TEMP_C
+from data_export import filter_rows_by_hours
+from data_logger import _VALID_NAME
+from serial_manager import (
+    HEATER_OFF_SETPOINT,
+    MAX_SAFE_TEMP_C,
+    OD_AGG_CHOICES,
+    OD_AGG_DEFAULT,
+    OD_DEFAULT_N_DARK,
+    OD_DEFAULT_N_SAMPLES,
+)
 
 # Union of all controller types accepted by the engine. New modes that follow
 # the same interface (push_od / decide / to_state / restore_state /
@@ -83,6 +92,17 @@ DEFAULT_VOLUME_ML = 25.0
 DEFAULT_EFFLUX_EXTRA_SECONDS = 0.0
 DEFAULT_HISTORY_WINDOW = 5
 DEFAULT_PUMP_WAIT_MINUTES = 15.0
+
+# Enhanced OD acquisition defaults (median-of-N averaging + dark subtraction +
+# range guard). Used for the per-experiment "od_acquisition" config block; the
+# sensor_loop reads these via ExperimentEngine.od_acquisition_params() and only
+# while an experiment is RUNNING (idle reads use the naive single read).
+DEFAULT_OD_ACQUISITION: dict = {
+    "n_samples": OD_DEFAULT_N_SAMPLES,
+    "dark_subtract": False,
+    "n_dark": OD_DEFAULT_N_DARK,
+    "agg": OD_AGG_DEFAULT,
+}
 
 log = logging.getLogger(__name__)
 
@@ -130,6 +150,38 @@ def _as_list_of_16(value: Any, *, default: float, name: str) -> list[float]:
             )
         return [float(v) for v in value]
     raise ValueError(f"'{name}' must be a number or a list of {N_VIALS} numbers")
+
+
+def _parse_od_acquisition(parameters: dict) -> dict:
+    """Validate and normalize the optional ``od_acquisition`` block from an
+    experiment's parameters. Returns a complete dict with all four keys, falling
+    back to :data:`DEFAULT_OD_ACQUISITION` for anything omitted. Raises
+    ``ValueError`` on malformed values (the API maps these to HTTP 400)."""
+    block = parameters.get("od_acquisition") or {}
+    if not isinstance(block, dict):
+        raise ValueError("'od_acquisition' must be an object")
+    out = dict(DEFAULT_OD_ACQUISITION)
+    out.update({k: block[k] for k in block if k in DEFAULT_OD_ACQUISITION})
+
+    n_samples = int(out["n_samples"])
+    if n_samples < 1:
+        raise ValueError(f"od_acquisition.n_samples must be >= 1, got {n_samples}")
+    n_dark = int(out["n_dark"])
+    if n_dark < 0:
+        raise ValueError(f"od_acquisition.n_dark must be >= 0, got {n_dark}")
+    if not isinstance(out["dark_subtract"], bool):
+        raise ValueError("od_acquisition.dark_subtract must be a boolean")
+    agg = str(out["agg"])
+    if agg not in OD_AGG_CHOICES:
+        raise ValueError(
+            f"od_acquisition.agg must be one of {OD_AGG_CHOICES}, got {agg!r}"
+        )
+    return {
+        "n_samples": n_samples,
+        "dark_subtract": out["dark_subtract"],
+        "n_dark": n_dark,
+        "agg": agg,
+    }
 
 
 def _validate_and_normalize_media(media: dict) -> dict:
@@ -275,6 +327,7 @@ class ExperimentEngine:
         self._setpoint_raw: dict[int, int] = {}
         self._setpoint_stir: int = 0
         self._nan_streak: dict[int, int] = {}
+        self._od_range_streak: dict[int, int] = {}
         self._vial_faults: dict[int, Optional[str]] = {}
         self._created_at: Optional[datetime] = None
         self._started_at: Optional[datetime] = None
@@ -323,6 +376,22 @@ class ExperimentEngine:
         with self._lock:
             return self._status
 
+    def od_acquisition_params(self) -> dict:
+        """Enhanced-OD acquisition parameters for the loaded experiment, as
+        keyword args for ``SerialManager.read_od_enhanced`` (``n_samples``,
+        ``dark_subtract``, ``n_dark``, ``agg``). Returns the validated
+        per-experiment ``od_acquisition`` block merged over defaults; falls back
+        to :data:`DEFAULT_OD_ACQUISITION` when nothing is loaded."""
+        with self._lock:
+            params = (self._config or {}).get("parameters", {})
+        try:
+            return _parse_od_acquisition(params)
+        except ValueError:
+            # Config was validated at create time; if somehow malformed (e.g.
+            # hand-edited), fall back to safe defaults rather than break reads.
+            log.exception("invalid od_acquisition in loaded config; using defaults")
+            return dict(DEFAULT_OD_ACQUISITION)
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -349,6 +418,10 @@ class ExperimentEngine:
             raise ValueError(
                 f"unsupported mode {mode!r}; supported: {sorted(SUPPORTED_MODES)}"
             )
+
+        # Validate the optional od_acquisition block up front so a malformed
+        # config fails at create time (HTTP 400) rather than at first read.
+        _parse_od_acquisition(parameters or {})
 
         normalized_media: Optional[dict] = None
         if media is not None:
@@ -391,6 +464,7 @@ class ExperimentEngine:
             self._setpoint_raw = {v: HEATER_OFF_SETPOINT for v in self._vials}
             self._setpoint_stir = 0
             self._nan_streak = {v: 0 for v in self._vials}
+            self._od_range_streak = {v: 0 for v in self._vials}
             self._vial_faults = {v: None for v in self._vials}
             self._created_at = _now_utc()
             self._started_at = None
@@ -518,6 +592,110 @@ class ExperimentEngine:
                 raise FileNotFoundError(f"experiment directory not found: {exp_dir}")
             shutil.rmtree(exp_dir)
         log.info("experiment '%s' deleted", name)
+
+    def rename_experiment(self, old: str, new: str) -> dict:
+        """Rename an experiment directory and its ``name`` field in
+        ``config.json`` / ``state.json``.
+
+        Blocked while ``old`` is the loaded experiment AND it is RUNNING or in
+        maintenance mode (mirrors the :meth:`delete_experiment` guard); allowed
+        for unloaded experiments or a loaded one in CREATED/STOPPED/ERROR.
+        Returns ``{"old": old, "new": new}``.
+
+        Raises:
+            ValueError: ``new`` is malformed or equal to ``old``.
+            InvalidExperimentStateError: ``old`` is loaded and running.
+            FileNotFoundError: ``old`` directory does not exist.
+            FileExistsError: ``new`` directory already exists.
+        """
+        if not isinstance(new, str) or not _VALID_NAME.match(new):
+            raise ValueError(
+                f"experiment name must match {_VALID_NAME.pattern!r}; got {new!r}"
+            )
+        with self._lock:
+            is_loaded = self._name == old
+            if is_loaded and (
+                self._status == ExperimentStatus.RUNNING or self._maintenance_active
+            ):
+                raise InvalidExperimentStateError(
+                    f"cannot rename '{old}' while it is loaded with status="
+                    f"{self._status}"
+                )
+            old_dir = self._experiments_root / old
+            new_dir = self._experiments_root / new
+            if not old_dir.is_dir():
+                raise FileNotFoundError(f"experiment directory not found: {old_dir}")
+            if new == old:
+                raise ValueError("new name is the same as the old name")
+            if new_dir.exists():
+                raise FileExistsError(
+                    f"experiment directory already exists: {new_dir}"
+                )
+
+            shutil.move(str(old_dir), str(new_dir))
+
+            # Rewrite the name field in config.json (atomic) and state.json.
+            try:
+                self._data_logger.update_experiment_config(new, {"name": new})
+            except Exception:
+                log.exception("rename: failed to update config.json name")
+            state_path = new_dir / "state.json"
+            if state_path.is_file():
+                try:
+                    s = json.loads(state_path.read_text(encoding="utf-8"))
+                    s["name"] = new
+                    tmp = new_dir / "state.json.tmp"
+                    tmp.write_text(json.dumps(s, indent=4), encoding="utf-8")
+                    os.replace(tmp, state_path)
+                except Exception:
+                    log.exception("rename: failed to update state.json name")
+
+            if is_loaded:
+                self._name = new
+                if self._config is not None:
+                    self._config["name"] = new
+
+        self._broadcast_event({"type": "renamed", "old": old, "new": new})
+        log.info("experiment '%s' renamed to '%s'", old, new)
+        return {"old": old, "new": new}
+
+    def update_metadata(
+        self,
+        name: str,
+        *,
+        notes: Optional[str] = None,
+        tags: Optional[list] = None,
+    ) -> dict:
+        """Edit free-text ``notes`` and/or ``tags`` on an experiment's
+        ``config.json``. Works whether or not ``name`` is the loaded
+        experiment; when it is loaded, the in-memory config is refreshed so
+        :meth:`status` reflects the edit. Returns the merged config dict.
+
+        Raises:
+            ValueError: notes/tags are the wrong type, or nothing to update.
+            FileNotFoundError: config.json missing (from the DataLogger).
+        """
+        partial: dict = {}
+        if notes is not None:
+            if not isinstance(notes, str):
+                raise ValueError("notes must be a string")
+            partial["notes"] = notes
+        if tags is not None:
+            if not isinstance(tags, list) or not all(
+                isinstance(t, str) for t in tags
+            ):
+                raise ValueError("tags must be a list of strings")
+            partial["tags"] = tags
+        if not partial:
+            raise ValueError("nothing to update (provide notes and/or tags)")
+
+        merged = self._data_logger.update_experiment_config(name, partial)
+        with self._lock:
+            if self._name == name and self._config is not None:
+                self._config = merged
+        self._broadcast_event({"type": "metadata_updated", "name": name})
+        log.info("experiment '%s' metadata updated (%s)", name, list(partial))
+        return merged
 
     def handle_emergency_stop(self) -> None:
         """Called by `api_emergency_stop` after `manager.emergency_shutdown()`
@@ -734,6 +912,7 @@ class ExperimentEngine:
         timestamp_iso: str,
         temperature_calibrated: list[float],
         od_calibrated: list[float],
+        od_flags: Optional[list[str]] = None,
     ) -> list[tuple[int, PumpAction]]:
         """Run one control-loop tick. Returns pump actions the caller
         should execute (each as a ``(vial, PumpAction)`` tuple). Returns
@@ -747,6 +926,13 @@ class ExperimentEngine:
         The engine still handles per-vial heater safety, NaN-streak
         fault latching, stir re-send, and state.json persistence —
         those are pure engine concerns that don't need the caller.
+
+        ``od_flags`` is the optional per-vial flag list from the enhanced OD
+        reader (``"ok" | "out_of_range" | "dropped"``). When provided, an
+        ``out_of_range`` reading (OD past the calibrated domain — likely
+        saturation) is tracked on a SEPARATE streak with a distinct warning,
+        rather than being counted as a lossy-bus dropped read. ``None``
+        preserves the legacy behavior (all NaN OD treated as dropped).
         """
         if len(temperature_calibrated) != N_VIALS or len(od_calibrated) != N_VIALS:
             log.warning(
@@ -768,17 +954,43 @@ class ExperimentEngine:
                     continue  # latched fault — skip
                 temp_c = temperature_calibrated[vial]
                 od = od_calibrated[vial]
+                temp_nan = _is_nan(temp_c)
+                od_nan = _is_nan(od)
 
-                # (1) sensor failure handling
-                if _is_nan(temp_c) or _is_nan(od):
+                # (1a) OD out-of-range: a DISTINCT condition from a lossy
+                # dropped read. The OD is NaN (range guard rejected it), but
+                # the bus delivered data — likely the culture is denser than
+                # the calibration covers (saturation). Track on its own streak,
+                # warn once on crossing the threshold, and skip OD control —
+                # but let heater safety still run if the temperature is valid.
+                od_out_of_range = (
+                    od_flags is not None
+                    and vial < len(od_flags)
+                    and od_flags[vial] == "out_of_range"
+                )
+                if od_out_of_range:
+                    self._od_range_streak[vial] = self._od_range_streak.get(vial, 0) + 1
+                    if self._od_range_streak[vial] == self._sensor_failure_threshold:
+                        _msg = (
+                            f"Vial {vial}: OD out of calibrated range for "
+                            f"{self._od_range_streak[vial]} consecutive cycles "
+                            "(possible saturation / culture denser than "
+                            "calibration; continuing -- heater unaffected)"
+                        )
+                        log.warning(_msg)
+                        self._broadcast_alert(level="warning", message=_msg, vial=vial)
+                else:
+                    self._od_range_streak[vial] = 0
+
+                # (1b) lossy/dropped read handling. A NaN temperature, or a NaN
+                # OD that is NOT a known out-of-range reading, is a dropped
+                # sample. Skip this cycle's control decision (no valid data) but
+                # DO NOT park the heater or latch a stopping fault -- the Arduino
+                # keeps regulating temperature on its own thermistor whether or
+                # not the Pi got this sample. Warn once on crossing the
+                # threshold so a genuinely dead sensor stays visible.
+                if temp_nan or (od_nan and not od_out_of_range):
                     self._nan_streak[vial] = self._nan_streak.get(vial, 0) + 1
-                    # RS485 reads are lossy: dropped/garbled samples are normal
-                    # and recoverable. Skip this cycle's control decision (no
-                    # valid data) but DO NOT park the heater or latch a stopping
-                    # fault -- the Arduino keeps regulating temperature on its
-                    # own thermistor whether or not the Pi got this sample.
-                    # Warn once on crossing the threshold so a genuinely dead
-                    # sensor stays visible in the journal and the dashboard.
                     if self._nan_streak[vial] == self._sensor_failure_threshold:
                         _msg = (
                             f"Vial {vial}: {self._nan_streak[vial]} consecutive "
@@ -790,12 +1002,15 @@ class ExperimentEngine:
                     continue
                 self._nan_streak[vial] = 0
 
-                # (2) heater safety
+                # (2) heater safety (temperature is valid here)
                 self._handle_heater_safety_locked(vial, float(temp_c))
                 if self._vial_faults.get(vial) is not None:
                     continue
 
-                # (3) push OD, (4) decide
+                # (3) push OD, (4) decide. Skip OD control when OD is invalid
+                # (out-of-range with otherwise-valid temperature lands here).
+                if od_nan:
+                    continue
                 controller = self._controllers.get(vial)
                 if controller is None:
                     continue
@@ -1029,14 +1244,27 @@ class ExperimentEngine:
         vial: int,
         parameter: str,
         last_n: Optional[int] = None,
+        hours: Optional[float] = None,
+        max_points: Optional[int] = None,
     ) -> dict:
-        """Read CSV rows for a vial/parameter, return JSON-shaped data."""
+        """Read CSV rows for a vial/parameter, return JSON-shaped data.
+
+        ``hours`` keeps only rows within the last ``hours`` of available
+        data (computed from the ``elapsed_hours`` column relative to the
+        last row, so it works for stopped experiments too). ``max_points``
+        downsamples od/temp series via min/max bucketing (see
+        :meth:`_downsample_minmax`); pump events are never downsampled.
+        """
         if parameter not in ("od", "temp", "pump"):
             raise ValueError(f"parameter must be od/temp/pump, got {parameter!r}")
         if not (0 <= vial < N_VIALS):
             raise ValueError(f"vial must be in 0..{N_VIALS - 1}, got {vial}")
         if last_n is not None and last_n <= 0:
             raise ValueError(f"last_n must be > 0, got {last_n}")
+        if hours is not None and hours <= 0:
+            raise ValueError(f"hours must be > 0, got {hours}")
+        if max_points is not None and max_points <= 0:
+            raise ValueError(f"max_points must be > 0, got {max_points}")
 
         fname = {
             "od": f"vial{vial:02d}_OD.csv",
@@ -1054,6 +1282,17 @@ class ExperimentEngine:
             return {"timestamps": [], "values": []}
         header = lines[0].split(",")
         data_rows = lines[1:]
+
+        # Time-window filter on the elapsed_hours column, relative to the
+        # last available row (not wall-clock, so stopped runs still work).
+        # Shared with data_export.build_bundle so the window semantics match.
+        if hours is not None and data_rows:
+            try:
+                elapsed_col = header.index("elapsed_hours")
+            except ValueError:
+                elapsed_col = 1
+            data_rows = filter_rows_by_hours(data_rows, elapsed_col, hours)
+
         if last_n is not None:
             data_rows = data_rows[-last_n:]
 
@@ -1081,7 +1320,56 @@ class ExperimentEngine:
                 values.append(float(cell) if cell != "" else None)
             except ValueError:
                 values.append(None)
+
+        if max_points is not None:
+            timestamps, values = self._downsample_minmax(
+                timestamps, values, max_points
+            )
         return {"timestamps": timestamps, "values": values}
+
+    @staticmethod
+    def _downsample_minmax(
+        timestamps: list[str],
+        values: list[Optional[float]],
+        max_points: int,
+    ) -> tuple[list[str], list[Optional[float]]]:
+        """Reduce a ``(timestamps, values)`` series to roughly ``max_points``
+        while preserving spikes and gaps.
+
+        The series is split into ~``max_points / 2`` time-ordered buckets;
+        each bucket contributes its minimum and maximum non-None points (in
+        chronological order), so transient spikes survive. A bucket that is
+        entirely ``None`` contributes a single ``None`` so sensor dropouts
+        stay visible as gaps rather than being interpolated away.
+        """
+        n = len(values)
+        if max_points <= 0 or n <= max_points:
+            return timestamps, values
+        n_buckets = max(1, max_points // 2)
+        bucket_size = math.ceil(n / n_buckets)
+        out_ts: list[str] = []
+        out_v: list[Optional[float]] = []
+        for start in range(0, n, bucket_size):
+            end = min(start + bucket_size, n)
+            lo_i = hi_i = None
+            lo_val = hi_val = None
+            for i in range(start, end):
+                v = values[i]
+                if v is None:
+                    continue
+                if lo_val is None or v < lo_val:
+                    lo_val, lo_i = v, i
+                if hi_val is None or v > hi_val:
+                    hi_val, hi_i = v, i
+            if lo_i is None:
+                # entire bucket is None -> one gap marker
+                out_ts.append(timestamps[start])
+                out_v.append(None)
+                continue
+            for i in sorted({lo_i, hi_i}):  # min & max, chronological
+                out_ts.append(timestamps[i])
+                out_v.append(values[i])
+        return out_ts, out_v
 
     # ------------------------------------------------------------------
     # Media tracking (must hold self._lock)
@@ -1734,6 +2022,7 @@ class ExperimentEngine:
             },
             "vial_faults": {str(k): v for k, v in self._vial_faults.items()},
             "nan_streak": {str(k): v for k, v in self._nan_streak.items()},
+            "od_range_streak": {str(k): v for k, v in self._od_range_streak.items()},
             "media_state": self._media_runtime_state_locked(),
             "maintenance": {
                 "active": self._maintenance_active,
@@ -1839,6 +2128,12 @@ class ExperimentEngine:
             }
             for vial in self._vials:
                 self._nan_streak.setdefault(vial, 0)
+            self._od_range_streak = {
+                int(k): int(v)
+                for k, v in (state.get("od_range_streak") or {}).items()
+            }
+            for vial in self._vials:
+                self._od_range_streak.setdefault(vial, 0)
             self._created_at = _parse_iso(state.get("created"))
             self._started_at = _parse_iso(state.get("started"))
 
@@ -1911,6 +2206,7 @@ class ExperimentEngine:
         self._setpoint_raw = {}
         self._setpoint_stir = 0
         self._nan_streak = {}
+        self._od_range_streak = {}
         self._vial_faults = {}
         self._created_at = None
         self._started_at = None

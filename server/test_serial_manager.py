@@ -26,6 +26,7 @@ from serial_manager import (  # noqa: E402
     N_VIALS,
     OD_LED_MAX,
     STOP_ALL_PUMPS_BODY,
+    ODReading,
     SerialManager,
 )
 
@@ -395,6 +396,121 @@ def test_uncalibrated_returns_raw() -> None:
     print("PASS  uncalibrated mode returns raw ADC values (per SPEC §5)")
 
 
+# ---------------------------------------------------------------------------
+# Enhanced OD acquisition: median-of-N + dark subtraction + range guard
+# ---------------------------------------------------------------------------
+
+def _od_logistic(raw: float, vial: int) -> float:
+    od_cal = np.genfromtxt(OD_CAL, delimiter=",")
+    return od_cal[2, vial] - math.log10(
+        (od_cal[1, vial] - od_cal[0, vial]) / (raw - od_cal[0, vial]) - 1.0
+    ) / od_cal[3, vial]
+
+
+def test_od_enhanced_median_rejects_outlier() -> None:
+    """5 light reads, per-vial median. A single wild sample must not move the
+    result (mean would; median doesn't)."""
+    sm, fake = fresh(calibrated=True)
+    # Four good samples at 57711 plus one large outlier. Median = 57711;
+    # mean would be ~126k and yield a very different OD.
+    for val in (57711, 57711, 57711, 57711, 400000):
+        fake.read_queue.append(_od_response([val] * N_VIALS))
+    r = sm.read_od_enhanced(2125, n_samples=5, dark_subtract=False)
+    assert isinstance(r, ODReading)
+    assert r.flags[0] == "ok" and r.n_valid[0] == 5, (r.flags[0], r.n_valid[0])
+    assert math.isclose(r.raw[0], 57711.0, abs_tol=1e-6), r.raw[0]
+    assert math.isclose(r.calibrated[0], _od_logistic(57711.0, 0), abs_tol=1e-6), \
+        r.calibrated[0]
+    print("PASS  enhanced OD median-of-5 rejects an outlier sample")
+
+
+def test_od_enhanced_dropped_samples() -> None:
+    """Garbled/timed-out samples drop out of n_valid; all-dropped -> flag
+    'dropped' + NaN."""
+    sm, fake = fresh(calibrated=True)
+    # 3 valid, 2 timeouts (empty) interleaved -> n_valid == 3, still ok.
+    fake.read_queue.extend([
+        _od_response([57711] * N_VIALS),
+        b"",
+        _od_response([57711] * N_VIALS),
+        b"",
+        _od_response([57711] * N_VIALS),
+    ])
+    r = sm.read_od_enhanced(2125, n_samples=5, dark_subtract=False)
+    assert r.n_valid[0] == 3, r.n_valid[0]
+    assert r.flags[0] == "ok", r.flags[0]
+    assert math.isclose(r.raw[0], 57711.0, abs_tol=1e-6), r.raw[0]
+
+    # All five reads time out -> dropped, NaN calibrated + raw.
+    r2 = sm.read_od_enhanced(2125, n_samples=5, dark_subtract=False)
+    assert r2.n_valid[0] == 0, r2.n_valid[0]
+    assert r2.flags[0] == "dropped", r2.flags[0]
+    assert math.isnan(r2.calibrated[0]) and math.isnan(r2.raw[0])
+    print("PASS  enhanced OD: partial drop lowers n_valid; all-drop -> 'dropped'+NaN")
+
+
+def test_od_enhanced_dark_subtraction() -> None:
+    """corrected = median(light) - median(dark) is what feeds the calibration."""
+    sm, fake = fresh(calibrated=True)
+    # Dark phase first (n_dark reads), then light phase (n_samples reads).
+    for _ in range(3):
+        fake.read_queue.append(_od_response([2000] * N_VIALS))
+    for _ in range(5):
+        fake.read_queue.append(_od_response([60000] * N_VIALS))
+    r = sm.read_od_enhanced(2125, n_samples=5, dark_subtract=True, n_dark=3)
+    assert math.isclose(r.dark[0], 2000.0, abs_tol=1e-6), r.dark[0]
+    assert math.isclose(r.raw[0], 58000.0, abs_tol=1e-6), r.raw[0]
+    assert math.isclose(r.calibrated[0], _od_logistic(58000.0, 0), abs_tol=1e-6), \
+        r.calibrated[0]
+    assert r.flags[0] == "ok"
+    # Provenance guard: the bundled OD_cal.txt has no dark-subtracted marker
+    # (no OD_cal.meta.json), so requesting dark subtraction must warn once.
+    assert sm._dark_subtract_warned is True, "provenance guard did not engage"
+    print("PASS  enhanced OD dark subtraction (60000 - 2000 -> OD via calibration)")
+
+
+def test_od_enhanced_out_of_range() -> None:
+    """A corrected signal outside the calibration domain (mn, mx) flags
+    out_of_range, returns NaN OD, but keeps the raw value for diagnostics."""
+    sm, fake = fresh(calibrated=True)
+    # 5000 is below every vial's dark-floor asymptote (min mn = 13109).
+    for _ in range(5):
+        fake.read_queue.append(_od_response([5000] * N_VIALS))
+    r = sm.read_od_enhanced(2125, n_samples=5, dark_subtract=False)
+    assert r.flags[0] == "out_of_range", r.flags[0]
+    assert math.isnan(r.calibrated[0]), r.calibrated[0]
+    assert math.isclose(r.raw[0], 5000.0, abs_tol=1e-6), r.raw[0]
+    assert r.n_valid[0] == 5
+    print("PASS  enhanced OD range guard (below dark floor -> out_of_range + NaN)")
+
+
+def test_od_enhanced_inter_command_delay() -> None:
+    """The 50 ms inter-command floor is honored across every extra read in a
+    cycle (dark + light), not just the first."""
+    sm, fake = fresh(calibrated=True)
+    for _ in range(2):  # n_dark
+        fake.read_queue.append(_od_response([2000] * N_VIALS))
+    for _ in range(3):  # n_samples
+        fake.read_queue.append(_od_response([60000] * N_VIALS))
+    sleep_args: list[float] = []
+    real_sleep = time.sleep
+
+    def spy_sleep(s: float) -> None:
+        sleep_args.append(s)
+        if s > 0:
+            real_sleep(min(s, 0.001))
+
+    with patch("serial_manager.time.sleep", side_effect=spy_sleep):
+        sm.read_od_enhanced(2125, n_samples=3, dark_subtract=True, n_dark=2)
+    # 5 writes total -> the inter-command wait must engage before each of the 4
+    # subsequent writes. Each sleep is only the REMAINING time (work between
+    # reads consumes part of the 50 ms window), so assert on count, not duration.
+    positive = [s for s in sleep_args if s > 0]
+    assert len(positive) >= 4, f"expected >=4 inter-command waits, got {sleep_args}"
+    assert all(s <= MIN_INTER_COMMAND_SECONDS + 1e-9 for s in positive), sleep_args
+    print(f"PASS  enhanced OD honors {MIN_INTER_COMMAND_SECONDS*1000:.0f} ms delay across reads")
+
+
 def main() -> int:
     test_temperature_command_format()
     test_set_temperature_celsius_roundtrip()
@@ -414,6 +530,11 @@ def main() -> int:
     test_stir_and_od_caps()
     test_pump_subsecond_rounds_or_warns()
     test_uncalibrated_returns_raw()
+    test_od_enhanced_median_rejects_outlier()
+    test_od_enhanced_dropped_samples()
+    test_od_enhanced_dark_subtraction()
+    test_od_enhanced_out_of_range()
+    test_od_enhanced_inter_command_delay()
     print("\nAll tests passed.")
     return 0
 

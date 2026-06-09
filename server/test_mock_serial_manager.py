@@ -22,6 +22,7 @@ from mock_serial_manager import (  # noqa: E402
     HEATER_OFF_SETPOINT,
     MockSerialManager,
     N_VIALS,
+    ODReading,
     T_AMBIENT_C,
     T_GROWTH_OPT_C,
     raw_setpoint_to_target_C,
@@ -259,6 +260,39 @@ def test_thread_safety() -> None:
     print(f"PASS  thread safety ({n_pumps} pump events logged, no errors)")
 
 
+def test_read_od_enhanced_parity() -> None:
+    """Mock read_od_enhanced returns a 16-wide ODReading, advances the sim
+    EXACTLY once (not n_samples times), and reports ok/finite values against a
+    calibration."""
+    m = fresh(time_multiplier=1.0)
+    t0 = m.sim_time
+    r = m.read_od_enhanced(2125, n_samples=5, dark_subtract=False)
+    assert isinstance(r, ODReading)
+    for field in (r.calibrated, r.raw, r.dark, r.n_valid, r.flags):
+        assert len(field) == N_VIALS, len(field)
+    # One tick of sim time, regardless of n_samples=5.
+    assert math.isclose(
+        m.sim_time - t0, m.tick_seconds * m.time_multiplier, abs_tol=1e-9
+    ), m.sim_time - t0
+    assert all(n == 5 for n in r.n_valid), r.n_valid
+    for v in range(N_VIALS):
+        assert r.flags[v] == "ok", (v, r.flags[v])
+        assert not math.isnan(r.calibrated[v])
+        assert not math.isnan(r.raw[v])
+    print("PASS  mock read_od_enhanced parity (advances once; 16-wide; ok flags)")
+
+
+def test_read_od_enhanced_uncalibrated() -> None:
+    """Without calibration the mock cannot synthesize a raw signal -> raw NaN,
+    but the OD600 reading and flags are still well-formed."""
+    m = fresh(calibrated=False)
+    r = m.read_od_enhanced(2125, n_samples=3)
+    assert all(math.isnan(x) for x in r.raw), r.raw
+    assert all(f == "ok" for f in r.flags), r.flags
+    assert all(n == 3 for n in r.n_valid), r.n_valid
+    print("PASS  mock read_od_enhanced uncalibrated (raw NaN, OD + flags well-formed)")
+
+
 def main() -> int:
     test_calibration_roundtrip()
     test_temperature_settles()
@@ -269,6 +303,8 @@ def main() -> int:
     test_turbidostat_loop()
     test_uncalibrated_mode()
     test_thread_safety()
+    test_read_od_enhanced_parity()
+    test_read_od_enhanced_uncalibrated()
     print("\nAll tests passed.")
     return 0
 

@@ -230,6 +230,37 @@ def test_nan_values_emit_empty_strings() -> None:
     print("PASS  NaN sensor values render as empty CSV cells")
 
 
+def test_od_diagnostics_columns() -> None:
+    with TmpRoot() as root:
+        dl = DataLogger(root)
+        dl.start_experiment(name="exp1", mode="turbidostat", vials=[0, 1])
+        temp_cal, temp_raw, od_cal, od_raw = _make_arrays()
+        n_valid = [5] * N_VIALS
+        flags = ["ok"] * N_VIALS
+        flags[0] = "out_of_range"
+        flags[1] = "dropped"
+        dark = [2000 + i for i in range(N_VIALS)]
+        dl.log_sensor_cycle(
+            _now_iso(), temp_cal, temp_raw, od_cal, od_raw,
+            od_n_valid=n_valid, od_flags=flags, od_dark=dark,
+        )
+        # A second cycle WITHOUT diagnostics (naive read) -> blank columns.
+        dl.log_sensor_cycle(_now_iso(), temp_cal, temp_raw, od_cal, od_raw)
+        dl.stop_experiment()
+
+        rows0 = _read_csv(root / "exp1" / "vial00_OD.csv")
+        assert rows0[0] == list(OD_HEADER)
+        # columns: timestamp, elapsed, raw_adc, calibrated, n_valid, flag, dark
+        assert rows0[1][4] == "5" and rows0[1][5] == "out_of_range"
+        assert rows0[1][6] == "2000"
+        # Naive second row leaves the diagnostic columns blank.
+        assert rows0[2][4] == "" and rows0[2][5] == "" and rows0[2][6] == ""
+
+        rows1 = _read_csv(root / "exp1" / "vial01_OD.csv")
+        assert rows1[1][5] == "dropped" and rows1[1][6] == "2001"
+    print("PASS  OD diagnostics columns (n_valid, flag, dark) written and blank-safe")
+
+
 def test_cannot_start_two_experiments() -> None:
     with TmpRoot() as root:
         dl = DataLogger(root)
@@ -341,7 +372,7 @@ def test_concurrent_logging() -> None:
         assert len(rows) == 1 + 4 * per_thread, f"row count {len(rows)}"
         # Every data row should parse cleanly (no torn writes).
         for row in rows[1:]:
-            assert len(row) == 4, row
+            assert len(row) == len(OD_HEADER), row
             assert math.isclose(float(row[3]), 0.1, abs_tol=1e-9)
         pumps = _read_csv(root / "exp1" / "vial00_pump_log.csv")
         assert len(pumps) == 1 + 4 * per_thread
@@ -427,6 +458,7 @@ def main() -> int:
     test_log_pump_event_for_nonactive_vial_is_ignored()
     test_elapsed_hours_is_monotonic()
     test_nan_values_emit_empty_strings()
+    test_od_diagnostics_columns()
     test_cannot_start_two_experiments()
     test_duplicate_directory_rejected()
     test_invalid_inputs_rejected()

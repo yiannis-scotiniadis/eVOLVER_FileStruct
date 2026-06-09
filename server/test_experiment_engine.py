@@ -339,6 +339,86 @@ def test_dropped_reads_warn_but_do_not_latch() -> None:
     print("PASS  lossy dropped reads warn but do not latch or park the heater")
 
 
+def test_out_of_range_flag_distinct_from_dropped() -> None:
+    with TmpRoot() as root:
+        engine, manager, dl, events, alerts = _fresh(root)
+        engine.create_experiment(
+            name="exp1", mode="turbidostat", vials=[0, 1],
+            parameters={"temperature_c": 37, "stir_rate": 10,
+                        "od_lower_thresh": 0.2, "od_upper_thresh": 0.4,
+                        "min_samples_before_action": 1, "pump_wait_minutes": 1},
+        )
+        engine.start_experiment("exp1")
+        # Vial 0: OD past the calibrated domain (saturation). OD is NaN, but the
+        # flag marks it out_of_range -> a DISTINCT streak + alert, NOT a dropped
+        # read, and NOT a latched fault.
+        for i in range(3):
+            ods = [0.1] * N_VIALS
+            ods[0] = float("nan")
+            flags = ["ok"] * N_VIALS
+            flags[0] = "out_of_range"
+            engine.run_cycle(
+                f"2026-05-14T10:00:0{i}+00:00", [37.0] * N_VIALS, ods, od_flags=flags
+            )
+        assert engine._od_range_streak[0] == 3, engine._od_range_streak
+        assert engine._nan_streak[0] == 0, engine._nan_streak
+        assert engine._vial_faults[0] is None
+        range_warns = [a for a in alerts if a["level"] == "warning"
+                       and "calibrated range" in a["message"].lower()]
+        assert range_warns, f"expected an out-of-range warning, got {alerts}"
+        assert not [a for a in alerts if "dropped" in a["message"].lower()], \
+            f"out_of_range must not warn as a dropped read: {alerts}"
+
+        # A genuine dropped read (flag 'dropped') uses the nan-streak path.
+        for i in range(3):
+            ods = [0.1] * N_VIALS
+            ods[1] = float("nan")
+            flags = ["ok"] * N_VIALS
+            flags[1] = "dropped"
+            engine.run_cycle(
+                f"2026-05-14T10:01:0{i}+00:00", [37.0] * N_VIALS, ods, od_flags=flags
+            )
+        assert engine._nan_streak[1] == 3, engine._nan_streak
+        assert engine._od_range_streak[1] == 0, engine._od_range_streak
+
+        # An 'ok' read resets both streaks.
+        engine.run_cycle(
+            "2026-05-14T10:02:00+00:00", [37.0] * N_VIALS, [0.1] * N_VIALS,
+            od_flags=["ok"] * N_VIALS,
+        )
+        assert engine._od_range_streak[0] == 0 and engine._nan_streak[0] == 0
+    print("PASS  out_of_range OD distinct from dropped (separate streak + alert)")
+
+
+def test_od_range_streak_persists_across_resume() -> None:
+    with TmpRoot() as root:
+        engine_a, *_ = _fresh(root)
+        engine_a.create_experiment(
+            name="r", mode="turbidostat", vials=[0, 1],
+            parameters={"temperature_c": 37, "stir_rate": 10,
+                        "od_lower_thresh": 0.2, "od_upper_thresh": 0.4,
+                        "min_samples_before_action": 1, "pump_wait_minutes": 1},
+        )
+        engine_a.start_experiment("r")
+        for i in range(2):  # below the warn threshold of 3
+            ods = [0.1] * N_VIALS
+            ods[0] = float("nan")
+            flags = ["ok"] * N_VIALS
+            flags[0] = "out_of_range"
+            engine_a.run_cycle(
+                f"2026-05-14T10:00:0{i}+00:00", [37.0] * N_VIALS, ods, od_flags=flags
+            )
+        assert engine_a._od_range_streak[0] == 2
+        s = json.loads((root / "r" / "state.json").read_text())
+        assert s["od_range_streak"]["0"] == 2, s.get("od_range_streak")
+
+        engine_b, *_ = _fresh(root)
+        assert engine_b.resume_on_startup() == "r"
+        assert engine_b._od_range_streak[0] == 2, engine_b._od_range_streak
+        engine_b.stop_experiment(reason="test_cleanup")
+    print("PASS  od_range_streak persists across a simulated restart")
+
+
 def test_emergency_stop_fully_stops_experiment() -> None:
     with TmpRoot() as root:
         engine, manager, dl, _, alerts = _fresh(root)
@@ -517,6 +597,98 @@ def test_delete_experiment() -> None:
         assert not (root / "a").exists()
         assert engine.loaded_experiment is None
     print("PASS  delete_experiment removes directory")
+
+
+def test_rename_experiment_moves_dir_and_updates_name() -> None:
+    with TmpRoot() as root:
+        engine, *_ = _fresh(root)
+        engine.create_experiment(name="oldname", mode="turbidostat", vials=[0],
+                                  parameters={"temperature_c": 37, "stir_rate": 10})
+        engine.start_experiment("oldname")
+        engine.stop_experiment()  # STOPPED -> rename allowed
+        engine.rename_experiment("oldname", "newname")
+        assert not (root / "oldname").exists()
+        assert (root / "newname" / "config.json").is_file()
+        cfg = json.loads((root / "newname" / "config.json").read_text())
+        assert cfg["name"] == "newname"
+        st = json.loads((root / "newname" / "state.json").read_text())
+        assert st["name"] == "newname"
+        # loaded reference followed the rename
+        assert engine.loaded_experiment == "newname"
+    print("PASS  rename moves dir + rewrites config.json/state.json name")
+
+
+def test_rename_blocked_while_running() -> None:
+    with TmpRoot() as root:
+        engine, *_ = _fresh(root)
+        engine.create_experiment(name="run1", mode="turbidostat", vials=[0],
+                                  parameters={"temperature_c": 37, "stir_rate": 10})
+        engine.start_experiment("run1")
+        try:
+            engine.rename_experiment("run1", "run2")
+        except InvalidExperimentStateError:
+            pass
+        else:
+            raise AssertionError("rename allowed while RUNNING")
+        assert (root / "run1").exists() and not (root / "run2").exists()
+    print("PASS  rename blocked while experiment is loaded + RUNNING")
+
+
+def test_rename_rejects_bad_name_and_existing_target() -> None:
+    with TmpRoot() as root:
+        engine, *_ = _fresh(root)
+        engine.create_experiment(name="a", mode="turbidostat", vials=[0],
+                                  parameters={"temperature_c": 37, "stir_rate": 10})
+        engine.stop_experiment()
+        # target already exists
+        engine.create_experiment(name="b", mode="turbidostat", vials=[1],
+                                  parameters={"temperature_c": 37, "stir_rate": 10})
+        try:
+            engine.rename_experiment("a", "b")
+        except FileExistsError:
+            pass
+        else:
+            raise AssertionError("rename onto existing dir allowed")
+        # malformed new name
+        try:
+            engine.rename_experiment("a", "bad name!")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("rename accepted malformed name")
+        # missing source
+        try:
+            engine.rename_experiment("missing", "whatever")
+        except FileNotFoundError:
+            pass
+        else:
+            raise AssertionError("rename of missing experiment allowed")
+    print("PASS  rename rejects bad names, existing targets, missing sources")
+
+
+def test_update_metadata_round_trip() -> None:
+    with TmpRoot() as root:
+        engine, *_ = _fresh(root)
+        engine.create_experiment(name="m", mode="turbidostat", vials=[0],
+                                  parameters={"temperature_c": 37, "stir_rate": 10},
+                                  notes="initial")
+        merged = engine.update_metadata("m", notes="edited later", tags=["pilot", "lb"])
+        assert merged["notes"] == "edited later"
+        assert merged["tags"] == ["pilot", "lb"]
+        on_disk = json.loads((root / "m" / "config.json").read_text())
+        assert on_disk["notes"] == "edited later"
+        assert on_disk["tags"] == ["pilot", "lb"]
+        # loaded config refreshed so status() reflects the edit
+        assert engine._config["notes"] == "edited later"
+        # validation
+        for kwargs in ({"notes": 123}, {"tags": "notalist"}, {"tags": [1, 2]}, {}):
+            try:
+                engine.update_metadata("m", **kwargs)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"update_metadata accepted bad input: {kwargs}")
+    print("PASS  update_metadata edits notes/tags on disk + in loaded config")
 
 
 def _basic_media(*vials: int) -> dict:
@@ -1283,6 +1455,8 @@ def main() -> int:
     test_stop_zeros_experiment_vials_only()
     test_overtemp_fault_isolates_single_vial()
     test_dropped_reads_warn_but_do_not_latch()
+    test_out_of_range_flag_distinct_from_dropped()
+    test_od_range_streak_persists_across_resume()
     test_emergency_stop_fully_stops_experiment()
     test_get_data_reads_csv_rows()
     test_list_experiments_includes_status()
@@ -1290,6 +1464,10 @@ def main() -> int:
     test_create_while_loaded_running_raises()
     test_create_after_stop_unloads_previous()
     test_delete_experiment()
+    test_rename_experiment_moves_dir_and_updates_name()
+    test_rename_blocked_while_running()
+    test_rename_rejects_bad_name_and_existing_target()
+    test_update_metadata_round_trip()
     test_media_config_round_trip()
     test_media_invalid_inputs_rejected()
     test_vials_and_media_mismatch_rejected()

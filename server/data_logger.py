@@ -4,7 +4,7 @@ One experiment, one directory under ``experiments/{name}/``. Per active
 vial, three append-only CSV files::
 
     config.json
-    vial00_OD.csv          # timestamp,elapsed_hours,raw_adc,calibrated_od
+    vial00_OD.csv          # timestamp,elapsed_hours,raw_adc,calibrated_od,n_valid,flag,dark
     vial00_temp.csv        # timestamp,elapsed_hours,raw_adc,calibrated_temp_c
     vial00_pump_log.csv    # timestamp,elapsed_hours,direction,duration_seconds,od_at_pump
     ...
@@ -33,7 +33,18 @@ from typing import Iterable, Optional
 
 N_VIALS = 16
 
-OD_HEADER = ("timestamp", "elapsed_hours", "raw_adc", "calibrated_od")
+# raw_adc is the aggregated, dark-subtracted signal fed to the calibration;
+# n_valid/flag/dark are the enhanced-acquisition diagnostics (blank when a
+# cycle used the naive single read, e.g. idle standby).
+OD_HEADER = (
+    "timestamp",
+    "elapsed_hours",
+    "raw_adc",
+    "calibrated_od",
+    "n_valid",
+    "flag",
+    "dark",
+)
 TEMP_HEADER = ("timestamp", "elapsed_hours", "raw_adc", "calibrated_temp_c")
 PUMP_HEADER = (
     "timestamp",
@@ -352,8 +363,15 @@ class DataLogger:
         temperature_raw: list,
         od_calibrated: list,
         od_raw: list,
+        od_n_valid: Optional[list] = None,
+        od_flags: Optional[list] = None,
+        od_dark: Optional[list] = None,
     ) -> None:
         """Append one OD row and one temperature row per active vial.
+
+        ``od_n_valid`` / ``od_flags`` / ``od_dark`` are the optional
+        enhanced-acquisition diagnostics; when omitted (naive read) the
+        corresponding CSV columns are left blank.
 
         File writes are serialized via ``self._lock`` so concurrent callers
         cannot corrupt CSV rows (Windows lacks POSIX O_APPEND atomic-write
@@ -368,6 +386,15 @@ class DataLogger:
                 (od_raw, "od_raw"),
             ):
                 if len(series) != N_VIALS:
+                    raise ValueError(
+                        f"'{label}' must have {N_VIALS} entries, got {len(series)}"
+                    )
+            for series, label in (
+                (od_n_valid, "od_n_valid"),
+                (od_flags, "od_flags"),
+                (od_dark, "od_dark"),
+            ):
+                if series is not None and len(series) != N_VIALS:
                     raise ValueError(
                         f"'{label}' must have {N_VIALS} entries, got {len(series)}"
                     )
@@ -396,6 +423,9 @@ class DataLogger:
                         elapsed_str,
                         _format_int(od_raw[v]),
                         _format_number(od_calibrated[v], 4),
+                        _format_int(od_n_valid[v]) if od_n_valid is not None else "",
+                        (od_flags[v] if od_flags is not None else "") or "",
+                        _format_int(od_dark[v]) if od_dark is not None else "",
                     ],
                 )
 

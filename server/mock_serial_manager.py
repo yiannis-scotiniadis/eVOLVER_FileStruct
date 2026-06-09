@@ -43,6 +43,10 @@ from serial_manager import (
     DEFAULT_RAW_FLOOR,
     HEATER_OFF_SETPOINT,
     MAX_SAFE_TEMP_C,
+    OD_AGG_DEFAULT,
+    OD_DEFAULT_N_DARK,
+    OD_DEFAULT_N_SAMPLES,
+    ODReading,
 )
 
 
@@ -265,6 +269,59 @@ class MockSerialManager:
         with self._lock:
             self._advance()
             return self.od_abs.tolist()
+
+    def read_od_enhanced(
+        self,
+        led_power: int = 2125,
+        *,
+        n_samples: int = OD_DEFAULT_N_SAMPLES,
+        dark_subtract: bool = False,
+        n_dark: int = OD_DEFAULT_N_DARK,
+        agg: str = OD_AGG_DEFAULT,
+    ) -> ODReading:
+        """Mock parity for SerialManager.read_od_enhanced.
+
+        The simulation works in OD600 directly, so there is no raw-ADC noise to
+        average — the sim advances **exactly once** (never ``n_samples`` times,
+        which would over-run sim time) and the structured fields are synthesized
+        to mirror the real reader's shape and conventions. ``raw`` is the
+        dark-subtracted signal recovered by inverting the calibration (NaN when
+        uncalibrated); the per-vial range guard mirrors the real reader so the
+        ``out_of_range`` path stays exercisable against a calibration."""
+        with self._lock:
+            self._advance()
+            n = max(1, int(n_samples))
+            od = np.asarray(self.od_abs, dtype=float)
+            if self.od_cal is not None:
+                raw = self._od_abs_to_raw(od)
+                mn, mx = self.od_cal[0], self.od_cal[1]
+                in_domain = (raw > mn) & (raw < mx)
+            else:
+                raw = np.full(N_VIALS, np.nan)
+                in_domain = np.ones(N_VIALS, dtype=bool)
+            dark = np.zeros(N_VIALS) if dark_subtract else np.full(N_VIALS, np.nan)
+
+            calibrated: list[float] = []
+            raw_out: list[float] = []
+            flags: list[str] = []
+            for v in range(N_VIALS):
+                raw_v = float(raw[v]) if not np.isnan(raw[v]) else float("nan")
+                raw_out.append(raw_v)
+                if in_domain[v]:
+                    flags.append("ok")
+                    calibrated.append(float(od[v]))
+                else:
+                    flags.append("out_of_range")
+                    calibrated.append(float("nan"))
+            return ODReading(
+                calibrated=calibrated,
+                raw=raw_out,
+                dark=[
+                    float(d) if not np.isnan(d) else float("nan") for d in dark
+                ],
+                n_valid=[n] * N_VIALS,
+                flags=flags,
+            )
 
     # ------------------------------------------------------------------
     # Public writes

@@ -17,9 +17,12 @@ Protocol (CLAUDE.md):
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -65,10 +68,40 @@ DEFAULT_RAW_FLOOR = 300
 STIR_MAX = 15
 OD_LED_MAX = 2200  # eVOLVER_module.py:18 "Limit 2200"
 
+# Enhanced OD acquisition (median-of-N raw averaging + dark subtraction +
+# range guard). Defaults; per-experiment config overrides via app.py.
+OD_DEFAULT_N_SAMPLES = 5     # light reads per cycle (median of these)
+OD_DEFAULT_N_DARK = 3        # LED-off reads per cycle (dark is more stable)
+OD_AGG_DEFAULT = "median"
+OD_AGG_CHOICES = ("median", "mean", "trimmed_mean")
+
 # Stop-all-pumps body (CLAUDE.md "Fluidics sub-protocol" / eVOLVER_module.py:199).
 # st (address) + t, (multi-fire sub-mode) + 32 ones (pump mask) + 16 zeros
 # (per-vial times). Full wire becomes "stt,<32 ones>,<16 zeros>, !".
 STOP_ALL_PUMPS_BODY = "t," + ("1" * 32) + "," + ("0," * 16)
+
+
+@dataclass(frozen=True)
+class ODReading:
+    """Structured result of one enhanced OD acquisition cycle.
+
+    Every field is a length-``N_VIALS`` list:
+
+    - ``calibrated`` — OD600; ``NaN`` when the vial was ``dropped`` or
+      ``out_of_range``.
+    - ``raw`` — aggregated, **dark-subtracted** photodiode signal (the value
+      actually fed to the calibration); ``NaN`` when dropped.
+    - ``dark`` — aggregated LED-off reading; ``NaN`` when dark subtraction is
+      off.
+    - ``n_valid`` — surviving samples per vial after NaN/garble rejection.
+    - ``flags`` — per vial, one of ``"ok" | "out_of_range" | "dropped"``.
+    """
+
+    calibrated: list[float]
+    raw: list[float]
+    dark: list[float]
+    n_valid: list[int]
+    flags: list[str]
 
 
 log = logging.getLogger(__name__)
@@ -106,6 +139,12 @@ class SerialManager:
 
         self.temp_cal: Optional[np.ndarray] = None
         self.od_cal: Optional[np.ndarray] = None
+        # True when the loaded OD calibration was measured on dark-subtracted
+        # signal (LED-on - LED-off), per the OD_cal.meta.json sidecar. The
+        # enhanced reader warns once if dark subtraction is requested against a
+        # calibration that is NOT dark-subtracted (would yield wrong OD).
+        self._od_cal_dark_subtracted = False
+        self._dark_subtract_warned = False
 
     def close(self) -> None:
         with self._lock:
@@ -129,9 +168,31 @@ class SerialManager:
             raise ValueError(
                 f"OD calibration shape {od_cal.shape}, expected (4, {N_VIALS})"
             )
+        # Provenance sidecar (optional): calibration/OD_cal.meta.json marks
+        # whether this curve was fit on dark-subtracted signal. Absent ->
+        # assume NOT dark-subtracted (the legacy convention).
+        dark_subtracted = self._read_cal_dark_subtracted(od_cal_path)
         with self._lock:
             self.temp_cal = temp_cal
             self.od_cal = od_cal
+            self._od_cal_dark_subtracted = dark_subtracted
+            self._dark_subtract_warned = False
+
+    @staticmethod
+    def _read_cal_dark_subtracted(od_cal_path: str) -> bool:
+        """Read the ``dark_subtracted`` flag from the OD calibration's
+        ``<stem>.meta.json`` sidecar, if present. Returns False on any
+        absence/parse error (the safe legacy assumption)."""
+        try:
+            p = Path(od_cal_path)
+            meta_path = p.with_name(p.stem + ".meta.json")
+            if not meta_path.is_file():
+                return False
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            return bool(meta.get("dark_subtracted", False))
+        except Exception:
+            log.exception("failed reading OD calibration meta for %s", od_cal_path)
+            return False
 
     def _temp_raw_to_C(self, raw: np.ndarray) -> np.ndarray:
         # CLAUDE.md: temp_celsius = (raw_adc * slope[vial]) + intercept[vial]
@@ -223,6 +284,152 @@ class SerialManager:
         if self.od_cal is None:
             return raw.tolist()
         return self._od_raw_to_OD(raw).tolist()
+
+    # ------------------------------------------------------------------
+    # Enhanced OD acquisition: median-of-N + dark subtraction + range guard
+    # ------------------------------------------------------------------
+
+    def _collect_od_reads(self, body: str, n: int) -> np.ndarray:
+        """Issue ``n`` OD reads with payload ``body`` and stack the framed
+        responses into an ``(n, N_VIALS)`` float array. A timed-out/malformed
+        response (``_read_response`` returns None) becomes an all-NaN row so it
+        drops out of the per-vial aggregation."""
+        rows: list[list[float]] = []
+        for _ in range(n):
+            self._write(PREFIX_OD, body)
+            values = self._read_response(RESPONSE_OD)
+            if values is None:
+                rows.append([float("nan")] * N_VIALS)
+            else:
+                rows.append([float(v) for v in values])
+        return np.asarray(rows, dtype=float)
+
+    @staticmethod
+    def _aggregate_samples(samples: np.ndarray, agg: str) -> tuple[np.ndarray, np.ndarray]:
+        """Per-vial aggregate of an ``(n, N_VIALS)`` sample array, ignoring NaN
+        (dropped/garbled) samples. Returns ``(agg_per_vial, n_valid_per_vial)``;
+        a vial with zero surviving samples aggregates to NaN."""
+        agg_out = np.full(N_VIALS, np.nan)
+        n_valid = np.zeros(N_VIALS, dtype=int)
+        for v in range(N_VIALS):
+            col = samples[:, v]
+            col = col[~np.isnan(col)]
+            n_valid[v] = col.size
+            if col.size == 0:
+                continue
+            if agg == "median":
+                agg_out[v] = float(np.median(col))
+            elif agg == "mean":
+                agg_out[v] = float(np.mean(col))
+            elif agg == "trimmed_mean":
+                # Drop one min + one max, average the rest; fall back to the
+                # median when too few samples remain to trim meaningfully.
+                if col.size >= 3:
+                    agg_out[v] = float(np.mean(np.sort(col)[1:-1]))
+                else:
+                    agg_out[v] = float(np.median(col))
+            else:
+                raise ValueError(
+                    f"unknown OD aggregation {agg!r}; choose from {OD_AGG_CHOICES}"
+                )
+        return agg_out, n_valid
+
+    def read_od_enhanced(
+        self,
+        led_power: int = 2125,
+        *,
+        n_samples: int = OD_DEFAULT_N_SAMPLES,
+        dark_subtract: bool = False,
+        n_dark: int = OD_DEFAULT_N_DARK,
+        agg: str = OD_AGG_DEFAULT,
+    ) -> ODReading:
+        """Acquire one OD cycle with averaging, optional dark subtraction, and
+        a per-vial calibration range guard. See :class:`ODReading`.
+
+        ``dark_subtract`` assumes the loaded calibration was fit on
+        dark-subtracted signal (LED-on - LED-off); a one-time warning is logged
+        if it is requested against a calibration not marked dark-subtracted."""
+        with self._lock:
+            return self._read_od_enhanced_locked(
+                led_power, n_samples, dark_subtract, n_dark, agg,
+            )
+
+    def _read_od_enhanced_locked(
+        self,
+        led_power: int,
+        n_samples: int,
+        dark_subtract: bool,
+        n_dark: int,
+        agg: str,
+    ) -> ODReading:
+        led = int(np.clip(led_power, 0, OD_LED_MAX))
+        n_samples = max(1, int(n_samples))
+        n_dark = max(0, int(n_dark))
+
+        # --- Dark phase (LED off). The photodiode still responds, so each
+        # dark read is a full request/response we must drain. ---
+        if dark_subtract and n_dark > 0:
+            if self.od_cal is not None and not self._od_cal_dark_subtracted \
+                    and not self._dark_subtract_warned:
+                log.warning(
+                    "dark subtraction requested but the loaded OD calibration is "
+                    "not marked dark-subtracted (OD_cal.meta.json); OD values may "
+                    "be wrong until a dark-subtracted calibration is installed"
+                )
+                self._dark_subtract_warned = True
+            dark_body = self._format_csv(np.zeros(N_VIALS, dtype=int))
+            dark_samples = self._collect_od_reads(dark_body, n_dark)
+            dark_agg, _ = self._aggregate_samples(dark_samples, agg)
+            # A dropped dark read subtracts 0 rather than poisoning the vial.
+            dark_for_calc = np.nan_to_num(dark_agg, nan=0.0)
+        else:
+            dark_agg = np.full(N_VIALS, np.nan)
+            dark_for_calc = np.zeros(N_VIALS)
+
+        # --- Light phase ---
+        light_body = self._format_csv(np.full(N_VIALS, led))
+        light_samples = self._collect_od_reads(light_body, n_samples)
+        signal_on, n_valid = self._aggregate_samples(light_samples, agg)
+
+        corrected = signal_on - dark_for_calc  # NaN where signal_on is NaN
+
+        od_cal = self.od_cal
+        if od_cal is not None:
+            mn, mx = od_cal[0], od_cal[1]
+            in_domain = (corrected > mn) & (corrected < mx)
+            od_all = self._od_raw_to_OD(corrected)
+        else:
+            in_domain = np.ones(N_VIALS, dtype=bool)
+            od_all = corrected  # no calibration -> raw passthrough
+
+        calibrated: list[float] = []
+        raw_out: list[float] = []
+        flags: list[str] = []
+        valid = (n_valid > 0) & (~np.isnan(corrected))
+        for v in range(N_VIALS):
+            if not valid[v]:
+                flags.append("dropped")
+                calibrated.append(float("nan"))
+                raw_out.append(float("nan"))
+                continue
+            raw_out.append(float(corrected[v]))
+            if od_cal is not None and not in_domain[v]:
+                flags.append("out_of_range")
+                calibrated.append(float("nan"))
+                continue
+            flags.append("ok")
+            calibrated.append(float(od_all[v]))
+
+        dark_list = [
+            float(d) if not np.isnan(d) else float("nan") for d in dark_agg
+        ]
+        return ODReading(
+            calibrated=calibrated,
+            raw=raw_out,
+            dark=dark_list,
+            n_valid=[int(x) for x in n_valid],
+            flags=flags,
+        )
 
     # ------------------------------------------------------------------
     # Public reads

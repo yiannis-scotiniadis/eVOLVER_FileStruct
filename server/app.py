@@ -17,10 +17,12 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import io
 import json
 import logging
 import math
 import os
+import shutil
 import signal
 import sys
 import threading
@@ -29,12 +31,20 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
-from flask import Flask, jsonify, render_template, request
+from flask import (
+    Flask,
+    jsonify,
+    render_template,
+    request,
+    send_file,
+    send_from_directory,
+)
 from flask.json.provider import DefaultJSONProvider
 from flask_socketio import SocketIO
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import data_export as dx  # noqa: E402
 from data_logger import DataLogger  # noqa: E402
 from experiment_engine import (  # noqa: E402
     ConflictError,
@@ -62,9 +72,22 @@ CAL_DIR = PROJECT_ROOT / "calibration"
 TEMP_CAL_PATH = CAL_DIR / "temp_calibration.txt"
 OD_CAL_PATH = CAL_DIR / "OD_cal.txt"
 EXPERIMENTS_DIR = PROJECT_ROOT / "experiments"
+# Server-side export bundles live OUTSIDE experiments/ so they don't get swept
+# up as bogus experiments by ExperimentEngine.list_experiments().
+EXPORTS_DIR = PROJECT_ROOT / "exports"
 
 SENSOR_LOOP_INTERVAL_SECONDS = 10.0
 OD_LED_POWER = 2125  # CLAUDE.md: standard LED power for OD reads
+
+# Low-disk monitor (sensor loop). The Pi's disk is finite and a multi-day run at
+# 10 s cadence accumulates many rows; warn before a run fills the disk and dies.
+# Checked every N cycles (not every tick) and edge-triggered so it alerts once
+# per crossing. Thresholds fire on whichever of free-bytes / free-% trips first.
+DISK_CHECK_EVERY_CYCLES = 30  # ~5 min at a 10 s cadence
+DISK_WARN_FREE_BYTES = 1 * 1024 ** 3       # 1 GB
+DISK_WARN_FREE_PCT = 10.0
+DISK_CRITICAL_FREE_BYTES = 256 * 1024 ** 2  # 256 MB
+DISK_CRITICAL_FREE_PCT = 3.0
 WATCHDOG_TIMEOUT_MINUTES = 10  # PILOT: shortened from 30 (SPEC §10) for faster fault detection during first hardware bring-up; restore to 30 after pilot
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 5000
@@ -165,6 +188,10 @@ class AppState:
         self.engine: ExperimentEngine | None = None  # set after socketio is created
         self.sensor_thread_stop = threading.Event()
         self.shutdown_done = threading.Event()
+        # Low-disk monitor state (sensor loop): throttle counter + edge latches.
+        self.disk_check_counter = 0
+        self.disk_warned = False
+        self.disk_critical = False
 
 
 def _read_temperature_pair(state: AppState) -> dict:
@@ -175,10 +202,38 @@ def _read_temperature_pair(state: AppState) -> dict:
 
 
 def _read_od_pair(state: AppState) -> dict:
+    """Read OD for one cycle. Always returns a dict with keys
+    ``calibrated``, ``raw``, ``dark``, ``n_valid``, ``flags``.
+
+    When an experiment is RUNNING, use the enhanced acquisition driven by that
+    experiment's ``od_acquisition`` config (median-of-N averaging, optional
+    per-cycle dark subtraction, per-vial range guard). When idle, fall back to
+    the naive single read so standby cycles don't spend bus time on data that
+    is never recorded."""
+    engine = state.engine
+    if engine is not None and engine.is_running:
+        r = state.manager.read_od_enhanced(
+            OD_LED_POWER, **engine.od_acquisition_params()
+        )
+        return {
+            "calibrated": list(r.calibrated),
+            "raw": list(r.raw),
+            "dark": list(r.dark),
+            "n_valid": list(r.n_valid),
+            "flags": list(r.flags),
+        }
+    # Naive idle path (unchanged conversion) with neutral diagnostics. NaN
+    # (timed-out) values are flagged "dropped"; everything else "ok".
     values = state.manager.read_od(OD_LED_POWER)
-    if state.od_cal is not None:
-        return {"calibrated": values, "raw": _od_to_raw(values, state.od_cal)}
-    return {"calibrated": values, "raw": list(values)}
+    raw = _od_to_raw(values, state.od_cal) if state.od_cal is not None else list(values)
+    flags = ["ok" if v == v else "dropped" for v in values]  # v != v -> NaN
+    return {
+        "calibrated": list(values),
+        "raw": list(raw),
+        "dark": [float("nan")] * N_VIALS,
+        "n_valid": [1] * N_VIALS,
+        "flags": flags,
+    }
 
 
 # --- NaN/Inf JSON safety ----------------------------------------------------
@@ -212,6 +267,88 @@ class _SafeJSONProvider(DefaultJSONProvider):
         return super().dumps(_json_safe(obj), **kwargs)
 
 
+def _disk_alert_decision(
+    free: int, total: int, warned: bool, critical: bool
+) -> tuple[str | None, bool, bool]:
+    """Pure band + hysteresis decision for the low-disk monitor.
+
+    Three bands (ok / warning / critical) keyed on whichever of free-bytes or
+    free-% trips first. Returns ``(alert_level_or_None, new_warned,
+    new_critical)``. An alert fires only when crossing UP into a band; latches
+    clear when free space recovers to ok, so a genuine re-crossing re-alerts
+    while a level hovering at a threshold does not spam. Dropping from critical
+    back to warning clears the critical latch silently (no new warning)."""
+    free_pct = 100.0 * free / total if total else 0.0
+    crit = free < DISK_CRITICAL_FREE_BYTES or free_pct < DISK_CRITICAL_FREE_PCT
+    warn = free < DISK_WARN_FREE_BYTES or free_pct < DISK_WARN_FREE_PCT
+    if crit:
+        if not critical:
+            return "critical", True, True
+        return None, warned, True
+    if warn:
+        if not warned:
+            return "warning", True, False
+        return None, True, False
+    return None, False, False
+
+
+def _experiment_vials(name: str) -> list[int] | None:
+    """Vials of an on-disk experiment from its config.json, or None if the
+    experiment directory / config is missing."""
+    config_path = EXPERIMENTS_DIR / name / "config.json"
+    if not config_path.is_file():
+        return None
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return sorted(int(v) for v in config.get("vials", []))
+
+
+def _resolve_export_request(parameters, vials, hours, exp_vials: list[int]):
+    """Normalize + validate an export request against the experiment's vials.
+
+    ``parameters`` / ``vials`` may each be a comma-string (query param), a list
+    (JSON body), or None (=> all). Returns ``(params, vials, hours)``. Raises
+    ``ValueError`` on any malformed or out-of-experiment selection (the caller
+    maps these to HTTP 400)."""
+    if parameters in (None, ""):
+        params = list(dx.EXPORT_PARAMETERS)
+    elif isinstance(parameters, str):
+        params = [p.strip().lower() for p in parameters.split(",") if p.strip()]
+    else:
+        params = [str(p).strip().lower() for p in parameters]
+    if not params:
+        params = list(dx.EXPORT_PARAMETERS)
+    for p in params:
+        if p not in dx.EXPORT_PARAMETERS:
+            raise ValueError(f"unknown parameter {p!r}; expected od/temp/pump")
+
+    if vials in (None, ""):
+        sel = list(exp_vials)
+    elif isinstance(vials, str):
+        sel = [int(v) for v in vials.split(",") if v.strip() != ""]
+    else:
+        sel = [int(v) for v in vials]
+    if not sel:
+        sel = list(exp_vials)
+    extra = sorted(set(sel) - set(exp_vials))
+    if extra:
+        raise ValueError(
+            f"vials {extra} are not part of experiment (vials={exp_vials})"
+        )
+
+    if hours in (None, ""):
+        h = None
+    else:
+        h = float(hours)
+        if h <= 0:
+            raise ValueError(f"hours must be > 0, got {h}")
+    # Preserve canonical od/temp/pump order; dedupe vials.
+    params = [p for p in dx.EXPORT_PARAMETERS if p in params]
+    return params, sorted(set(sel)), h
+
+
 def create_app(use_mock: bool):
     if use_mock:
         manager = MockSerialManager()
@@ -234,6 +371,7 @@ def create_app(use_mock: bool):
         )
 
     data_logger = DataLogger(EXPERIMENTS_DIR)
+    EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
     state = AppState(
         manager=manager, temp_cal=temp_cal, od_cal=od_cal, data_logger=data_logger
     )
@@ -673,13 +811,125 @@ def create_app(use_mock: bool):
             last_n = int(last_n_arg) if last_n_arg else None
         except ValueError:
             return jsonify(error="'last_n' must be an integer"), 400
+        hours_arg = request.args.get("hours")
         try:
-            data = state.engine.get_data(name, vial=vial, parameter=parameter, last_n=last_n)
+            hours = float(hours_arg) if hours_arg else None
+        except ValueError:
+            return jsonify(error="'hours' must be a number"), 400
+        max_points_arg = request.args.get("max_points")
+        try:
+            max_points = int(max_points_arg) if max_points_arg else 2000
+        except ValueError:
+            return jsonify(error="'max_points' must be an integer"), 400
+        try:
+            data = state.engine.get_data(
+                name,
+                vial=vial,
+                parameter=parameter,
+                last_n=last_n,
+                hours=hours,
+                max_points=max_points,
+            )
         except FileNotFoundError as exc:
             return jsonify(error=str(exc)), 404
         except ValueError as exc:
             return jsonify(error=str(exc)), 400
         return jsonify(data)
+
+    # --------------------------- Data export (SPEC §8) -----------------------
+    # Read-only over the per-vial CSVs (data_export.py). Safe to run while an
+    # experiment is RUNNING — append-only files make a snapshot consistent.
+    # GET streams the bundle to the browser; POST writes it to exports/ for a
+    # relay-resilient "generate now, fetch later" workflow.
+
+    @flask_app.route("/api/experiments/<name>/export", methods=["GET"])
+    def api_experiment_export(name):
+        exp_vials = _experiment_vials(name)
+        if exp_vials is None:
+            return jsonify(error=f"experiment '{name}' not found"), 404
+        try:
+            params, vials, hours = _resolve_export_request(
+                request.args.get("parameters"),
+                request.args.get("vials"),
+                request.args.get("hours"),
+                exp_vials,
+            )
+            filename, blob = dx.build_bundle(
+                EXPERIMENTS_DIR / name,
+                name=name,
+                vials=vials,
+                parameters=params,
+                hours=hours,
+            )
+        except ValueError as exc:
+            return jsonify(error=str(exc)), 400
+        mimetype = "application/zip" if filename.endswith(".zip") else "text/csv"
+        return send_file(
+            io.BytesIO(blob),
+            mimetype=mimetype,
+            as_attachment=True,
+            download_name=filename,
+        )
+
+    @flask_app.route("/api/experiments/<name>/export", methods=["POST"])
+    def api_experiment_export_save(name):
+        exp_vials = _experiment_vials(name)
+        if exp_vials is None:
+            return jsonify(error=f"experiment '{name}' not found"), 404
+        body = request.get_json(silent=True) or {}
+        try:
+            params, vials, hours = _resolve_export_request(
+                body.get("parameters"), body.get("vials"), body.get("hours"), exp_vials
+            )
+            filename, blob = dx.build_bundle(
+                EXPERIMENTS_DIR / name,
+                name=name,
+                vials=vials,
+                parameters=params,
+                hours=hours,
+            )
+        except ValueError as exc:
+            return jsonify(error=str(exc)), 400
+        EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        stem, dot, ext = filename.rpartition(".")
+        saved_name = f"{stem}_{stamp}.{ext}" if dot else f"{filename}_{stamp}"
+        (EXPORTS_DIR / saved_name).write_bytes(blob)
+        return jsonify(
+            status="saved",
+            filename=saved_name,
+            bytes=len(blob),
+            path=str(EXPORTS_DIR / saved_name),
+            download_url=f"/api/exports/{saved_name}",
+        )
+
+    @flask_app.route("/api/exports", methods=["GET"])
+    def api_exports_list():
+        EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
+        items = []
+        for p in sorted(EXPORTS_DIR.iterdir(), reverse=True):
+            if not p.is_file():
+                continue
+            st = p.stat()
+            items.append({
+                "filename": p.name,
+                "bytes": st.st_size,
+                "created": datetime.fromtimestamp(
+                    st.st_mtime, tz=timezone.utc
+                ).isoformat(timespec="seconds"),
+                "download_url": f"/api/exports/{p.name}",
+            })
+        return jsonify(exports=items)
+
+    @flask_app.route("/api/exports/<path:filename>", methods=["GET"])
+    def api_exports_download(filename):
+        # send_from_directory guards against path traversal outside EXPORTS_DIR.
+        EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
+        return send_from_directory(EXPORTS_DIR, filename, as_attachment=True)
+
+    @flask_app.route("/api/storage", methods=["GET"])
+    def api_storage():
+        return jsonify(dx.storage_report(EXPERIMENTS_DIR, EXPORTS_DIR))
 
     @flask_app.route("/api/experiments/<name>", methods=["DELETE"])
     def api_experiments_delete(name):
@@ -690,6 +940,55 @@ def create_app(use_mock: bool):
         except FileNotFoundError as exc:
             return jsonify(error=str(exc)), 404
         return jsonify(status="deleted", name=name)
+
+    @flask_app.route("/api/experiments/<name>", methods=["GET"])
+    def api_experiments_get(name):
+        """Full config.json for an experiment (loaded or on-disk). Used by the
+        dashboard's notes editor, which needs notes/tags that status() and the
+        list endpoint don't carry."""
+        config_path = EXPERIMENTS_DIR / name / "config.json"
+        if not config_path.is_file():
+            return jsonify(error=f"experiment '{name}' not found"), 404
+        try:
+            return jsonify(json.loads(config_path.read_text(encoding="utf-8")))
+        except Exception as exc:
+            return jsonify(error=f"failed to read config: {exc}"), 500
+
+    @flask_app.route("/api/experiments/<name>/rename", methods=["POST"])
+    def api_experiments_rename(name):
+        body = request.get_json(silent=True) or {}
+        new_name = body.get("new_name") or body.get("new")
+        if not new_name:
+            return jsonify(error="'new_name' is required"), 400
+        try:
+            result = state.engine.rename_experiment(name, new_name)
+        except ValueError as exc:
+            return jsonify(error=str(exc)), 400
+        except InvalidExperimentStateError as exc:
+            return jsonify(error=str(exc)), 409
+        except FileExistsError as exc:
+            return jsonify(error=str(exc)), 409
+        except FileNotFoundError as exc:
+            return jsonify(error=str(exc)), 404
+        return jsonify(status="renamed", **result)
+
+    @flask_app.route("/api/experiments/<name>", methods=["PATCH"])
+    def api_experiments_update(name):
+        body = request.get_json(silent=True) or {}
+        try:
+            merged = state.engine.update_metadata(
+                name, notes=body.get("notes"), tags=body.get("tags")
+            )
+        except ValueError as exc:
+            return jsonify(error=str(exc)), 400
+        except FileNotFoundError as exc:
+            return jsonify(error=str(exc)), 404
+        return jsonify(
+            status="updated",
+            name=name,
+            notes=merged.get("notes", ""),
+            tags=merged.get("tags", []),
+        )
 
     # ------------------------ Maintenance routes -----------------------------
     # Pauses pump execution so the user can refill bottles / empty waste
@@ -865,6 +1164,32 @@ def create_app(use_mock: bool):
         for vial, action, captured_ts in queued:
             _execute_pump_actions([(vial, action)], captured_ts)
 
+    def _check_disk_space() -> None:
+        """Edge-triggered low-disk alert; band/hysteresis logic lives in the
+        pure :func:`_disk_alert_decision` so it can be unit-tested."""
+        try:
+            usage = shutil.disk_usage(EXPERIMENTS_DIR)
+        except OSError:
+            log.exception("disk_usage check failed")
+            return
+        level, state.disk_warned, state.disk_critical = _disk_alert_decision(
+            usage.free, usage.total, state.disk_warned, state.disk_critical
+        )
+        if level is None:
+            return
+        free_mb = usage.free / 1024 ** 2
+        free_pct = 100.0 * usage.free / usage.total if usage.total else 0.0
+        if level == "critical":
+            msg = (
+                f"Disk critically low: {free_mb:.0f} MB free ({free_pct:.1f}%) "
+                "— data logging at risk, free space now"
+            )
+        else:
+            msg = f"Disk getting low: {free_mb:.0f} MB free ({free_pct:.1f}%)"
+        socketio.emit(
+            "alert", {"level": level, "message": msg, "timestamp": _now_iso()}
+        )
+
     def sensor_loop():
         log.info("sensor loop started (interval=%.1fs)", SENSOR_LOOP_INTERVAL_SECONDS)
         while not state.sensor_thread_stop.is_set():
@@ -884,6 +1209,9 @@ def create_app(use_mock: bool):
                         temperature_raw=t["raw"],
                         od_calibrated=o["calibrated"],
                         od_raw=o["raw"],
+                        od_n_valid=o.get("n_valid"),
+                        od_flags=o.get("flags"),
+                        od_dark=o.get("dark"),
                     )
                 except Exception:
                     log.exception("data_logger.log_sensor_cycle failed")
@@ -892,7 +1220,8 @@ def create_app(use_mock: bool):
                 pump_actions: list = []
                 try:
                     pump_actions = state.engine.run_cycle(
-                        ts_iso, t["calibrated"], o["calibrated"]
+                        ts_iso, t["calibrated"], o["calibrated"],
+                        od_flags=o.get("flags"),
                     )
                 except Exception:
                     log.exception("engine.run_cycle failed")
@@ -915,6 +1244,12 @@ def create_app(use_mock: bool):
                 except Exception:
                     log.exception("maintenance timeout check failed")
 
+                # Low-disk monitor: throttled (~every 5 min) so we don't stat
+                # the filesystem every tick. Runs regardless of experiment state.
+                state.disk_check_counter += 1
+                if state.disk_check_counter % DISK_CHECK_EVERY_CYCLES == 1:
+                    _check_disk_space()
+
                 # Broadcast sensor update WITH experiment status so the
                 # dashboard can keep its status bar fresh without polling.
                 socketio.emit(
@@ -928,6 +1263,9 @@ def create_app(use_mock: bool):
                         "od": {
                             "calibrated": o["calibrated"],
                             "raw": o["raw"],
+                            "dark": o.get("dark"),
+                            "n_valid": o.get("n_valid"),
+                            "flags": o.get("flags"),
                         },
                         "experiment": _experiment_summary(),
                     },

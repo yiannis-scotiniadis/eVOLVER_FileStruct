@@ -13,3 +13,7 @@ __pycache__/
 # Runtime experiment data — backed up to lab storage, not git
 experiments/*
 !experiments/.gitkeep
+
+# Generated export bundles (data_export.py) — regenerated on demand, not git
+exports/*
+!exports/.gitkeep

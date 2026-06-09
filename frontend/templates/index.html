@@ -4,6 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>eVOLVER Control</title>
+  <link rel="stylesheet" href="/static/css/uPlot.min.css">
   <style>
     :root {
       --bg: #f5f7fa;
@@ -1174,6 +1175,149 @@
       pointer-events: none;
       opacity: 0.6;
     }
+
+    /* ---------- View navigation (Dashboard / Plots) ---------- */
+    .view-nav {
+      display: inline-flex;
+      gap: 4px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 3px;
+    }
+    .view-tab {
+      border: none;
+      background: transparent;
+      color: var(--text-muted);
+      font-size: 13px;
+      font-weight: 600;
+      padding: 6px 14px;
+      border-radius: 6px;
+      cursor: pointer;
+      transition: background 0.15s ease, color 0.15s ease;
+    }
+    .view-tab:hover { color: var(--text); }
+    .view-tab.active {
+      background: var(--card);
+      color: var(--text);
+      box-shadow: var(--shadow-sm);
+    }
+    .view-hidden { display: none !important; }
+
+    /* ---------- Plots view ---------- */
+    .plots-view { padding: 20px 24px 40px; }
+    .plots-toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: flex-end;
+      gap: 22px;
+      margin-bottom: 14px;
+    }
+    .plots-control-group { display: flex; flex-direction: column; gap: 6px; }
+    .plots-label {
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--text-muted);
+    }
+    .plots-select {
+      padding: 8px 10px;
+      border: 1px solid var(--border-strong);
+      border-radius: 6px;
+      background: var(--card);
+      font-size: 13px;
+      min-width: 220px;
+    }
+    .plots-checks { display: inline-flex; gap: 14px; align-items: center; }
+    .chk {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 13px;
+      cursor: pointer;
+      user-select: none;
+    }
+    .chk input { accent-color: var(--status-info); }
+    .range-btns {
+      display: inline-flex;
+      border: 1px solid var(--border-strong);
+      border-radius: 6px;
+      overflow: hidden;
+    }
+    .range-btn {
+      border: none;
+      background: var(--card);
+      color: var(--text-muted);
+      font-size: 12px;
+      font-weight: 600;
+      padding: 7px 12px;
+      cursor: pointer;
+      border-right: 1px solid var(--border);
+      transition: background 0.1s ease, color 0.1s ease;
+    }
+    .range-btn:last-child { border-right: none; }
+    .range-btn:hover { background: var(--bg); }
+    .range-btn.active { background: var(--status-info); color: #fff; }
+    .plots-vials { margin-bottom: 14px; }
+    .plots-vials .vial-select-grid {
+      grid-template-columns: repeat(8, 1fr);
+      margin-top: 6px;
+      max-width: 560px;
+    }
+    .plots-vials .vial-select-cell { padding: 8px 4px; position: relative; }
+    .plots-vials .vial-select-cell.selected {
+      background: var(--vial-color, var(--status-info));
+      border-color: var(--vial-color, var(--status-info));
+      color: #fff;
+    }
+    .plots-note, .plots-tz { font-size: 12px; color: var(--text-muted); margin: 6px 0; }
+    .plots-tz { margin-top: 12px; }
+    .chart-card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 14px 16px 8px;
+      margin-bottom: 16px;
+      box-shadow: var(--shadow-sm);
+    }
+    .chart-title {
+      margin: 0 0 8px;
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text);
+    }
+    .chart-box { width: 100%; }
+    .chart-card-sm { padding: 10px 12px 6px; margin: 10px 0; }
+    .chart-title-sm {
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--text-muted);
+    }
+
+    /* ---------- Modal Trends ---------- */
+    .trends-controls {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 14px;
+      margin-bottom: 6px;
+    }
+    .trends-empty { font-size: 13px; color: var(--text-muted); margin: 8px 0; }
+
+    /* ---------- uPlot theming ---------- */
+    .uplot { font-family: inherit; width: 100%; }
+    .uplot .u-title { font-size: 13px; }
+    .u-legend { font-size: 12px; }
+    .u-legend .u-series th { font-weight: 500; }
+
+    @media (max-width: 640px) {
+      .plots-view { padding: 16px 12px 32px; }
+      .plots-vials .vial-select-grid { grid-template-columns: repeat(4, 1fr); }
+      .plots-toolbar { gap: 14px; }
+    }
   </style>
 </head>
 <body>
@@ -1182,6 +1326,12 @@
       <h1>eVOLVER</h1>
       <span class="subtitle">Control System</span>
     </div>
+    <nav class="view-nav" role="tablist" aria-label="Switch view">
+      <button id="nav-dashboard" class="view-tab active" type="button"
+              role="tab" aria-selected="true">Dashboard</button>
+      <button id="nav-plots" class="view-tab" type="button"
+              role="tab" aria-selected="false">Plots</button>
+    </nav>
     <div class="header-status">
       <span class="conn disconnected" id="conn" aria-live="polite">
         <span class="dot" aria-hidden="true"></span>
@@ -1244,6 +1394,101 @@
     </section>
   </main>
 
+  <!-- ---------- Plots view (time-series, hidden until selected) ---------- -->
+  <section id="plots-view" class="plots-view view-hidden"
+           aria-label="Time-series plots">
+    <div class="plots-toolbar">
+      <div class="plots-control-group">
+        <label class="plots-label" for="plots-exp">Experiment</label>
+        <select id="plots-exp" class="plots-select"></select>
+      </div>
+      <div class="plots-control-group">
+        <span class="plots-label">Variables</span>
+        <div class="plots-checks">
+          <label class="chk"><input type="checkbox" id="plots-var-od" checked> OD</label>
+          <label class="chk"><input type="checkbox" id="plots-var-temp" checked> Temperature</label>
+          <label class="chk"><input type="checkbox" id="plots-var-pump" checked> Pump markers</label>
+        </div>
+      </div>
+      <div class="plots-control-group">
+        <span class="plots-label">Range</span>
+        <div class="range-btns" id="plots-range">
+          <button class="range-btn" data-range="1h" type="button">1h</button>
+          <button class="range-btn active" data-range="6h" type="button">6h</button>
+          <button class="range-btn" data-range="24h" type="button">24h</button>
+          <button class="range-btn" data-range="all" type="button">All</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="plots-vials">
+      <span class="plots-label">Vials</span>
+      <div class="vial-select-grid" id="plots-vial-grid"></div>
+    </div>
+
+    <!-- Export & manage: operates on the experiment / vials / variables /
+         range selected above. Export shapes per data_export.py (wide CSV per
+         parameter, pump events long CSV). -->
+    <div class="plots-toolbar plots-manage">
+      <div class="plots-control-group">
+        <span class="plots-label">Export (uses Variables · Vials · Range above)</span>
+        <div class="plots-checks">
+          <button id="exp-export-download" class="range-btn" type="button">⤓ Download</button>
+          <button id="exp-export-save" class="range-btn" type="button">Save on Pi</button>
+        </div>
+      </div>
+      <div class="plots-control-group">
+        <label class="plots-label" for="exp-rename-input">Rename experiment</label>
+        <div class="plots-checks">
+          <input id="exp-rename-input" class="plots-select" type="text"
+                 placeholder="new name" autocomplete="off" style="min-width:140px;">
+          <button id="exp-rename-btn" class="range-btn" type="button">Rename</button>
+        </div>
+      </div>
+      <div class="plots-control-group">
+        <span class="plots-label">Storage</span>
+        <span id="exp-storage-readout" class="plots-label"
+              style="font-weight:600;">—</span>
+      </div>
+    </div>
+
+    <div class="plots-vials" style="align-items:flex-start;">
+      <label class="plots-label" for="exp-notes-edit">Notes</label>
+      <div style="display:flex; gap:8px; flex:1 1 320px; min-width:0; align-items:flex-start;">
+        <textarea id="exp-notes-edit" rows="2"
+                  placeholder="Lab-notebook notes for this experiment…"
+                  style="flex:1; min-width:0; resize:vertical; font:inherit;
+                         padding:6px 8px; border-radius:6px; color:inherit;
+                         background:transparent;
+                         border:1px solid rgba(127,127,127,0.4);"></textarea>
+        <button id="exp-notes-save" class="range-btn" type="button">Save</button>
+      </div>
+    </div>
+
+    <div class="plots-vials" style="align-items:flex-start;">
+      <span class="plots-label">Saved exports</span>
+      <div id="exp-saved-list" class="plots-checks"
+           style="flex:1; min-width:0; flex-wrap:wrap;"></div>
+    </div>
+
+    <p class="plots-note" id="plots-note"></p>
+
+    <div class="chart-card" id="plots-od-card">
+      <h3 class="chart-title">Optical Density</h3>
+      <div class="chart-box" id="plots-od-chart"></div>
+    </div>
+    <div class="chart-card" id="plots-temp-card">
+      <h3 class="chart-title">Temperature (°C)</h3>
+      <div class="chart-box" id="plots-temp-chart"></div>
+    </div>
+
+    <p class="plots-tz">
+      Times shown in your local timezone (CSV logs are UTC). Pump markers on the
+      OD plot sit at the OD recorded when each pump fired. In the overlay,
+      lines bridge brief gaps — open a single vial for gap-accurate detail.
+    </p>
+  </section>
+
   <div class="modal-backdrop" id="vial-modal" hidden>
     <div class="modal"
          role="dialog"
@@ -1267,6 +1512,30 @@
             <div class="metric-value placeholder" id="modal-od">—</div>
           </div>
         </div>
+
+        <section class="control-block trends-block">
+          <h3>Trends</h3>
+          <div class="trends-controls">
+            <div class="range-btns" id="modal-range">
+              <button class="range-btn" data-range="1h" type="button">1h</button>
+              <button class="range-btn active" data-range="6h" type="button">6h</button>
+              <button class="range-btn" data-range="24h" type="button">24h</button>
+              <button class="range-btn" data-range="all" type="button">All</button>
+            </div>
+            <label class="chk"><input type="checkbox" id="modal-var-pump" checked> Pump markers</label>
+          </div>
+          <p class="trends-empty" id="modal-trends-empty" hidden>
+            No experiment data for this vial.
+          </p>
+          <div class="chart-card chart-card-sm" id="modal-od-card">
+            <span class="chart-title-sm">OD</span>
+            <div class="chart-box chart-box-sm" id="modal-od-chart"></div>
+          </div>
+          <div class="chart-card chart-card-sm" id="modal-temp-card">
+            <span class="chart-title-sm">Temperature (°C)</span>
+            <div class="chart-box chart-box-sm" id="modal-temp-chart"></div>
+          </div>
+        </section>
 
         <section class="control-block">
           <h3>Temperature setpoint</h3>
@@ -1581,6 +1850,7 @@
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
   <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+  <script src="/static/js/uPlot.iife.min.js"></script>
   <script>
     "use strict";
 
@@ -1966,11 +2236,13 @@
       requestAnimationFrame(() => modalEl.classList.add("open"));
       renderModalReadings();
       syncModalFromState(vial);
+      modalTrendsOpen(vial);
     }
 
     function closeVialModal() {
       modalState.vial = null;
       modalEl.classList.remove("open");
+      modalTrendsClose();
       // Wait for transition before hiding to avoid focus traps.
       setTimeout(() => { if (!modalEl.classList.contains("open")) modalEl.hidden = true; }, 160);
     }
@@ -3274,6 +3546,675 @@
       }
     }
 
+    // ============================================================
+    //  Time-series plots (OD / Temperature / pump events)
+    // ============================================================
+    const PLOT_COLORS = [
+      "#2563eb", "#dc2626", "#16a34a", "#d97706", "#7c3aed", "#0891b2",
+      "#db2777", "#65a30d", "#ea580c", "#0d9488", "#4f46e5", "#b91c1c",
+      "#059669", "#9333ea", "#c026d3", "#475569",
+    ];
+    const vialColor = (i) => PLOT_COLORS[((i % 16) + 16) % 16];
+    const RANGE_TO_HOURS = { "1h": 1, "6h": 6, "24h": 24, "all": null };
+    const PLOT_MAX_POINTS = 2000;
+
+    function tsToEpoch(iso) {
+      const ms = Date.parse(iso);
+      return Number.isNaN(ms) ? null : ms / 1000;
+    }
+
+    function rootColor(name, fallback) {
+      return (getComputedStyle(document.documentElement)
+        .getPropertyValue(name).trim()) || fallback;
+    }
+
+    async function fetchPlotData(exp, vial, param, hours) {
+      const qs = new URLSearchParams({
+        vial: String(vial), parameter: param, max_points: String(PLOT_MAX_POINTS),
+      });
+      if (hours != null) qs.set("hours", String(hours));
+      const res = await fetch(
+        `/api/experiments/${encodeURIComponent(exp)}/data?${qs.toString()}`);
+      if (!res.ok) {
+        const e = await res.json().catch(() => ({}));
+        throw new Error(e.error || `HTTP ${res.status}`);
+      }
+      return res.json();
+    }
+
+    // Draws per-vial pump markers (diamonds at the OD recorded when the pump
+    // fired) onto an OD chart. Marker list is attached as u._pumpMarkers.
+    function pumpMarkerPlugin() {
+      return { hooks: { draw: (u) => {
+        const marks = u._pumpMarkers;
+        if (!marks || !marks.length) return;
+        const ctx = u.ctx;
+        const dpr = u.pxRatio || 1;
+        const { left, top, width, height } = u.bbox;
+        const r = 4 * dpr;
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(left, top, width, height);
+        ctx.clip();
+        for (const m of marks) {
+          if (m.t == null || m.od == null || !Number.isFinite(m.od)) continue;
+          const x = u.valToPos(m.t, "x", true);
+          const y = u.valToPos(m.od, "y", true);
+          if (x < left || x > left + width) continue;
+          ctx.beginPath();
+          ctx.moveTo(x, y - r); ctx.lineTo(x + r, y);
+          ctx.lineTo(x, y + r); ctx.lineTo(x - r, y);
+          ctx.closePath();
+          ctx.fillStyle = m.color;
+          ctx.fill();
+          ctx.lineWidth = dpr;
+          ctx.strokeStyle = "#ffffff";
+          ctx.stroke();
+        }
+        ctx.restore();
+      } } };
+    }
+
+    function makeChart(el, series, data, opts) {
+      opts = opts || {};
+      const axisColor = rootColor("--text-muted", "#64748b");
+      const gridStroke = "rgba(100,116,139,0.18)";
+      const u = new uPlot({
+        width: el.clientWidth || 600,
+        height: opts.height || 240,
+        legend: { show: opts.legend !== false },
+        cursor: { drag: { x: true, y: false }, focus: { prox: 30 } },
+        scales: { x: { time: true } },
+        axes: [
+          { stroke: axisColor, grid: { stroke: gridStroke, width: 1 },
+            ticks: { stroke: gridStroke, width: 1 } },
+          { stroke: axisColor, grid: { stroke: gridStroke, width: 1 },
+            ticks: { stroke: gridStroke, width: 1 }, size: opts.ySize || 54 },
+        ],
+        series: series,
+        plugins: opts.plugins || [],
+      }, data, el);
+      const ro = new ResizeObserver(() => {
+        if (el.clientWidth) u.setSize({ width: el.clientWidth, height: opts.height || 240 });
+      });
+      ro.observe(el);
+      u._ro = ro;
+      return u;
+    }
+
+    function destroyChart(u) {
+      if (!u) return;
+      try { if (u._ro) u._ro.disconnect(); u.destroy(); } catch (_e) { /* ignore */ }
+    }
+
+    // Build a uPlot-aligned [xs, vial0, vial1, ...] from per-vial
+    // {t:[epoch], v:[value|null]} maps. Vials with no point at a given epoch
+    // get null; overlay series use spanGaps so lines stay continuous.
+    function buildAligned(seriesByVial, vials) {
+      const set = new Set();
+      for (const v of vials) {
+        const s = seriesByVial[v];
+        if (!s) continue;
+        for (const t of s.t) if (t != null) set.add(t);
+      }
+      const xs = Array.from(set).sort((a, b) => a - b);
+      const idx = new Map();
+      xs.forEach((t, i) => idx.set(t, i));
+      const cols = [xs];
+      for (const v of vials) {
+        const arr = new Array(xs.length).fill(null);
+        const s = seriesByVial[v];
+        if (s) {
+          for (let i = 0; i < s.t.length; i++) {
+            const t = s.t[i];
+            if (t == null) continue;
+            const j = idx.get(t);
+            if (j != null) arr[j] = s.v[i];
+          }
+        }
+        cols.push(arr);
+      }
+      return cols;
+    }
+
+    // Append one live (epoch, value-per-vial) sample; trims to the window.
+    function appendLive(u, vials, epoch, calArr, hours) {
+      if (!u) return;
+      const d = u.data.map((col) => col.slice());
+      const xs = d[0];
+      if (xs.length && xs[xs.length - 1] >= epoch) return; // dup / out of order
+      xs.push(epoch);
+      for (let k = 0; k < vials.length; k++) {
+        const val = calArr[vials[k]];
+        d[k + 1].push(Number.isFinite(val) ? val : null);
+      }
+      if (hours != null) {
+        const cutoff = epoch - hours * 3600;
+        let drop = 0;
+        while (drop < xs.length && xs[drop] < cutoff) drop++;
+        if (drop > 0) for (let c = 0; c < d.length; c++) d[c].splice(0, drop);
+      }
+      u.setData(d);
+    }
+
+    function chartingReady() { return typeof uPlot !== "undefined"; }
+
+    // ---------- Dedicated multi-vial Plots view ----------
+    const plots = {
+      exp: null,
+      expVials: [],
+      vials: new Set(),
+      range: "6h",
+      showOD: true, showTemp: true, showPump: true,
+      od: null, temp: null,
+      _odByVial: {}, _tempByVial: {}, _pumpByVial: {},
+      _chartVials: [],
+    };
+    let plotsLoadToken = 0;
+
+    const plotsView = document.getElementById("plots-view");
+    const mainView = document.querySelector("main");
+
+    function showView(which) {
+      const isPlots = which === "plots";
+      plotsView.classList.toggle("view-hidden", !isPlots);
+      mainView.classList.toggle("view-hidden", isPlots);
+      const navPlots = document.getElementById("nav-plots");
+      const navDash = document.getElementById("nav-dashboard");
+      navPlots.classList.toggle("active", isPlots);
+      navDash.classList.toggle("active", !isPlots);
+      navPlots.setAttribute("aria-selected", String(isPlots));
+      navDash.setAttribute("aria-selected", String(!isPlots));
+      if (isPlots) plotsOnOpen();
+    }
+
+    async function plotsPopulateExperiments() {
+      const sel = document.getElementById("plots-exp");
+      let list = [];
+      try {
+        const res = await fetch("/api/experiments");
+        const d = await res.json();
+        list = d.experiments || [];
+      } catch (_e) { list = []; }
+      list.sort((a, b) =>
+        (b.status === "running" ? 1 : 0) - (a.status === "running" ? 1 : 0));
+      sel.innerHTML = "";
+      if (!list.length) {
+        const o = document.createElement("option");
+        o.value = ""; o.textContent = "No experiments";
+        sel.appendChild(o);
+        plots.exp = null; plots.expVials = [];
+        return;
+      }
+      for (const e of list) {
+        const o = document.createElement("option");
+        o.value = e.name;
+        o.textContent = `${e.name} (${e.status})`;
+        o.dataset.vials = JSON.stringify(e.vials || []);
+        sel.appendChild(o);
+      }
+      const chosen = list.find((e) => e.name === plots.exp)
+        || list.find((e) => e.status === "running") || list[0];
+      plots.exp = chosen.name;
+      plots.expVials = chosen.vials || [];
+      sel.value = plots.exp;
+    }
+
+    function plotsRenderVialGrid() {
+      const grid = document.getElementById("plots-vial-grid");
+      grid.innerHTML = "";
+      const avail = new Set(plots.expVials);
+      for (let i = 0; i < N_VIALS; i++) {
+        const cell = document.createElement("div");
+        cell.className = "vial-select-cell";
+        cell.textContent = i;
+        if (!avail.has(i)) {
+          cell.classList.add("locked-other");
+        } else {
+          cell.style.setProperty("--vial-color", vialColor(i));
+          if (plots.vials.has(i)) cell.classList.add("selected");
+          cell.addEventListener("click", () => {
+            if (plots.vials.has(i)) plots.vials.delete(i);
+            else plots.vials.add(i);
+            cell.classList.toggle("selected");
+            plotsLoad();
+          });
+        }
+        grid.appendChild(cell);
+      }
+    }
+
+    async function plotsOnOpen() {
+      await plotsPopulateExperiments();
+      // keep only vials that still exist in the chosen experiment.
+      plots.vials = new Set(
+        Array.from(plots.vials).filter((v) => plots.expVials.includes(v)));
+      if (!plots.vials.size) plots.vials = new Set(plots.expVials);
+      plotsRenderVialGrid();
+      plotsLoad();
+      refreshExperimentManagePanel();
+    }
+
+    function clearPlotsCharts() {
+      destroyChart(plots.od); plots.od = null;
+      destroyChart(plots.temp); plots.temp = null;
+    }
+
+    async function plotsLoad() {
+      const note = document.getElementById("plots-note");
+      if (!chartingReady()) { note.textContent = "Charting library failed to load."; return; }
+      if (!plots.exp) { note.textContent = "No experiment selected."; clearPlotsCharts(); return; }
+      const vials = Array.from(plots.vials).sort((a, b) => a - b);
+      if (!vials.length) { note.textContent = "Select one or more vials to plot."; clearPlotsCharts(); return; }
+      const token = ++plotsLoadToken;
+      note.textContent = "Loading…";
+      const hours = RANGE_TO_HOURS[plots.range];
+      const odByVial = {}, tempByVial = {}, pumpByVial = {};
+      try {
+        await Promise.all(vials.map(async (v) => {
+          if (plots.showOD || plots.showPump) {
+            const od = await fetchPlotData(plots.exp, v, "od", hours);
+            odByVial[v] = { t: od.timestamps.map(tsToEpoch), v: od.values };
+          }
+          if (plots.showTemp) {
+            const tp = await fetchPlotData(plots.exp, v, "temp", hours);
+            tempByVial[v] = { t: tp.timestamps.map(tsToEpoch), v: tp.values };
+          }
+          if (plots.showPump) {
+            try {
+              const pd = await fetchPlotData(plots.exp, v, "pump", hours);
+              pumpByVial[v] = (pd.rows || [])
+                .filter((r) => r.direction !== "efflux")
+                .map((r) => ({
+                  t: tsToEpoch(r.timestamp),
+                  od: (r.od_at_pump == null || r.od_at_pump === "")
+                    ? null : parseFloat(r.od_at_pump),
+                  color: vialColor(v),
+                }));
+            } catch (_e) { pumpByVial[v] = []; }
+          }
+        }));
+        if (token !== plotsLoadToken) return; // superseded by a newer load
+        plots._odByVial = odByVial;
+        plots._tempByVial = tempByVial;
+        plots._pumpByVial = pumpByVial;
+        renderPlotsCharts(vials);
+        note.textContent = "";
+      } catch (err) {
+        if (token !== plotsLoadToken) return;
+        note.textContent = `Failed to load data: ${err.message}`;
+      }
+    }
+
+    function seriesForVials(vials) {
+      const arr = [{ label: "Time" }];
+      for (const v of vials) {
+        arr.push({
+          label: `Vial ${v}`, stroke: vialColor(v), width: 1.5,
+          spanGaps: true, points: { show: false },
+        });
+      }
+      return arr;
+    }
+
+    function collectPumpMarkers(vials) {
+      const out = [];
+      for (const v of vials) {
+        const arr = (plots._pumpByVial || {})[v] || [];
+        for (const m of arr) out.push(m);
+      }
+      return out;
+    }
+
+    function renderPlotsCharts(vials) {
+      plots._chartVials = vials.slice();
+      const odCard = document.getElementById("plots-od-card");
+      const tempCard = document.getElementById("plots-temp-card");
+      odCard.classList.toggle("view-hidden", !plots.showOD);
+      tempCard.classList.toggle("view-hidden", !plots.showTemp);
+      clearPlotsCharts();
+      if (plots.showOD) {
+        const data = buildAligned(plots._odByVial, vials);
+        plots.od = makeChart(document.getElementById("plots-od-chart"),
+          seriesForVials(vials), data, { height: 280, plugins: [pumpMarkerPlugin()] });
+        plots.od._pumpMarkers = plots.showPump ? collectPumpMarkers(vials) : [];
+        plots.od.redraw();
+      }
+      if (plots.showTemp) {
+        const data = buildAligned(plots._tempByVial, vials);
+        plots.temp = makeChart(document.getElementById("plots-temp-chart"),
+          seriesForVials(vials), data, { height: 240 });
+      }
+    }
+
+    function plotsOnSensorUpdate(msg) {
+      if (plotsView.classList.contains("view-hidden")) return;
+      if (!msg.experiment || msg.experiment.name !== plots.exp
+          || msg.experiment.status !== "running") return;
+      if (!plots._chartVials || !plots._chartVials.length) return;
+      const epoch = tsToEpoch(msg.timestamp);
+      if (epoch == null) return;
+      const hours = RANGE_TO_HOURS[plots.range];
+      const odCal = (msg.od && msg.od.calibrated) || [];
+      const tCal = (msg.temperature && msg.temperature.calibrated) || [];
+      appendLive(plots.od, plots._chartVials, epoch, odCal, hours);
+      appendLive(plots.temp, plots._chartVials, epoch, tCal, hours);
+    }
+
+    function plotsOnExperimentEvent(msg) {
+      if (!msg) return;
+      // Refresh the experiment dropdown when the set/status of experiments changes.
+      if (["created", "started", "stopped", "error"].includes(msg.type)
+          && !plotsView.classList.contains("view-hidden")) {
+        const prev = plots.exp;
+        plotsPopulateExperiments().then(() => {
+          const sel = document.getElementById("plots-exp");
+          sel.value = plots.exp || "";
+          if (plots.exp !== prev) {
+            plots.vials = new Set(plots.expVials);
+            plotsRenderVialGrid();
+            plotsLoad();
+          }
+        });
+      }
+      // Live pump marker (influx = the dilution event).
+      if (msg.type === "pump" && typeof msg.vial === "number"
+          && msg.direction !== "efflux" && plots.exp === expState.name) {
+        const epoch = Date.now() / 1000;
+        const od = latest.od[msg.vial];
+        const mark = {
+          t: epoch, od: Number.isFinite(od) ? od : null, color: vialColor(msg.vial),
+        };
+        if (!plotsView.classList.contains("view-hidden") && plots.showPump
+            && plots.od && plots.vials.has(msg.vial)) {
+          (plots.od._pumpMarkers = plots.od._pumpMarkers || []).push(mark);
+          plots.od.redraw();
+        }
+        if (modalState.vial === msg.vial && modalTrends.od && modalTrends.showPump) {
+          (modalTrends.od._pumpMarkers = modalTrends.od._pumpMarkers || []).push(mark);
+          modalTrends.od.redraw();
+        }
+      }
+    }
+
+    // ---------- Per-vial Trends in the vial modal ----------
+    const modalTrends = { vial: null, range: "6h", showPump: true, od: null, temp: null };
+    let modalTrendsToken = 0;
+
+    function modalTrendsClose() {
+      destroyChart(modalTrends.od); modalTrends.od = null;
+      destroyChart(modalTrends.temp); modalTrends.temp = null;
+      modalTrends.vial = null;
+    }
+
+    async function modalTrendsOpen(vial) {
+      modalTrends.vial = vial;
+      await modalTrendsLoad();
+    }
+
+    async function modalTrendsLoad() {
+      const token = ++modalTrendsToken;
+      const vial = modalTrends.vial;
+      if (vial == null) return;
+      const empty = document.getElementById("modal-trends-empty");
+      const odCard = document.getElementById("modal-od-card");
+      const tempCard = document.getElementById("modal-temp-card");
+      destroyChart(modalTrends.od); modalTrends.od = null;
+      destroyChart(modalTrends.temp); modalTrends.temp = null;
+      const exp = expState.name;
+      const inExp = exp && Array.isArray(expState.vials) && expState.vials.includes(vial);
+      if (!chartingReady() || !inExp) {
+        empty.hidden = false;
+        empty.textContent = chartingReady()
+          ? "No experiment data for this vial."
+          : "Charting library failed to load.";
+        odCard.classList.add("view-hidden");
+        tempCard.classList.add("view-hidden");
+        return;
+      }
+      empty.hidden = true;
+      odCard.classList.remove("view-hidden");
+      tempCard.classList.remove("view-hidden");
+      const hours = RANGE_TO_HOURS[modalTrends.range];
+      try {
+        const [od, tp] = await Promise.all([
+          fetchPlotData(exp, vial, "od", hours),
+          fetchPlotData(exp, vial, "temp", hours),
+        ]);
+        let pumpMarks = [];
+        if (modalTrends.showPump) {
+          try {
+            const pd = await fetchPlotData(exp, vial, "pump", hours);
+            pumpMarks = (pd.rows || [])
+              .filter((r) => r.direction !== "efflux")
+              .map((r) => ({
+                t: tsToEpoch(r.timestamp),
+                od: (r.od_at_pump == null || r.od_at_pump === "")
+                  ? null : parseFloat(r.od_at_pump),
+                color: vialColor(vial),
+              }));
+          } catch (_e) { /* pump log may not exist yet */ }
+        }
+        if (token !== modalTrendsToken || modalState.vial !== vial) return;
+        const odData = [od.timestamps.map(tsToEpoch), od.values];
+        const tpData = [tp.timestamps.map(tsToEpoch), tp.values];
+        modalTrends.od = makeChart(
+          document.getElementById("modal-od-chart"),
+          [{ label: "Time" },
+           { label: `Vial ${vial}`, stroke: vialColor(vial), width: 1.5,
+             spanGaps: false, points: { show: false } }],
+          odData, { height: 170, legend: false, plugins: [pumpMarkerPlugin()] });
+        modalTrends.od._pumpMarkers = pumpMarks;
+        modalTrends.od.redraw();
+        modalTrends.temp = makeChart(
+          document.getElementById("modal-temp-chart"),
+          [{ label: "Time" },
+           { label: `Vial ${vial}`, stroke: "#dc2626", width: 1.5,
+             spanGaps: false, points: { show: false } }],
+          tpData, { height: 150, legend: false });
+      } catch (err) {
+        if (token !== modalTrendsToken) return;
+        empty.hidden = false;
+        empty.textContent = `Failed to load trends: ${err.message}`;
+        odCard.classList.add("view-hidden");
+        tempCard.classList.add("view-hidden");
+      }
+    }
+
+    function modalTrendsAppend(msg) {
+      if (modalState.vial === null || modalTrends.vial === null) return;
+      if (!msg.experiment || msg.experiment.name !== expState.name
+          || msg.experiment.status !== "running") return;
+      if (!Array.isArray(expState.vials) || !expState.vials.includes(modalTrends.vial)) return;
+      const epoch = tsToEpoch(msg.timestamp);
+      if (epoch == null) return;
+      const hours = RANGE_TO_HOURS[modalTrends.range];
+      const odCal = (msg.od && msg.od.calibrated) || [];
+      const tCal = (msg.temperature && msg.temperature.calibrated) || [];
+      appendLive(modalTrends.od, [modalTrends.vial], epoch, odCal, hours);
+      appendLive(modalTrends.temp, [modalTrends.vial], epoch, tCal, hours);
+    }
+
+    // ---------- Wire up the controls (run once at load) ----------
+    function wireRangeButtons(container, cb) {
+      if (!container) return;
+      container.addEventListener("click", (e) => {
+        const btn = e.target.closest(".range-btn");
+        if (!btn) return;
+        container.querySelectorAll(".range-btn").forEach((b) => b.classList.remove("active"));
+        btn.classList.add("active");
+        cb(btn.dataset.range);
+      });
+    }
+
+    // ---------- Export & manage (plots view) ----------
+    async function reqJson(method, url, body) {
+      const opts = { method, headers: { "Content-Type": "application/json" } };
+      if (body !== undefined) opts.body = JSON.stringify(body);
+      const res = await fetch(url, opts);
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      return data;
+    }
+
+    function fmtBytes(n) {
+      if (n == null) return "—";
+      const u = ["B", "KB", "MB", "GB", "TB"];
+      let i = 0, v = n;
+      while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+      return `${v.toFixed(v < 10 && i > 0 ? 1 : 0)} ${u[i]}`;
+    }
+
+    function plotsExportSelection() {
+      const params = [];
+      if (plots.showOD) params.push("od");
+      if (plots.showTemp) params.push("temp");
+      if (plots.showPump) params.push("pump");
+      const vials = Array.from(plots.vials).sort((a, b) => a - b);
+      return { params, vials, hours: RANGE_TO_HOURS[plots.range] };
+    }
+
+    function exportSelectionValid() {
+      const { params, vials } = plotsExportSelection();
+      if (!plots.exp) { showToast("No experiment selected.", "error"); return false; }
+      if (!params.length) { showToast("Enable at least one variable (OD/Temp/Pump).", "error"); return false; }
+      if (!vials.length) { showToast("Select at least one vial.", "error"); return false; }
+      return true;
+    }
+
+    function downloadExport() {
+      if (!exportSelectionValid()) return;
+      const { params, vials, hours } = plotsExportSelection();
+      const qs = new URLSearchParams();
+      qs.set("parameters", params.join(","));
+      qs.set("vials", vials.join(","));
+      if (hours != null) qs.set("hours", String(hours));
+      const a = document.createElement("a");
+      a.href = `/api/experiments/${encodeURIComponent(plots.exp)}/export?${qs.toString()}`;
+      a.download = "";
+      document.body.appendChild(a); a.click(); a.remove();
+      showToast("Export download started", "ok");
+    }
+
+    async function saveExportOnPi() {
+      if (!exportSelectionValid()) return;
+      const { params, vials, hours } = plotsExportSelection();
+      try {
+        const r = await reqJson("POST",
+          `/api/experiments/${encodeURIComponent(plots.exp)}/export`,
+          { parameters: params, vials, hours });
+        showToast(`Saved ${r.filename} (${fmtBytes(r.bytes)})`, "ok");
+        await refreshSavedExports();
+        await refreshStorage();
+      } catch (err) { showToast(`Save failed: ${err.message}`, "error"); }
+    }
+
+    async function refreshSavedExports() {
+      const wrap = document.getElementById("exp-saved-list");
+      try {
+        const d = await (await fetch("/api/exports")).json();
+        const items = d.exports || [];
+        wrap.innerHTML = "";
+        if (!items.length) { wrap.textContent = "None yet."; return; }
+        for (const it of items.slice(0, 12)) {
+          const a = document.createElement("a");
+          a.href = it.download_url; a.download = "";
+          a.className = "range-btn";
+          a.textContent = `${it.filename} (${fmtBytes(it.bytes)})`;
+          a.title = `created ${it.created}`;
+          wrap.appendChild(a);
+        }
+      } catch (_e) { wrap.textContent = "Could not load exports."; }
+    }
+
+    async function refreshStorage() {
+      const el = document.getElementById("exp-storage-readout");
+      try {
+        const d = await (await fetch("/api/storage")).json();
+        const fs = d.filesystem || {};
+        el.textContent = `${fmtBytes(fs.free_bytes)} free (${fs.free_pct}%)`;
+        el.style.color = (fs.free_pct != null && fs.free_pct < 10) ? "#d9534f" : "inherit";
+      } catch (_e) { el.textContent = "—"; }
+    }
+
+    async function renameExperiment() {
+      const input = document.getElementById("exp-rename-input");
+      const newName = input.value.trim();
+      if (!plots.exp) { showToast("No experiment selected.", "error"); return; }
+      if (!newName) { showToast("Enter a new name.", "error"); return; }
+      try {
+        await reqJson("POST",
+          `/api/experiments/${encodeURIComponent(plots.exp)}/rename`,
+          { new_name: newName });
+        showToast(`Renamed to ${newName}`, "ok");
+        input.value = "";
+        plots.exp = newName;
+        await plotsOnOpen();
+      } catch (err) { showToast(`Rename failed: ${err.message}`, "error"); }
+    }
+
+    async function loadExperimentNotes() {
+      const ta = document.getElementById("exp-notes-edit");
+      if (!plots.exp) { ta.value = ""; return; }
+      try {
+        const cfg = await (await fetch(
+          `/api/experiments/${encodeURIComponent(plots.exp)}`)).json();
+        ta.value = (cfg && cfg.notes) ? cfg.notes : "";
+      } catch (_e) { ta.value = ""; }
+    }
+
+    async function saveExperimentNotes() {
+      const ta = document.getElementById("exp-notes-edit");
+      if (!plots.exp) { showToast("No experiment selected.", "error"); return; }
+      try {
+        await reqJson("PATCH",
+          `/api/experiments/${encodeURIComponent(plots.exp)}`, { notes: ta.value });
+        showToast("Notes saved", "ok");
+      } catch (err) { showToast(`Save notes failed: ${err.message}`, "error"); }
+    }
+
+    function refreshExperimentManagePanel() {
+      loadExperimentNotes();
+      refreshStorage();
+      refreshSavedExports();
+    }
+
+    (function initPlotsUI() {
+      document.getElementById("nav-dashboard")
+        .addEventListener("click", () => showView("dashboard"));
+      document.getElementById("nav-plots")
+        .addEventListener("click", () => showView("plots"));
+      document.getElementById("plots-exp").addEventListener("change", (e) => {
+        plots.exp = e.target.value || null;
+        const opt = e.target.selectedOptions[0];
+        plots.expVials = opt ? JSON.parse(opt.dataset.vials || "[]") : [];
+        plots.vials = new Set(plots.expVials);
+        plotsRenderVialGrid();
+        plotsLoad();
+        loadExperimentNotes();
+      });
+      document.getElementById("exp-export-download")
+        .addEventListener("click", downloadExport);
+      document.getElementById("exp-export-save")
+        .addEventListener("click", saveExportOnPi);
+      document.getElementById("exp-rename-btn")
+        .addEventListener("click", renameExperiment);
+      document.getElementById("exp-notes-save")
+        .addEventListener("click", saveExperimentNotes);
+      document.getElementById("plots-var-od")
+        .addEventListener("change", (e) => { plots.showOD = e.target.checked; plotsLoad(); });
+      document.getElementById("plots-var-temp")
+        .addEventListener("change", (e) => { plots.showTemp = e.target.checked; plotsLoad(); });
+      document.getElementById("plots-var-pump")
+        .addEventListener("change", (e) => { plots.showPump = e.target.checked; plotsLoad(); });
+      wireRangeButtons(document.getElementById("plots-range"),
+        (r) => { plots.range = r; plotsLoad(); });
+      wireRangeButtons(document.getElementById("modal-range"),
+        (r) => { modalTrends.range = r; modalTrendsLoad(); });
+      document.getElementById("modal-var-pump")
+        .addEventListener("change", (e) => { modalTrends.showPump = e.target.checked; modalTrendsLoad(); });
+    })();
+
     // --- Socket.IO ---
     const socket = io({ transports: ["websocket", "polling"] });
     socket.on("connect", () => {
@@ -3283,6 +4224,8 @@
     });
     socket.on("disconnect", () => setConnection("disconnected"));
     socket.on("sensor_update", updateVials);
+    socket.on("sensor_update", (msg) => { plotsOnSensorUpdate(msg); modalTrendsAppend(msg); });
+    socket.on("experiment_event", plotsOnExperimentEvent);
     socket.on("alert", (msg) => {
       const kind = msg.level === "critical" ? "error" : "ok";
       showToast(msg.message || "Alert", kind);
