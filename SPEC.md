@@ -20,37 +20,59 @@ All members of the Isaacs Lab at Yale, ranging from undergraduate researchers wi
 
 ## 2. Phased build plan
 
-### Phase 1: MVP — Live dashboard + turbidostat (target: first working experiment)
+> **Status note (Aug 2026).** Phase 1 is complete and deployed. Most of Phase 2 is
+> complete. Phase 3 has barely started — in particular there are **no calibration
+> endpoints in the codebase at all**, which is the quiet blocker under several other
+> features. `ROADMAP.md` holds the current prioritised work plan derived from the
+> August 2026 lab meeting; this section records the phase structure and what is done.
 
-- Flask server on RPi replaces all 5 supervisor processes
-- SerialManager class owns RS485 communication
-- MockSerialManager for development without hardware
-- Live dashboard: temperature and OD for all 16 vials, updated every 10 seconds
-- Manual controls: set temperature, stir rate, trigger pumps, emergency stop
-- Single turbidostat experiment: configure thresholds per vial, start/stop, log data
-- CSV data export
-- Watchdog: zero all actuators if no heartbeat for 30 minutes
-- Shutdown handler: zero all actuators on server exit, crash, or SIGTERM
+### Phase 1: MVP — Live dashboard + turbidostat — **COMPLETE**
 
-### Phase 2: Multi-experiment + experiment designer
+- [x] Flask server on RPi replaces all 5 supervisor processes
+- [x] SerialManager class owns RS485 communication
+- [x] MockSerialManager for development without hardware
+- [x] Live dashboard: temperature and OD for all 16 vials, updated every 10 seconds
+- [x] Manual controls: set temperature, stir rate, trigger pumps, emergency stop
+- [x] Single turbidostat experiment: configure thresholds per vial, start/stop, log data
+- [x] CSV data export
+- [x] Watchdog: zero all actuators if no heartbeat for 30 minutes
+- [x] Shutdown handler: zero all actuators on server exit, crash, or SIGTERM
 
-- Assign vials to independent experiment groups
-- Visual experiment designer GUI (vial assignment, parameter sliders, mode selection)
-- Additional control modes: chemostat, morbidostat, growth rate feedback
-- Phase-based experiment protocols (sequential phases with trigger conditions)
-- Experiment templates (save/load/share experiment configurations as JSON)
+### Phase 2: Multi-experiment + experiment designer — **MOSTLY COMPLETE**
 
-### Phase 3: Calibration + monitoring
+- [x] Additional control modes: chemostat, morbidostat
+- [x] Media/waste configuration wizard, per-vial media assignment, volume tracking
+- [x] Maintenance mode with auto-resume failsafe
+- [x] Crash recovery / resume from `state.json`
+- [ ] Growth rate feedback control mode (disabled in the UI — blocked on §17)
+- [ ] Vial groups: independent modes and parameters within one experiment (ROADMAP Session Y)
+- [ ] Phase-based experiment protocols (ROADMAP Session Z)
+- [ ] Experiment templates (§23, ROADMAP Session Q)
+- [ ] True parallel experiments — deferred, see `ROADMAP.md` §2 for the reasoning
 
-- Guided calibration wizard for temperature and OD
-- Pump flow rate calibration
-- Historical data plotting with zoom/pan
-- Growth rate estimation (exponential fit on sliding OD window)
-- Configurable alerts: OD stagnation, temperature deviation, excessive pump cycling
-- Slack webhook integration for alerts
+### Phase 3: Calibration + monitoring — **STARTED**
+
+- [x] Historical data plotting (uPlot, per-vial modal and plots view)
+- [ ] Guided calibration wizard for temperature and OD (§19)
+- [ ] Pump flow rate calibration (§19) — blocks the accuracy of §15, §16, §17
+- [ ] Per-run OD blank (§19)
+- [ ] Growth rate estimation service (§17)
+- [ ] Consumables safety interlock (§15)
+- [ ] Volume-based fluidics (§16)
+- [ ] Structured logging and unified event log (§20)
+- [ ] Hygiene records and sterilisation wizard (§18)
+- [ ] Supervised per-vial override (§21)
+- [ ] Rule-based anomaly and stall detection (§22)
+- [ ] Slack webhook integration for alerts (§22)
+- [ ] Off-box backup (§24)
 
 ### Phase 4: Advanced features
 
+- Stir-rate-to-RPM calibration (§25)
+- Statistical contamination detection (deferred — needs a corpus of real runs first)
+- Cascade PID temperature control (deferred — see `ROADMAP.md` §6; note the premise in
+  `SESSION_MASTER_PLAN.md` Session H is wrong)
+- Authentication and network hardening
 - Spectral multiplexing (multi-wavelength OD if hardware supports it)
 - ML-in-the-loop adaptive experiments
 - Metapopulation mode (inter-vial transfers on a programmable topology)
@@ -377,18 +399,78 @@ GET /api/experiments/{name}/status
   }
 ```
 
-### Calibration endpoints (Phase 3)
+### Calibration endpoints (Phase 3 — §19, not yet implemented)
 
 ```
 GET /api/calibration/temperature
-  Response: {"slopes": [...], "intercepts": [...], "last_calibrated": "..."}
+  Response: {"slopes": [...], "intercepts": [...], "last_calibrated": "...", "version": "..."}
 
 GET /api/calibration/od
-  Response: {"params": [[...], [...], [...], [...]], "last_calibrated": "..."}
+  Response: {"params": [[...], [...], [...], [...]], "last_calibrated": "...", "version": "..."}
 
-POST /api/calibration/temperature/start
-POST /api/calibration/temperature/record
-POST /api/calibration/temperature/finish
+GET /api/calibration/pump
+  Response: {"flow_rates_ml_s": {"influx": [...16], "efflux": [...16]},
+             "last_calibrated": "...", "version": "..."}
+
+POST /api/calibration/{subsystem}/start     # subsystem = temperature | od | pump
+POST /api/calibration/{subsystem}/record    # append one measurement point
+POST /api/calibration/{subsystem}/finish    # fit, write a NEW versioned file, return the fit
+POST /api/calibration/{subsystem}/abort
+
+POST /api/calibration/od/blank              # per-run blank; scoped to an experiment
+  Body: {"experiment": "name", "stage": "dark" | "blank"}
+  Response: {"status": "ok", "raw": [...16], "updated_rows": [0] | [1]}
+
+GET  /api/calibration/history               # all versions, for provenance
+```
+
+All `/api/calibration/*` routes reject requests while an experiment is RUNNING, and are
+the only routes permitted to reach the raw actuator paths (`set_temperature_raw`, raw OD
+LED power). See §19.
+
+### Consumables, hygiene, override, and template endpoints (not yet implemented)
+
+```
+GET  /api/consumables                       # §15 — levels, reserves, block state, forecast
+  Response: {"bottles": [{"id": "media_a", "remaining_ml": 412.0,
+                          "reserve_ml": 50.0, "blocked": false,
+                          "hours_remaining_observed": 14.2,
+                          "hours_remaining_predicted": 11.8,
+                          "empty_at": "2026-08-04T03:40:00",
+                          "estimate_quality": "calibrated" | "uncalibrated"}],
+             "waste": {"filled_ml": 2180.0, "capacity_ml": 5000.0, "blocked": false}}
+
+POST /api/actuators/pump                    # §16 — extended, backwards compatible
+  Body: {"vial": 0, "direction": "influx", "volume_ml": 5.0}
+     or {"vial": 0, "direction": "influx", "seconds": 5.0}
+  Response: {"status": "ok", "requested_ml": 5.0, "delivered_ml": 5.0, "seconds": 5}
+
+POST /api/actuators/pump/preview            # §16 — quantisation preview, no side effects
+  Body: {"vial": 0, "direction": "influx", "volume_ml": 2.5}
+  Response: {"deliverable_ml": 2.0, "seconds": 2, "min_ml": 1.0, "quantised": true}
+
+GET  /api/hygiene                           # §18
+POST /api/hygiene/record
+POST /api/service/sterilize/start           # service mode only; refuses while RUNNING
+POST /api/service/sterilize/advance
+POST /api/service/sterilize/abort
+
+POST /api/vials/{vial}/override             # §21
+  Body: {"duration_minutes": 10, "reason": "sampling"}
+  Response: {"status": "ok", "expires_at": "..."}
+POST /api/vials/{vial}/override/release
+
+GET  /api/templates                         # §23
+POST /api/templates                         # save current or named experiment as template
+GET  /api/templates/{name}
+DELETE /api/templates/{name}
+
+GET  /api/experiments/{name}/events         # §20 — unified event log
+  Query params: ?level=warning&category=pump&last_n=200
+GET  /api/growth_rate                       # §17 — current per-vial estimates
+  Response: {"vials": {"0": {"mu_per_hour": 0.43, "doubling_time_h": 1.61,
+                             "r_squared": 0.98, "method": "segment",
+                             "mu_dilution": 0.41, "diverged": false}}}
 ```
 
 ---
@@ -977,4 +1059,455 @@ These decisions can be deferred but should be resolved before Phase 2:
 
 5. **Network access:** Currently the eVOLVER is on a dedicated Netgear router (192.168.1.x). For remote monitoring, the router could be connected to Yale's network, or a VPN tunnel could be set up. This is a Phase 4 concern.
 
-6. **Concurrent experiments:** Phase 2 allows multiple experiment groups, but the RS485 bus is shared. The serial manager must ensure commands for different experiments don't interfere. Since all 16 vials are always read in a single command, this is primarily a software isolation concern, not a hardware one.
+6. **Concurrent experiments:** Phase 2 allows multiple experiment groups, but the RS485 bus is shared. The serial manager must ensure commands for different experiments don't interfere. Since all 16 vials are always read in a single command, this is primarily a software isolation concern, not a hardware one. **Update:** the recommended path is vial groups within one experiment (§2 Phase 2, `ROADMAP.md` Session Y) rather than concurrent engine instances — same practical capability, far less concurrency risk in the code path that drives heaters.
+
+### Questions raised by the August 2026 lab meeting
+
+7. **Pump flow calibration is the load-bearing unknown.** Media levels, the consumables interlock (§15), volume-based pumping (§16), and the dilution-rate growth estimator (§17) all rest on `pump_flow_rates`, which is currently a hardcoded default array of plausible-looking numbers. Nothing downstream is more accurate than this array. Gravimetric calibration (§19) should be scheduled before the next real run.
+
+8. **Is bottle level worth measuring rather than inferring?** All volume tracking is open-loop: `duration × flow_rate`, accumulated. It cannot detect a disconnected tube, a kinked line, a pump that stalls, or an operator topping up a bottle without telling the software. A float switch or a load cell under each bottle would convert the interlock from an estimate into a measurement. This is the highest-value hardware addition currently on the table and should be costed.
+
+9. **What growth-rate estimate does the lab consider authoritative?** §17 proposes computing two (segment regression on OD, and dilution-rate) and reporting both. Before the analysis pipeline hardens around one of them, the lab should decide which is quoted in figures — they answer subtly different questions, and their disagreement is itself a useful diagnostic.
+
+10. **Does the Pi have outbound internet?** Notifications (§22) and off-box backup (§24) both need egress. The Pi sits behind a dedicated Netgear router; Tailscale is deployed (`deploy/ts-keepalive/`), which suggests egress exists, but this has not been verified for arbitrary outbound HTTPS. Confirm before building either feature.
+
+11. **Who performs the bench calibration work?** §19 needs roughly 40 minutes of gravimetric pump work; §25 needs about two hours of stir RPM measurement; full OD/temperature recalibration (Phase 4) needs several more. None of it is software effort, and all of it blocks software accuracy. Assign an owner.
+
+12. **Sterilisation record threshold.** §18 warns when fluidics were last sterilised longer ago than a threshold, defaulting to 14 days. The lab should set the real number — and confirm the warning stays soft, since the software cannot verify the record and a hard gate on an unverifiable claim only teaches people to click through it.
+---
+
+## 15. Consumables safety interlock
+
+**Status: not implemented. Priority P0 (`ROADMAP.md` Session K).**
+
+The engine tracks `_bottle_consumed_ml` and `_waste_filled_ml` and raises low/high alerts,
+but nothing stops pumping. An overnight bottle-empty condition currently results in the
+influx pump pushing air while efflux keeps removing broth — the vial drains and the run is
+lost. A full waste carboy floods the bench.
+
+### Behaviour
+
+A gate evaluated in `run_cycle` **before any pump dispatch**, for every candidate action:
+
+| Condition | Action | Alert |
+|---|---|---|
+| `bottle.remaining_ml <= reserve_ml` | Suppress influx for every vial fed by that bottle | `critical` |
+| `waste.filled_ml >= capacity_ml - reserve_ml` | Suppress **all** pumping (influx without efflux overflows the vial) | `critical` |
+| Every active vial blocked | Auto-enter maintenance mode | `critical` |
+
+```
+reserve_ml (media) = max(50.0, 0.05 * initial_volume_ml)
+reserve_ml (waste) = max(100.0, 0.05 * capacity_ml)
+```
+
+Blocking is **sticky**: it clears only on an explicit `refill_media` call. It must never
+clear on its own, because the volume estimate has no way to recover — if the software
+believes a bottle is empty, only a human can establish otherwise.
+
+Suppressed pump attempts are logged to `events.csv` (§20) with the reason, so a run that
+quietly stopped diluting is diagnosable after the fact.
+
+### Accuracy caveat — must be surfaced in the UI
+
+Volume tracking is open-loop inference (`duration × flow_rate`), not measurement. It
+drifts with pump wear, tubing compliance, and calibration error, and it is blind to a
+disconnected tube or a manually topped-up bottle.
+
+- Present levels as estimates, never as measurements.
+- Tag each bottle's estimate `calibrated` or `uncalibrated` depending on whether the
+  experiment used measured `pump_flow_rates` (§19) or the hardcoded defaults, and display
+  that distinction.
+- See §14 open question 8 on replacing inference with a float switch or load cell.
+
+---
+
+## 16. Volume-based fluidics
+
+**Status: not implemented. Priority P0 (`ROADMAP.md` Session L).**
+
+Manual pump controls currently take a duration in seconds. Researchers work in
+millilitres, so every manual dilution requires mental arithmetic against a per-vial flow
+rate the UI does not display.
+
+### Behaviour
+
+Manual controls take **mL** by default, with seconds available behind an advanced toggle.
+
+```
+seconds = volume_ml / flow_rate_ml_s[vial][direction]
+```
+
+Influx and efflux volumes are independently settable — the most common manual operation
+is removing a few mL for a sample, which has no influx counterpart.
+
+### Firmware quantisation — the constraint that must be visible
+
+The 2016 firmware accepts **whole seconds only**. At flow rates of 0.85–1.15 mL/s the
+minimum deliverable bolus is roughly 1 mL and the quantisation step is roughly 1 mL,
+differing per vial.
+
+- Show requested vs deliverable volume before firing: *"requested 2.5 mL → will deliver
+  2.0 mL (2 s)"*. `POST /api/actuators/pump/preview` provides this without side effects.
+- Requests below one second must be **rejected with an explanation naming that vial's
+  minimum**, never silently truncated. Silent truncation is precisely the legacy `%d` bug
+  documented in §9, and it fails invisibly.
+- Log both requested and delivered volume; the difference is real experimental error and
+  belongs in the record.
+
+Automatic dilutions in the control modes are unaffected — they already handle sub-second
+amounts correctly via the deficit accumulator (§9). This section governs the manual path
+only, where there is a human who can be told what will actually happen.
+
+---
+
+## 17. Growth rate estimation service
+
+**Status: partially implemented (private to `MorbidostatController`). Priority P0
+(`ROADMAP.md` Session N). Blocks: §22 detection rules, consumables forecasting, the
+growth-rate control mode, and the derived-statistics plots.**
+
+New module `server/growth_rate.py`: pure, I/O-free, importable by any control mode. Output
+lands in `status()`, the WebSocket payload, and the existing `growth_rate_per_hour` column
+in the per-vial CSV.
+
+### Two estimators, both reported
+
+Naively fitting `ln(OD)` over a rolling window is **wrong in a turbidostat**: dilution
+events are step decreases in OD that have nothing to do with growth, and averaging across
+them biases μ toward zero.
+
+**1. Segment regression.** Split the OD series at dilution events; within each
+inter-dilution segment fit
+
+```
+ln(OD) = μ·t + c        (least squares)
+```
+
+and take a weighted mean of recent segments. Reflects instantaneous growth. Variance
+rises as dilutions become frequent, because segments become short.
+
+**2. Dilution-rate estimator.** At turbidostat steady state, growth rate equals dilution
+rate. Over a window containing *k* dilution events delivering volumes *vᵢ* into vial
+volume *V*:
+
+```
+μ ≈ Σ ln(1 + vᵢ/V) / Δt_window
+```
+
+Depends only on pump volumes and event times, not on OD noise — substantially lower
+variance — but inherits any error in the pump flow calibration (§19) and is valid only
+when OD is genuinely stationary.
+
+**Report both.** Persistent divergence is a physical signal, not a bug: biofilm or wall
+growth (culture denser than planktonic OD suggests), a mis-calibrated pump, or a culture
+not actually at steady state. §22 consumes this divergence as a detection rule.
+
+In chemostat mode μ is imposed by the operator at steady state, so the dilution estimator
+is close to tautological there; segment regression is the informative one.
+
+### Required edge-case handling
+
+| Case | Behaviour |
+|---|---|
+| OD < 0.1 | Return `None` — the sigmoid calibration is at its noisy tail |
+| Fewer than N samples or shorter than the minimum span | Return `None` |
+| Lag or stationary phase | Report R² alongside μ so the UI can flag low confidence |
+| Turbidostat warmup (first 8 cycles, §9) | Dormant |
+
+Never return a number without its R². A slope fitted through non-exponential data is
+meaningless, and presenting it unqualified is worse than presenting nothing.
+
+Also report **doubling time** (`ln2 / μ`), which most biologists read more fluently
+than μ.
+
+---
+
+## 18. Hygiene records and sterilisation wizard
+
+**Status: not implemented. Priority P1 (`ROADMAP.md` Session P).**
+
+### 18.1 Hygiene record
+
+Persistent record, per fluidic line and for the vial set: procedure performed (autoclave /
+bleach cycle / ethanol flush), timestamp, operator, free-text notes.
+
+- Dashboard badge: *"Fluidics last sterilised: 6 days ago."*
+- **Soft gate** in the experiment wizard review step: if the record is older than a
+  configurable threshold (default 14 days, see §14 open question 12) or absent, show a
+  warning the user must acknowledge.
+- Deliberately soft, not blocking. The software cannot verify that sterilisation actually
+  happened; a hard gate on an unverifiable self-report only trains people to click
+  through it.
+
+### 18.2 Sterilisation wizard
+
+A guided service routine running the standard line-cleaning sequence — bleach, dwell,
+water rinse ×N, ethanol, air — with per-step volumes, timers, and confirmation prompts,
+writing a hygiene record on completion.
+
+**Safety requirements — these are the substance of the feature:**
+
+- Runs only in an explicit **service mode**. Refuses to start while an experiment is
+  RUNNING.
+- Fluid moved during service must **not** debit media bottles or count as experimental
+  consumption. It is a distinct event category. Waste volume still accumulates physically
+  and must be credited, but tagged as service volume so it doesn't corrupt consumption
+  statistics.
+- The wizard must prompt the operator to confirm which bottle each line currently sits in
+  (bleach vs media). The tubing is moved by hand; the software cannot know, and guessing
+  wrong means pumping bleach into a culture.
+- Hard-stop control available on every step.
+
+---
+
+## 19. Calibration wizards
+
+**Status: not implemented — there are no `/api/calibration/*` routes in the codebase at
+all. Priority P0 for pump and per-run blank (`ROADMAP.md` Session O); Phase 4 for full
+thermistor and OD sigmoid recalibration.**
+
+Every OD value the system reports and every volume it believes it moved rests on
+unvalidated 2016-era constants inherited from a previous user (§14 open question 3).
+
+### 19.1 Pump flow calibration (gravimetric) — P0
+
+For each of the 32 pumps: prime the line, fire for a fixed 20 s into a tared vessel,
+operator enters delivered mass or volume, wizard computes mL/s and writes
+`calibration/pump_calibration.json`. Supports batching and resumption — 32 pumps is about
+40 minutes of bench work and nobody will do it in one sitting.
+
+Directly improves §15 (interlock), §16 (volume controls), §17 (dilution estimator), and
+consumables forecasting.
+
+### 19.2 Per-run OD blank — P0
+
+The full 4-parameter sigmoid is a long calibration nobody will repeat before every
+experiment. What *is* worth repeating is re-establishing the two asymptotes against this
+run's actual vials, media, and sleeve seating:
+
+- **Dark reading** — LEDs off → OD calibration row 0
+- **Blank reading** — LEDs on, sterile media, no cells → OD calibration row 1
+
+Rows 2 and 3 (inflection point, Hill coefficient) are untouched; they genuinely require a
+dilution series. This corrects the dominant per-run error sources — vial-to-vial optical
+variation, sleeve seating, media colour — in roughly 5 minutes.
+
+Per-run blanks are written into the **experiment directory**, not the global calibration
+directory, because they are run-specific by definition.
+
+### 19.3 Full temperature and OD recalibration — Phase 4
+
+Two-point thermistor calibration against a reference thermometer, and an OD dilution
+series fitting all four sigmoid parameters. Several hours of bench work; prerequisites
+for publishable absolute OD values. Blocked in practice by §14 open question 4 (heater
+electrical health).
+
+### 19.4 Cross-cutting requirements
+
+- **Never overwrite calibration files in place.** Write versioned files carrying a
+  timestamp, operator, and `source`; retain the previous version; record the calibration
+  version used inside each experiment's `config.json`. Calibration provenance is part of
+  the dataset — a plot whose calibration cannot be reconstructed is not reproducible.
+- Calibration is the **only** consumer of raw actuator paths (`set_temperature_raw`, raw
+  OD LED power). Expose them under `/api/calibration/*` so ordinary operation cannot
+  reach them.
+- All calibration routes refuse to run while an experiment is RUNNING.
+- On completion, report the fit quality and refuse to save an obviously bad fit (e.g.
+  non-monotonic pump response, R² below a floor) without explicit override.
+
+---
+
+## 20. Observability: structured logging and the event log
+
+**Status: minimal (`logging.basicConfig` to stdout). Priority P0 (`ROADMAP.md` Session M).**
+
+### 20.1 Rotating file logs
+
+`RotatingFileHandler` to `logs/evolver.log` (5 × 10 MB), plus `logs/errors.log` at WARNING
+and above. Disk-aware: `/api/storage` already reports free space; log writes must degrade
+gracefully rather than filling the SD card that the experiment is also writing data to.
+
+### 20.2 Unified per-experiment event log
+
+`experiments/{name}/events.csv`:
+
+```csv
+timestamp,elapsed_hours,level,category,vial,message,data_json
+```
+
+Every discrete occurrence is recorded here: experiment start/stop, pump fires **and
+suppressed pump attempts** (§15), phase changes, alerts, maintenance enter/exit, refills,
+manual overrides (§21), drug escalations, sensor failures, and serial errors.
+
+This is the artefact a researcher attaches to a lab-notebook entry, the backing store for
+the event-log table in the UI, and part of the export bundle.
+
+### 20.3 Error classification
+
+Logging every serial hiccup identically buries the one that matters. Classify:
+
+| Class | Meaning | Handling |
+|---|---|---|
+| `TRANSIENT` | Single malformed RS485 frame | Counted, not alerted — the bus is lossy by design and commit `b9b135a` already tolerates this |
+| `DEGRADED` | One vial's sensor failing repeatedly (engine already tracks `DEFAULT_SENSOR_FAILURE_THRESHOLD`) | Per-vial health badge on the dashboard |
+| `PERSISTENT` | Bus silent, serial port gone, Arduino unresponsive | Immediate `critical` alert — this is the class that ends experiments |
+
+Rate-limit repeated identical errors: log the first, then every Nth with an occurrence
+count. A stuck loop must not be able to fill the disk in an hour.
+
+---
+
+## 21. Supervised per-vial override
+
+**Status: not implemented — vials in a running experiment are hard-locked in the UI
+(`isLocked`). Priority P1 (`ROADMAP.md` Session S).**
+
+Hard-locking is the right default and the wrong absolute. Real experiments need
+intervention: pull a sample, spike a vial, rescue a stalled culture.
+
+### Behaviour
+
+An explicit unlock gesture (press-and-hold ≈2 s; typed confirmation for destructive
+actions) grants a **time-limited, audited override** on one vial — manual influx/efflux by
+volume, temperature change, stir change. Default expiry 10 minutes, after which the vial
+re-locks automatically so a forgotten unlock cannot leave a vial unguarded.
+
+### Controller-state coherence — the correctness requirement
+
+A manual action the controller does not know about will corrupt control. The turbidostat
+tracks `last_pump_time` and a deficit accumulator; a manual dilution invisible to it will
+be followed immediately by an automatic one, double-diluting the culture.
+
+Every manual action on a controlled vial must therefore be **pushed into controller
+state**, not merely executed:
+
+- Manual influx/efflux updates `last_pump_time`, debits the media bottle, credits waste,
+  and appends to the vial's pump history exactly as an automatic event would.
+- Manual temperature or stir changes either update the experiment's persisted parameters
+  (so a restart does not silently revert them) or are explicitly marked transient with a
+  stated expiry. Ambiguity here produces experiments whose actual conditions cannot be
+  reconstructed.
+- Every override writes an `events.csv` entry with operator, action, and reason, **and is
+  drawn as a marker on that vial's plots**. An unexplained step in the data six months
+  later is a research problem, not a UI problem.
+
+---
+
+## 22. Anomaly detection and notifications
+
+**Status: not implemented. Priority P1 for the rule-based tier and Slack
+(`ROADMAP.md` Sessions V and W); statistical contamination detection deferred.**
+
+### 22.1 Rule-based detection (P1)
+
+Deterministic, explainable, warn-only. No model, no training data. Dormant below OD 0.1
+and during the turbidostat's 8-cycle warmup.
+
+| Condition | Rule | Level |
+|---|---|---|
+| Stall | μ < 0.05/h for > 2 h with OD > 0.1 | warning |
+| Dead culture | OD monotonically falling > 1 h with no dilution | warning |
+| Dilution-response failure | Influx fired but OD did not drop by the expected fraction | warning |
+| Runaway growth | OD above upper threshold for > 3 consecutive cycles despite dilution | warning |
+| Estimator divergence | Segment-regression μ and dilution-rate μ differ > 50 % for > 1 h (§17) | info |
+| Temperature excursion | \|T − setpoint\| > 2 °C for > 15 min | warning |
+| Pump over-cycling | Dilution interval below `pump_wait` floor repeatedly | warning |
+| Sensor degradation | Per-vial failure counter above threshold (§20) | warning |
+
+**No rule may stop an experiment.** Every alert must carry the evidence that triggered it —
+the numbers, the window, the threshold. An alert that only says "possible contamination"
+trains users to dismiss alerts, which is worse than having none.
+
+The dilution-response check deserves emphasis: by comparing the OD drop a dilution
+*should* have produced against what actually happened, it catches the two most common
+mechanical failures at once — a pump not actually pumping, and a bottle empty despite
+what the volume estimate claims (§15).
+
+### 22.2 Statistical contamination detection — deferred
+
+The failure mode is asymmetric: a false positive that halts or casts doubt on a five-day
+adaptation experiment costs more than the detector saves. Tuning requires a corpus of real
+runs including known-contaminated ones, which does not yet exist.
+
+**Concrete prerequisite:** §22.1 must log its derived features (short/long-window μ,
+growth-rate jerk, dilution-interval variance and trend, estimator divergence) into
+`events.csv` from day one, so the corpus accumulates passively. Revisit after ~10 runs
+with known outcomes, including at least 2 contaminated.
+
+### 22.3 Notifications
+
+Route `critical` and `warning` alerts to a **Slack incoming webhook** — a single POST, no
+OAuth, no app review. Per-level configuration, digesting so a flapping condition cannot
+spam the channel, a "send test notification" button, and a daily heartbeat for running
+experiments (silence must not be ambiguous between "fine" and "server dead").
+
+Egress is unverified (§14 open question 10) — fail gracefully with a queued buffer and
+send on reconnect. Email is deliberately second: Yale's SMTP relay will likely require
+authenticated submission and may reject a headless device; a webhook-to-email bridge is
+preferable to running SMTP on the Pi. The webhook URL is a credential and must live
+outside the repository.
+
+---
+
+## 23. Experiment templates
+
+**Status: not implemented. Priority P1 (`ROADMAP.md` Session Q).**
+
+`config.json` already fully describes an experiment, so this is largely plumbing with a
+disproportionate payoff for handing the system to new lab members.
+
+- Save any experiment's configuration as a named template (`templates/{name}.json`).
+- Start the wizard from a template, pre-filling every step for review and adjustment.
+- "Clone previous run" — how most experiments actually get created.
+- Curated built-ins: standard turbidostat (8 vials, LB, 37 °C), chemostat dilution series,
+  morbidostat escalation, OD-only monitoring with heaters parked at ambient.
+- Templates record the calibration version they assume and warn on load if calibration has
+  changed since (§19.4).
+- Export/import as a portable file, so a protocol can be shared between labs or attached
+  to a paper.
+
+---
+
+## 24. Off-box backup
+
+**Status: not implemented. Priority P1 (`ROADMAP.md` Session X).**
+
+The requirement is *don't lose an experiment when the Pi's SD card dies* — a real and
+fairly likely failure mode. Implemented generically via `rclone`, driven by a **systemd
+timer rather than the Flask process**, so a backup failure can never perturb the control
+loop.
+
+- Configurable remote: OneDrive, Google Drive, S3, or SFTP to a lab NAS — a one-line
+  config change between them. (The lab meeting asked for OneDrive specifically; `rclone`'s
+  OneDrive backend satisfies that without hand-rolling Microsoft Graph OAuth on a headless
+  Pi against a tenant that likely enforces conditional access. See `ROADMAP.md` §2.)
+- Triggers: on experiment stop, plus a nightly incremental.
+- Never sync while the serial loop is under load; check disk and CPU first.
+- **Report last-successful-backup age on the dashboard.** A silently failing backup is
+  worse than none, because it manufactures confidence.
+- Document *and test* the restore path onto a clean directory. An untested backup is a
+  hypothesis.
+- `rclone.conf` lives outside the repo and is git-ignored.
+
+---
+
+## 25. Stir rate to RPM calibration
+
+**Status: not implemented. Priority P2 (`ROADMAP.md` Session AC).**
+
+Stir is currently a raw PWM value 0–15 (this one really *is* a PWM, unlike `xr` — see
+§10). "Stir setting 8" is not reportable in a methods section; "600 RPM" is.
+
+- Measure actual RPM per sleeve across the 0–15 range by tachometer, strobe, or
+  high-frame-rate video of a marked stir bar. Sample ~4 points per sleeve and interpolate
+  rather than measuring all 16 settings.
+- Store as `calibration/stir_calibration.json`, per vial, following the versioning rules
+  in §19.4.
+- Display RPM alongside the PWM setting in the UI and record it in `config.json`.
+- Optional: bind an animation's rotation rate to the calibrated RPM in the experiment
+  designer. Cosmetic, and last.
+
+The software is trivial; the cost is ~2 hours of bench work (§14 open question 11). Worth
+doing partly for reportability and partly because stir bars couple inconsistently across
+sleeves — the calibration will likely expose real vial-to-vial variation worth knowing
+about before it shows up as unexplained variance in a growth experiment.

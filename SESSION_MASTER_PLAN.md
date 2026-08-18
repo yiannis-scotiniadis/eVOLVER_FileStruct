@@ -1,5 +1,30 @@
 # eVOLVER Development Sessions — Master Plan
 
+> **STATUS (Aug 2026) — read this before using the plan below.**
+>
+> This document was written before Phase 1 shipped. Sessions **A, B, C, F, and G are
+> built and in `main`**. Sessions **D, E, H, I, and J are not.** The session prompts
+> below remain useful as design context, but they describe a codebase that no longer
+> exists in the state they assume — several of them tell you to build things that are
+> already there.
+>
+> **For current priorities, use `ROADMAP.md`**, which triages the August 2026 lab-meeting
+> feature requests against the code as it actually is, and sequences the remaining work
+> (Sessions K onward) by urgency, utility, and difficulty.
+>
+> | Session | Status | Notes |
+> |---|---|---|
+> | A — Setup Mode & Media Configuration | **Built** | Wizard steps 2–4; `_validate_and_normalize_media` |
+> | B — Waste & Media Volume Tracking | **Built (partially)** | Tracking and alerts done; time-to-empty forecast **not** done → `ROADMAP.md` Session R |
+> | C — Alternative Control Modes | **Built (partially)** | Chemostat and morbidostat done; growth-rate mode still disabled in the UI, blocked on `SPEC.md` §17 |
+> | D — Contamination & Stall Detection | **Not built** | Rescoped: rule-based tier → `ROADMAP.md` Session V; statistical tier deferred, see `ROADMAP.md` §6 |
+> | E — Visual Experiment Designer | **Not built** | → `ROADMAP.md` Session Z (P2). The linear-phase-list recommendation below still stands |
+> | F — Media Replacement Mode | **Built** | `enter_maintenance` / `exit_maintenance` / `refill_media`, 30 min failsafe |
+> | G — Data Management & Export | **Built (partially)** | ZIP export, plots, disk monitoring done; unified event log **not** done → `ROADMAP.md` Session M |
+> | H — PID Temperature Control | **Not built** | **Premise below is factually wrong — see the correction in that section.** Deferred to P3 |
+> | I — Documentation & Troubleshooting | **Not built** | Still worth doing; schedule after the P0 block in `ROADMAP.md` |
+> | J — WiFi Independence & Security | **Not built** | → `ROADMAP.md` Session AE (P2). Tailscale is deployed (`deploy/ts-keepalive/`), which covers part of the access need |
+
 ## Dependency map
 
 ```
@@ -627,59 +652,63 @@ Add data management features:
 
 ---
 
-## Session H: PID Temperature Control
+## Session H: Cascade Temperature Control — DEFERRED (P3)
 
-**Depth: LIGHT (30 min)**
-**Why light:** Replacing the current bang-bang temperature control with
-PID is a small, isolated change to the experiment engine.
+> ### ⚠ CORRECTION — the original premise of this session was wrong
+>
+> This session was written on the assumption that "temperature PWM is calculated from
+> calibration: `pwm = (target_temp - intercept) / slope`" and that there is "no feedback
+> loop." **Both statements are false**, and they repeat exactly the misconception that
+> `CLAUDE.md` and `SPEC.md` §10 warn about.
+>
+> The `xr` value is **not a PWM duty cycle.** It is a *setpoint* that the temperature
+> Arduino's closed loop drives the thermistor ADC reading toward. The feedback loop
+> already exists — it runs on the Arduino, in firmware from 2016 that is not being
+> changed. The calibration slope is **negative**, so a lower `xr` means a *hotter*
+> target, and `xr=0` requests roughly 82 °C rather than "off."
+>
+> Any implementation following the original prompt below would have written a controller
+> that clamps "PWM" to 0–600 and treats 0 as safe. On this hardware that is a command to
+> drive the heater to maximum. **Do not implement the prompt as originally written.**
 
-### Context for the decision
+### The correct framing, if this is ever built
 
-The current system sends a fixed PWM value calculated from the
-calibration curve. There is no feedback loop — if the room temperature
-changes or a vial drifts, the PWM doesn't adjust. True PID control
-reads the actual temperature each cycle and adjusts PWM to converge
-on the setpoint.
+What is actually available is **cascade control**: an outer loop on the Pi that trims the
+`xr` setpoint based on the error between the calibrated temperature reading in °C and the
+target in °C, wrapped around the inner loop the Arduino already closes on raw ADC.
 
-Whether to implement PID or keep the current approach is worth
-discussing HERE first. PID advantages: tighter temperature control,
-handles environmental disturbances. PID risks: oscillation if poorly
-tuned, more complex debugging. For most eVOLVER experiments,
-temperature tolerance of +/- 1C is fine and the current approach
-works. PID becomes valuable for experiments where precise temperature
-matters (e.g., thermotolerance evolution).
+- Outer-loop output is a **setpoint adjustment in °C**, converted to `xr` by
+  `set_temperature_celsius`. It never touches raw values directly.
+- Safety clamps stay in Celsius (`MAX_SAFE_TEMP_C`), where they are legible; the existing
+  per-vial raw floor in `set_temperature_raw` remains the backstop.
+- The outer loop must be much slower than the inner loop — the sensor cycle is 10 s and
+  the thermal time constant of a sleeve is minutes, so an outer loop updating faster than
+  roughly once a minute will fight the Arduino rather than help it.
 
-### Prompts
+### Why it is deferred to P3
 
-```
-Add optional PID temperature control to the experiment engine.
+Two prerequisites, plus a live question about whether it is worth doing at all:
 
-Currently, temperature PWM is calculated from calibration:
-  pwm = (target_temp - intercept) / slope
+1. **`SPEC.md` §14 open question 4** — whether the heaters are electrically healthy — is
+   unresolved. Note that the inverted-setpoint discovery may itself explain the
+   stuck-on symptom: any earlier code or operator that sent `xr=0` "to turn the heaters
+   off" was in fact requesting ~82 °C. Verify the heaters turn off on `xr=4095` before
+   concluding hardware is at fault, and certainly before adding a controller on top.
+2. **Temperature calibration is unverified** (`ROADMAP.md` Session AA). A cascade loop
+   tuned against a wrong calibration will converge confidently on the wrong temperature —
+   worse than the current arrangement, because it will look well-controlled.
+3. **It may not be needed.** ±1 °C is adequate for essentially every experiment the lab
+   currently runs, and the existing arrangement plus the §10 safety clamps already
+   achieves that. Revisit only if a specific experiment (thermotolerance evolution, say)
+   demands tighter control, and quantify how much tighter before starting.
 
-Replace this with a PID controller that:
-- Reads actual temperature each cycle
-- Computes error = target - actual
-- Adjusts PWM using: output = Kp*error + Ki*integral + Kd*derivative
-- Clamps output to 0-600 (safety cap)
-- Anti-windup: clamp integral term when output is saturated
-
-Default PID gains: Kp=50, Ki=2, Kd=10 (these will need tuning
-on real hardware). Make gains configurable in experiment config.
-
-The experiment config should have a "temperature_mode" field:
-"direct" (current behavior) or "pid" (new PID control).
-
-Keep this simple. One PID controller per vial, reset on experiment
-start.
-```
-
-### Verification
-- [ ] PID mode converges to setpoint in mock simulation
-- [ ] Direct mode still works unchanged
-- [ ] PWM never exceeds safety cap
-- [ ] No oscillation in steady state (in simulation)
-- [ ] PID gains configurable in experiment config
+### Verification, if built
+- [ ] Outer loop expressed entirely in °C; raw setpoints only ever produced by `set_temperature_celsius`
+- [ ] Outer-loop update period ≥ 60 s; no fighting between the two loops in simulation
+- [ ] Never requests a target above `MAX_SAFE_TEMP_C`; `xr=0` is unreachable by construction
+- [ ] Converges without steady-state oscillation in mock simulation
+- [ ] Direct mode still works unchanged and remains the default
+- [ ] Gains configurable per experiment
 
 ---
 
@@ -794,31 +823,48 @@ Plan and implement:
 
 ---
 
-## Session priority and timeline
+## Session priority and timeline — SUPERSEDED
 
-| Priority | Session | Depth | Est. Time | Dependency |
-|----------|---------|-------|-----------|------------|
-| 1        | A: Setup Mode | Deep | 90 min | MVP complete |
-| 2        | B: Media/Waste Tracking | Medium | 45 min | Session A |
-| 3        | C: Alt Control Modes | Medium | 60 min | MVP complete |
-| 4        | D: Contamination Detection | Deep | 90 min | Session C |
-| 5        | E: Visual Designer | Deep | 2-3 hrs | Sessions A, C |
-| 6        | F: Replacement Mode | Light | 30 min | Session B |
-| 7        | G: Data Management | Medium | 45 min | MVP complete |
-| 8        | H: PID Control | Light | 30 min | Session C |
-| 9        | I: Documentation | Medium | 45 min | All above |
-| 10       | J: WiFi & Security | Medium | 45 min | MVP complete |
+The original ordering below is kept for the record. **It no longer reflects priorities.**
+Sessions A, B, C, F, and G are built; the August 2026 lab meeting added 20 further
+requests that reshuffle everything that remains.
 
-**Recommended order for maximum impact:**
-Weeks 1-2: Sessions A, B, F (media awareness — complete subsystem)
-Week 3: Session C (alternative control modes)
-Week 4: Session D (contamination detection — needs careful design)
-Weeks 5-6: Session E (visual designer — biggest UI effort)
-Week 7: Sessions G, H (data management, PID)
-Week 8: Sessions I, J (documentation, WiFi)
+**→ Use the sequence in `ROADMAP.md` §7 instead.**
 
-**Sessions to bring to THIS chat first (before Claude Code):**
-- Session D: The anomaly detection algorithm needs careful design
-  and we should discuss thresholds and false positive tolerance
-- Session E: The block chart vs linear phase list decision
-- Session H: Whether PID is worth the complexity for your use cases
+| Priority | Session | Depth | Est. Time | Dependency | Status |
+|----------|---------|-------|-----------|------------|--------|
+| 1        | A: Setup Mode | Deep | 90 min | MVP complete | **Built** |
+| 2        | B: Media/Waste Tracking | Medium | 45 min | Session A | **Built** (forecast → ROADMAP R) |
+| 3        | C: Alt Control Modes | Medium | 60 min | MVP complete | **Built** (growth-rate mode → SPEC §17) |
+| 4        | D: Contamination Detection | Deep | 90 min | Session C | Not built → ROADMAP V / §6 |
+| 5        | E: Visual Designer | Deep | 2-3 hrs | Sessions A, C | Not built → ROADMAP Z (P2) |
+| 6        | F: Replacement Mode | Light | 30 min | Session B | **Built** |
+| 7        | G: Data Management | Medium | 45 min | MVP complete | **Built** (event log → ROADMAP M) |
+| 8        | H: PID Control | Light | 30 min | Session C | Not built, **premise corrected** → P3 |
+| 9        | I: Documentation | Medium | 45 min | All above | Not built |
+| 10       | J: WiFi & Security | Medium | 45 min | MVP complete | Not built → ROADMAP AE (P2) |
+
+### What changed and why
+
+The three highest-priority items now are **not** on the original list, because they only
+became visible once the system was real enough to run experiments on:
+
+1. **Consumables interlock** (`ROADMAP.md` Session K) — the system tracks bottle levels
+   and warns, but does not stop pumping. That gap loses overnight runs.
+2. **Pump flow calibration** (Session O) — every volume the system reports is derived
+   from a hardcoded default array. Media levels, the interlock, volume-based pumping, and
+   one of the two growth-rate estimators are all downstream of it.
+3. **Growth-rate service** (Session N) — currently private to the morbidostat controller,
+   yet four other planned features need it.
+
+**Sessions to discuss before implementing** (the original list, updated):
+
+- `ROADMAP.md` Session N — which growth-rate estimator is authoritative, and what error
+  the lab considers acceptable
+- `ROADMAP.md` Session O — the gravimetric protocol, and who does the bench work
+- `ROADMAP.md` Session Y — whether vial groups genuinely cover the "parallel experiments"
+  need before committing to the larger Session AB refactor
+- Session E above — the block-chart vs linear-phase-list decision (recommendation in that
+  section still stands: build the linear list)
+- Session H above — **read the correction first**; the question is no longer "is PID worth
+  it" but "is cascade control worth it, given the Arduino already closes the loop"

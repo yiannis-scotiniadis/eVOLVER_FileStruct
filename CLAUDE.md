@@ -253,38 +253,55 @@ Algorithm per vial per cycle:
    - Fire influx + efflux for `time_in` seconds
    - Fire efflux alone for `time_out` additional seconds
 
-## What to build
+## What has been built
 
-### Phase 1: Web dashboard on RPi
-- Flask/FastAPI server running on the RPi
-- Replaces all 5 current processes (4 UDP servers + exp_manager) with a single app
-- Directly reads/writes RS485 serial (no file-based IPC, no UDP)
-- Serves a web GUI at http://192.168.1.2:5000
-- Real-time display of temperature and OD for all 16 vials (WebSocket push every 10s)
-- Manual controls: set temperature, stir rate, trigger pump, stop all
-- Mobile-friendly responsive design
+**Phase 1 shipped and is deployed.** The Flask server replaces all 5 legacy supervisor
+processes, owns `/dev/ttyAMA0` directly, and serves the dashboard at
+`http://192.168.1.2:5000`. Most of Phase 2 is done as well.
 
-### Phase 2: Experiment engine
-- Config-driven experiment system (JSON/YAML config files, not hardcoded Python)
-- Support multiple control modes: turbidostat, chemostat, morbidostat, growth rate control
-- Independent experiment groups: partition 16 vials into groups with different parameters
-- Phase-based protocols: sequential experiment phases with trigger conditions
-- Real-time growth rate estimation from OD sliding window
-- Automatic data logging to structured CSV/JSON files
+| Subsystem | Status | Where |
+|---|---|---|
+| Flask + socketio server, 10 s sensor loop, watchdog, shutdown handler | Built | `server/app.py`, `watchdog.py` |
+| `SerialManager` + `MockSerialManager` (`--mock` runs with no hardware) | Built | `server/serial_manager.py`, `mock_serial_manager.py` |
+| Dashboard, 4×4 vial grid, per-vial modal with uPlot charts | Built | `frontend/templates/index.html` (single file) |
+| Manual controls (temperature in °C, stir, pump, emergency stop) | Built | `/api/actuators/*` |
+| 7-step experiment wizard (Name → Media → Vials → Waste → Mode → Params → Review) | Built | `index.html` `#exp-modal` |
+| Media bottles, vial→bottle map, waste tracking, low/high alerts, refill | Built | `server/experiment_engine.py` |
+| Maintenance mode with 30 min auto-resume failsafe | Built | `experiment_engine.py` |
+| Control modes: turbidostat, chemostat, morbidostat | Built | `server/control_modes/` |
+| Data export (ZIP), exports browser, disk monitoring | Built | `server/data_export.py` |
+| Crash recovery / resume from `state.json` | Built | `experiment_engine.py` |
+| Deployment: systemd unit, `install.sh`, Tailscale keepalive | Built | `DEPLOY.md`, `deploy/` |
 
-### Phase 3: Experiment designer GUI
-- Visual drag-and-configure interface for experiment design
-- Vial group assignment (click to assign vials to experiment groups)
-- Parameter configuration with sliders and validated inputs
-- Protocol timeline builder for multi-phase experiments
-- Preset templates for common experiment types
-- Config export/import for sharing experiment designs
+**Not yet built** (in rough priority order — see `ROADMAP.md`):
+consumables safety interlock, volume-based manual pumping, structured logging and a
+unified event log, a general per-vial growth-rate service, calibration wizards of any kind
+(**there are currently no `/api/calibration/*` routes at all**), hygiene/sterilisation
+records, experiment templates, supervised per-vial override, anomaly detection,
+notifications, off-box backup, vial groups, multi-phase protocols, and authentication.
 
-### Phase 4: Monitoring and alerting
-- Historical data plots (OD, temperature, growth rate over time)
-- Pump event log visualization
-- Configurable alerts: OD stagnation, temperature deviation, excessive pump cycling
-- Slack/email notification integration
+### Where to look for what
+
+- `ROADMAP.md` — **current prioritised work plan.** Derived from the August 2026 lab
+  meeting; triages every outstanding feature by urgency, utility, and difficulty, and
+  records which items were deliberately deferred and why.
+- `SPEC.md` — technical specification. §15–§25 cover the subsystems listed as not-yet-built.
+- `SESSION_MASTER_PLAN.md` — the original Session A–J plan. A/B/C/F/G are built; read the
+  status header at the top before following any of its prompts.
+- `DEPLOY.md` — operator runbook for the RPi.
+
+### Two facts worth carrying into any new work
+
+1. **`xr` is a closed-loop setpoint, not a PWM, and the slope is negative.** The Arduino
+   already closes the temperature loop. `xr=0` requests ~82 °C. See the Testing warning
+   below and `SPEC.md` §10. `SESSION_MASTER_PLAN.md` Session H originally got this wrong;
+   it now carries a correction.
+2. **All volume tracking is open-loop inference**, computed as `duration × flow_rate` and
+   accumulated. `pump_flow_rates` is currently a hardcoded default array that has never
+   been measured on this machine. Media levels, the planned consumables interlock, and one
+   of the two planned growth-rate estimators are all downstream of it — nothing built on
+   those numbers is more accurate than that array. Gravimetric pump calibration
+   (`ROADMAP.md` Session O) is the fix.
 
 ## Technical constraints
 
@@ -328,27 +345,50 @@ python3 app.py  # or python app.py
 ## Repository structure
 
 ```
-evolver-gui/
-  CLAUDE.md                  # This file
+eVOLVER_FileStruct/
+  CLAUDE.md                  # This file — hardware facts and serial protocol
+  SPEC.md                    # Technical specification (§15-§25 = planned subsystems)
+  ROADMAP.md                 # Current prioritised work plan (Aug 2026 lab meeting)
+  SESSION_MASTER_PLAN.md     # Original Session A-J plan; see its status header
+  DEPLOY.md                  # RPi operator runbook
+
   rpi_original/              # Original RPi scripts (reference only, do not modify)
     evolver_UPD.py
-    UDP_TEMP.py
-    UDP_OD.py
-    UDP_FAN.py
-    UDP_FLUIDICS.py
+    UDP_TEMP.py  UDP_OD.py  UDP_FAN.py  UDP_FLUIDICS.py
     RS485_TEST.py
+    extras/
   mac_original/              # Original Mac client scripts (reference only)
-    eVOLVER_module.py
-    main_eVOLVER.py
-    custom_script.py
-  calibration/               # Calibration data files
-    OD_cal.txt
-    temp_calibration.txt
-  server/                    # New Flask server (to be built)
-    app.py
-    serial_manager.py
-    experiment_engine.py
-    ...
-  frontend/                  # New web GUI (to be built)
-    ...
+    eVOLVER_module.py  main_eVOLVER.py  custom_script.py
+
+  calibration/               # Calibration data files (2016-era, UNVERIFIED)
+    OD_cal.txt               # 4 x 16 sigmoid parameters
+    temp_calibration.txt     # 2 x 16 slope/intercept
+    # pump_calibration.json  — planned, ROADMAP Session O
+    # stir_calibration.json  — planned, SPEC §25
+
+  server/
+    app.py                   # Flask routes, socketio, sensor loop, shutdown handler
+    serial_manager.py        # RS485 (real hardware); owns /dev/ttyAMA0
+    mock_serial_manager.py   # Simulated hardware — run app.py --mock
+    experiment_engine.py     # Lifecycle, run_cycle, media tracking, maintenance, resume
+    data_logger.py           # Per-vial CSV writers
+    data_export.py           # ZIP bundles, filtering
+    watchdog.py              # Heartbeat -> emergency shutdown
+    control_modes/
+      turbidostat.py  chemostat.py  morbidostat.py
+    test_*.py                # pytest suite, all runnable against the mock
+
+  frontend/
+    templates/index.html     # Entire GUI in one file (dashboard, wizard, plots)
+    static/js/uPlot.iife.min.js
+
+  experiments/{name}/        # Runtime output
+    config.json  state.json
+    vial00_OD.csv  vial00_temp.csv  vial00_pump_log.csv  ...
+    # events.csv             — planned, SPEC §20
+  exports/                   # Server-side export bundles (outside experiments/ by design)
+  deploy/                    # systemd unit, Tailscale keepalive
 ```
+
+Run locally with no hardware: `python server/app.py --mock`
+Run the tests: `cd server && python -m pytest`
