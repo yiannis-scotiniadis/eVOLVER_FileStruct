@@ -391,4 +391,4 @@ eVOLVER_FileStruct/
 ```
 
 Run locally with no hardware: `python server/app.py --mock`
-Run the tests: `cd server && python -m pytest`
+Run the tests: `python -m pytest` (from repo root — testpaths is set in pytest.ini)

@@ -1,0 +1,5 @@
+# Dev/test-only dependencies. NOT installed on the Raspberry Pi deploy target
+# (see requirements.txt, which is scoped to the Pi runtime and its piwheels
+# ARM-wheel constraints). Install both for local development:
+#   pip install -r requirements.txt -r requirements-dev.txt
+pytest==9.0.3
