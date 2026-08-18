@@ -4,8 +4,10 @@ __pycache__/
 .DS_Store
 *.log
 
-# Per-machine Claude Code permission allowlist
-.claude/
+# Per-machine Claude Code config — settings.json/agents/skills are shared and
+# should be tracked; only per-developer/per-machine files are ignored here.
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
 
 # Python virtualenv (created by install.sh)
 .venv/
