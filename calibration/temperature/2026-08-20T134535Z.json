@@ -1,0 +1,59 @@
+{
+    "schema": "evolver.calibration/1",
+    "subsystem": "temperature",
+    "version": "2026-08-20T134535Z",
+    "supersedes": null,
+    "operator": "yiannis",
+    "source": "legacy-import-2016",
+    "conditions": {
+        "note": "conditions unrecorded \u2014 inherited 2016 files imported without provenance (SPEC \u00a714 Q3); never bench-verified"
+    },
+    "data": {
+        "slope": [
+            -0.10267,
+            -0.11112,
+            -0.11212,
+            -0.11394,
+            -0.11,
+            -0.10994,
+            -0.11082,
+            -0.11276,
+            -0.1097,
+            -0.11088,
+            -0.11312,
+            -0.11347,
+            -0.1092,
+            -0.11023,
+            -0.10947,
+            -0.11273
+        ],
+        "intercept": [
+            86.493,
+            81.779,
+            82.161,
+            83.2,
+            81.31,
+            81.21,
+            81.722,
+            82.484,
+            82.287,
+            81.642,
+            82.636,
+            82.817,
+            80.657,
+            81.06,
+            80.847,
+            82.645
+        ]
+    },
+    "fit": {},
+    "qc": {
+        "passed": true,
+        "warnings": [
+            "vial 0 slope is a 5.6-sigma outlier vs the other fifteen \u2014 probable bad fit (CALIBRATION_PROTOCOL \u00a71.3); bench-verify before use",
+            "vial 0 intercept is a 6.1-sigma outlier vs the other fifteen \u2014 probable bad fit (CALIBRATION_PROTOCOL \u00a71.3); bench-verify before use"
+        ],
+        "failures": [],
+        "overridden_by": null
+    }
+}

@@ -455,6 +455,17 @@
       margin-top: 4px;
     }
     .pump-buttons .btn { flex: 1; }
+    .pump-preview {
+      grid-column: 1 / -1;
+      font-size: 12px;
+      color: var(--text-muted);
+      font-variant-numeric: tabular-nums;
+      min-height: 15px;
+    }
+    .pump-preview.warn { color: var(--status-warn); }
+    .pump-advanced-toggle {
+      grid-column: 1 / -1;
+    }
 
     /* ---------- Toast ---------- */
     .toast {
@@ -481,6 +492,205 @@
     }
     .toast.ok { background: var(--status-ok); }
     .toast.error { background: var(--danger); }
+    /* SPEC §20.4 defect 1: "warning" used to fall through to .toast.ok and
+       render in the same green as "Stir applied". */
+    .toast.warn { background: var(--status-warn); }
+    .toast.info { background: var(--status-info); }
+
+    /* ---------- Alert drawer (SPEC §20.4) ---------- */
+    /* The toast is an acknowledgement channel; this is the error channel.
+       Deliberately not merged -- a 3.5 s toast cannot carry an overnight fault. */
+    .alerts-btn {
+      appearance: none;
+      position: relative;
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      background: var(--card);
+      border: 1px solid var(--border-strong);
+      color: var(--text);
+      border-radius: 7px;
+      padding: 7px 12px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.1s ease, border-color 0.1s ease;
+    }
+    .alerts-btn:hover { background: var(--bg); }
+    .alerts-btn .badge {
+      display: none;
+      min-width: 18px;
+      height: 18px;
+      padding: 0 5px;
+      border-radius: 9px;
+      background: var(--status-critical);
+      color: #fff;
+      font-size: 11px;
+      font-weight: 700;
+      line-height: 18px;
+      text-align: center;
+      font-variant-numeric: tabular-nums;
+    }
+    .alerts-btn[data-unacked="warning"] .badge { background: var(--status-warn); }
+    .alerts-btn.has-unacked .badge { display: inline-block; }
+
+    .drawer-scrim {
+      position: fixed;
+      inset: 0;
+      background: rgba(15, 23, 42, 0.28);
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.18s ease;
+      z-index: 190;
+    }
+    .drawer-scrim.open { opacity: 1; pointer-events: auto; }
+    .alert-drawer {
+      position: fixed;
+      top: 0;
+      right: 0;
+      height: 100%;
+      width: min(460px, 100%);
+      background: var(--card);
+      border-left: 1px solid var(--border);
+      box-shadow: -8px 0 28px rgba(15, 23, 42, 0.10);
+      transform: translateX(100%);
+      transition: transform 0.2s ease;
+      z-index: 200;
+      display: flex;
+      flex-direction: column;
+    }
+    .alert-drawer.open { transform: translateX(0); }
+    .drawer-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 14px 16px 10px;
+      border-bottom: 1px solid var(--border);
+    }
+    .drawer-head h2 { margin: 0; font-size: 14px; font-weight: 600; }
+    .drawer-filters {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+      padding: 10px 16px;
+      border-bottom: 1px solid var(--border);
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+    .drawer-filters select {
+      font: inherit;
+      padding: 4px 6px;
+      border: 1px solid var(--border-strong);
+      border-radius: 5px;
+      background: var(--card);
+      color: var(--text);
+    }
+    .drawer-list { flex: 1; overflow-y: auto; padding: 4px 0 20px; }
+    .drawer-empty { padding: 22px 16px; color: var(--text-muted); font-size: 13px; }
+    .alert-row {
+      display: grid;
+      grid-template-columns: 4px 1fr;
+      gap: 10px;
+      padding: 10px 16px 10px 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .alert-row .stripe { background: var(--status-info); }
+    .alert-row[data-level="warning"] .stripe { background: var(--status-warn); }
+    .alert-row[data-level="critical"] .stripe { background: var(--status-critical); }
+    .alert-row.acked { opacity: 0.55; }
+    .alert-meta {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 7px;
+      font-size: 11px;
+      color: var(--text-muted);
+      margin-bottom: 3px;
+    }
+    .alert-level {
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--status-info);
+    }
+    .alert-row[data-level="warning"] .alert-level { color: var(--status-warn); }
+    .alert-row[data-level="critical"] .alert-level { color: var(--status-critical); }
+    .alert-cat {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 0 5px;
+    }
+    .alert-count {
+      background: var(--status-warn);
+      color: #fff;
+      border-radius: 8px;
+      padding: 0 6px;
+      font-weight: 700;
+    }
+    .alert-msg { font-size: 13px; color: var(--text); overflow-wrap: anywhere; }
+    .alert-actions { margin-top: 5px; display: flex; gap: 10px; align-items: center; }
+    .alert-link {
+      appearance: none;
+      background: none;
+      border: none;
+      padding: 0;
+      font: inherit;
+      font-size: 11px;
+      color: var(--status-info);
+      cursor: pointer;
+      text-decoration: underline;
+    }
+    .alert-detail {
+      margin-top: 5px;
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      font-size: 11px;
+      color: var(--text-muted);
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 5px;
+      padding: 6px 8px;
+      overflow-x: auto;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+
+    /* ---------- RS485 bus indicator (distinct from socket.io) ---------- */
+    .conn.bus .dot { background: var(--status-idle); }
+    .conn.bus[data-bus="ok"] .dot {
+      background: var(--status-ok);
+      box-shadow: 0 0 0 3px rgba(22, 163, 74, 0.15);
+    }
+    .conn.bus[data-bus="degraded"] .dot {
+      background: var(--status-warn);
+      box-shadow: 0 0 0 3px rgba(249, 115, 22, 0.18);
+    }
+    .conn.bus[data-bus="down"] .dot {
+      background: var(--status-critical);
+      box-shadow: 0 0 0 3px rgba(220, 38, 38, 0.18);
+    }
+
+    /* ---------- Per-vial sleeve health badge ---------- */
+    .vial-health {
+      display: none;
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      border-radius: 4px;
+      padding: 1px 5px;
+      margin-left: 6px;
+      color: #fff;
+      background: var(--status-warn);
+    }
+    .vial-health[data-health="lossy"] { display: inline-block; background: var(--status-warn); }
+    .vial-health[data-health="degraded"] { display: inline-block; background: var(--status-critical); }
+    .vial-health[data-health="out_of_range"] { display: inline-block; background: var(--status-info); }
+
+    @media (max-width: 640px) {
+      .alert-drawer { width: 100%; }
+    }
 
     /* ---------- Experiment section (below the vial grid) ---------- */
     .exp-section {
@@ -992,12 +1202,29 @@
     .media-row.bottle.warn .fill { background: var(--status-warn); }
     .media-row.waste .fill { background: var(--text-muted); }
     .media-row.waste.warn .fill { background: var(--status-warn); }
+    /* Consumables interlock (SPEC §15): a distinct, more severe state than
+       "warn" -- pumping is actually suppressed, not just running low. */
+    .media-row.bottle.blocked .fill,
+    .media-row.waste.blocked .fill { background: var(--status-critical); }
+    .media-row.blocked .label { color: var(--status-critical); }
     .media-row .num {
       font-family: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
       font-variant-numeric: tabular-nums;
       font-size: 12px;
       color: var(--text-muted);
       text-align: right;
+    }
+    .media-row .estimate-tag {
+      font-size: 10px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--text-muted);
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      padding: 1px 4px;
+      margin-left: 6px;
+      white-space: nowrap;
     }
 
     /* Dashboard morbidostat panel */
@@ -1059,6 +1286,9 @@
       box-shadow: 0 1px 4px rgba(15, 23, 42, 0.1);
     }
     .maint-banner.show { display: flex; }
+    /* Consumables interlock (SPEC §15): won't auto-resume, so it reads as
+       more severe than a manually-requested pause. */
+    .maint-banner.consumables { background: var(--status-critical); }
     .maint-banner .icon {
       display: inline-flex;
       align-items: center;
@@ -1091,6 +1321,181 @@
     }
     .maint-banner .btn-light:hover {
       background: rgba(255, 255, 255, 0.15);
+    }
+
+    /* ---------- Calibration (SPEC §19) ---------- */
+    .cal-banner {
+      position: sticky;
+      top: 56px;
+      z-index: 44;
+      display: none;
+      align-items: center;
+      gap: 14px;
+      padding: 8px 24px;
+      background: rgba(249, 115, 22, 0.12);
+      color: var(--text);
+      font-size: 13px;
+      border-bottom: 1px solid rgba(249, 115, 22, 0.4);
+    }
+    .cal-banner.show { display: flex; }
+    .cal-banner .icon { flex-shrink: 0; }
+    .cal-banner .text { flex: 1; }
+    .cal-banner .text strong { color: var(--status-warn); }
+
+    .cal-cards {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+      gap: 12px;
+      padding: 0 24px 24px;
+    }
+    .cal-card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 14px 16px;
+    }
+    .cal-card h3 {
+      margin: 0 0 8px;
+      font-size: 13px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+    .cal-badge {
+      font-size: 10px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      padding: 2px 8px;
+      border-radius: 999px;
+      white-space: nowrap;
+    }
+    .cal-badge.ok {
+      color: var(--status-ok);
+      background: rgba(22, 163, 74, 0.12);
+    }
+    .cal-badge.stale {
+      color: var(--status-warn);
+      background: rgba(249, 115, 22, 0.14);
+    }
+    .cal-badge.missing {
+      color: var(--status-critical);
+      background: rgba(220, 38, 38, 0.12);
+    }
+    .cal-meta {
+      font-size: 12px;
+      color: var(--text-muted);
+      margin: 0 0 6px;
+      font-variant-numeric: tabular-nums;
+    }
+    .cal-reasons {
+      margin: 6px 0 0;
+      padding-left: 18px;
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+    .cal-reasons li { margin-bottom: 3px; }
+    .cal-hint {
+      font-size: 12px;
+      color: var(--text-muted);
+      margin: 0 0 12px;
+    }
+    .cal-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+      font-variant-numeric: tabular-nums;
+      margin: 10px 0;
+    }
+    .cal-table th, .cal-table td {
+      text-align: right;
+      padding: 4px 8px;
+      border-bottom: 1px solid var(--border);
+    }
+    .cal-table th:first-child, .cal-table td:first-child { text-align: left; }
+    .cal-table .bad { color: var(--status-critical); font-weight: 600; }
+    .cal-table .warn { color: var(--status-warn); }
+    .wizard-footer-right { display: flex; gap: 8px; }
+
+    /* Pump wizard: 32 tiles, canonical index (I0..I15 influx, E0..E15 efflux). */
+    .pump-cal-grid {
+      display: grid;
+      grid-template-columns: repeat(8, 1fr);
+      gap: 6px;
+      margin: 10px 0;
+    }
+    .pump-tile {
+      padding: 8px 4px;
+      border: 1px solid var(--border-strong);
+      border-radius: 6px;
+      background: var(--card);
+      font-size: 12px;
+      font-weight: 600;
+      text-align: center;
+      cursor: pointer;
+      font-variant-numeric: tabular-nums;
+    }
+    .pump-tile small {
+      display: block;
+      font-weight: 400;
+      font-size: 10px;
+      color: var(--text-muted);
+    }
+    .pump-tile.selected { outline: 2px solid var(--status-info); }
+    .pump-tile.done {
+      background: rgba(22, 163, 74, 0.10);
+      border-color: var(--status-ok);
+    }
+    .pump-tile.partial {
+      background: rgba(249, 115, 22, 0.10);
+      border-color: var(--status-warn);
+    }
+    .pump-tile.excluded { opacity: 0.35; cursor: default; }
+    .pump-detail {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px;
+      margin-top: 10px;
+    }
+    .pump-detail .rep-row {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      margin-top: 6px;
+      font-size: 13px;
+    }
+    .pump-detail input[type="number"] { width: 110px; }
+
+    .cal-form-grid, .recon-grid {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 8px 12px;
+      align-items: center;
+      font-size: 13px;
+      margin-bottom: 10px;
+    }
+    .cal-form-grid input, .recon-grid input, .recon-grid select {
+      padding: 6px 8px;
+      border: 1px solid var(--border-strong);
+      border-radius: 6px;
+      background: var(--card);
+      color: var(--text);
+      font: inherit;
+    }
+    .blank-status {
+      font-size: 13px;
+      padding: 8px 10px;
+      border-radius: 6px;
+      margin: 8px 0;
+    }
+    .blank-status.ok {
+      background: rgba(22, 163, 74, 0.10);
+      color: var(--status-ok);
+    }
+    .blank-status.wait {
+      background: rgba(249, 115, 22, 0.10);
+      color: var(--status-warn);
     }
 
     /* ---------- Refill modal ---------- */
@@ -1153,6 +1558,11 @@
       display: inline-block;
       margin-right: 6px;
       vertical-align: -1px;
+    }
+    /* Consumables interlock (SPEC §15): pumping suppressed for this vial. */
+    .vial .bottle-dot.blocked {
+      border: 1px solid var(--status-critical);
+      box-shadow: 0 0 0 2px rgba(220, 38, 38, 0.25);
     }
 
     /* Locked-modal note */
@@ -1331,12 +1741,27 @@
               role="tab" aria-selected="true">Dashboard</button>
       <button id="nav-plots" class="view-tab" type="button"
               role="tab" aria-selected="false">Plots</button>
+      <button id="nav-cal" class="view-tab" type="button"
+              role="tab" aria-selected="false">Calibration</button>
     </nav>
     <div class="header-status">
-      <span class="conn disconnected" id="conn" aria-live="polite">
+      <span class="conn disconnected" id="conn" aria-live="polite"
+            title="Browser to server (socket.io)">
         <span class="dot" aria-hidden="true"></span>
         <span class="conn-text">Connecting…</span>
       </span>
+      <!-- Distinct from the socket.io dot above: Flask can be perfectly
+           reachable while the RS485 bus is dead (SPEC §20.4). -->
+      <span class="conn bus" id="bus-conn" data-bus="unknown" aria-live="polite"
+            title="RS485 bus health">
+        <span class="dot" aria-hidden="true"></span>
+        <span class="conn-text">Bus —</span>
+      </span>
+      <button id="alerts-btn" class="alerts-btn" type="button"
+              aria-haspopup="dialog" aria-expanded="false"
+              title="Alerts and event log">
+        Alerts<span class="badge" id="alerts-badge">0</span>
+      </button>
       <span class="timestamp" id="last-update" title="Last sensor update">—</span>
     </div>
     <button id="new-experiment"
@@ -1352,6 +1777,16 @@
       Emergency Stop
     </button>
   </header>
+
+  <!-- Calibration staleness banner (SPEC §19.6: "a visible dashboard banner,
+       not just an API field"). Amber strip listing what is overdue and why. -->
+  <div class="cal-banner" id="cal-banner" role="status" aria-live="polite">
+    <span class="icon" aria-hidden="true">⚖</span>
+    <span class="text" id="cal-banner-text">Calibration overdue</span>
+    <span class="actions">
+      <button class="btn" id="cal-banner-open" type="button">Open Calibration</button>
+    </span>
+  </div>
 
   <div class="maint-banner" id="maint-banner" role="status" aria-live="polite">
     <span class="icon" aria-hidden="true">⏸</span>
@@ -1489,6 +1924,39 @@
     </p>
   </section>
 
+  <!-- ---------- Calibration view (SPEC §19 / CALIBRATION_PROTOCOL Part II) -->
+  <section id="cal-view" class="plots-view view-hidden"
+           aria-label="Calibration status and wizards">
+    <div class="plots-toolbar">
+      <div class="plots-control-group">
+        <span class="plots-label">Calibration wizards</span>
+        <div class="plots-checks">
+          <button id="cal-open-blank" class="range-btn" type="button"
+                  title="Per-run OD blank (Tier 1 §5.4) — needs a CREATED experiment">
+            OD blank (per-run)
+          </button>
+          <button id="cal-open-pump" class="range-btn" type="button"
+                  title="Gravimetric pump calibration (Tier 2 §7)">
+            Pump calibration
+          </button>
+          <button id="cal-open-recon" class="range-btn" type="button"
+                  title="Post-run mass reconciliation (§6)">
+            Mass reconciliation
+          </button>
+          <button id="cal-refresh" class="range-btn" type="button">Refresh</button>
+        </div>
+      </div>
+    </div>
+    <p class="plots-note" id="cal-note">
+      Bench procedures live in CALIBRATION_PROTOCOL.md. Tier 0 pre-flight,
+      priming, spot-checks and temperature verification stay on the printed
+      run sheet; the wizards here are the steps that change or validate a
+      number. Tier 3 (thermistor two-point, OD dilution series, stir RPM) is
+      not built yet — see ROADMAP Session AA.
+    </p>
+    <div class="cal-cards" id="cal-cards"></div>
+  </section>
+
   <div class="modal-backdrop" id="vial-modal" hidden>
     <div class="modal"
          role="dialog"
@@ -1570,10 +2038,15 @@
         <section class="control-block">
           <h3>Pumps</h3>
           <div class="pump-row">
-            <label for="pump-seconds">Duration (s)</label>
+            <label for="pump-volume" id="pump-input-label">Volume (mL)</label>
             <input type="number"
-                   id="pump-seconds"
-                   min="0.1" max="60" step="0.1" value="5">
+                   id="pump-volume"
+                   min="0.1" step="0.1" value="5">
+            <span class="pump-preview" id="pump-preview-text"></span>
+            <label class="chk pump-advanced-toggle">
+              <input type="checkbox" id="pump-advanced-seconds">
+              Advanced: enter seconds directly
+            </label>
             <div class="pump-buttons">
               <button class="btn" id="pump-influx" type="button">Run Influx</button>
               <button class="btn" id="pump-efflux" type="button">Run Efflux</button>
@@ -1847,6 +2320,125 @@
     </div>
   </div>
 
+  <!-- Alert drawer (SPEC §20.4). Persistent, filterable, survives reload via
+       GET /api/events/recent; criticals stay until acknowledged. -->
+  <!-- ---------- OD blank wizard (CALIBRATION_PROTOCOL §5.4) ---------- -->
+  <div class="modal-backdrop" id="blank-modal" hidden>
+    <div class="modal large" role="dialog" aria-modal="true"
+         aria-labelledby="blank-modal-title">
+      <div class="modal-header">
+        <h2 id="blank-modal-title">Per-run OD blank</h2>
+        <button class="modal-close" id="blank-modal-close"
+                type="button" aria-label="Close">&times;</button>
+      </div>
+      <div class="wizard-steps" id="blank-steps">
+        <span class="wizard-step" data-step="1">Conditions</span>
+        <span class="wizard-step" data-step="2">Dark</span>
+        <span class="wizard-step" data-step="3">Blank</span>
+        <span class="wizard-step" data-step="4">Review</span>
+      </div>
+      <div class="modal-body">
+        <div id="blank-body"></div>
+      </div>
+      <div class="modal-footer wizard-footer">
+        <button class="btn" id="blank-back" type="button">Back</button>
+        <span class="wizard-footer-right">
+          <button class="btn" id="blank-abort" type="button">Abort</button>
+          <button class="btn btn-primary" id="blank-next" type="button">Next</button>
+        </span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ---------- Pump gravimetric wizard (CALIBRATION_PROTOCOL §7) -------- -->
+  <div class="modal-backdrop" id="pumpcal-modal" hidden>
+    <div class="modal large" role="dialog" aria-modal="true"
+         aria-labelledby="pumpcal-modal-title">
+      <div class="modal-header">
+        <h2 id="pumpcal-modal-title">Pump calibration (gravimetric)</h2>
+        <button class="modal-close" id="pumpcal-modal-close"
+                type="button" aria-label="Close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div id="pumpcal-body"></div>
+      </div>
+      <div class="modal-footer wizard-footer">
+        <button class="btn" id="pumpcal-abort" type="button">Abort session</button>
+        <span class="wizard-footer-right">
+          <button class="btn" id="pumpcal-close-btn" type="button">Close</button>
+          <button class="btn btn-primary" id="pumpcal-finish" type="button">
+            Finish &amp; review
+          </button>
+        </span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ---------- Post-run mass reconciliation (§6 / SPEC §19.4) ----------- -->
+  <div class="modal-backdrop" id="recon-modal" hidden>
+    <div class="modal" role="dialog" aria-modal="true"
+         aria-labelledby="recon-modal-title">
+      <div class="modal-header">
+        <h2 id="recon-modal-title">Mass reconciliation</h2>
+        <button class="modal-close" id="recon-modal-close"
+                type="button" aria-label="Close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p class="cal-hint">
+          Weigh the media bottle and waste carboy, enter start/end masses, and
+          compare against the software's accumulated pumped volume — the only
+          check that validates the whole open-loop volume chain. Pass: ±10 %.
+        </p>
+        <div class="recon-grid">
+          <label for="recon-exp">Experiment</label>
+          <select id="recon-exp" class="plots-select"></select>
+          <label for="recon-density">Density (g/mL)</label>
+          <input id="recon-density" type="number" step="0.0001" value="0.9977">
+          <label for="recon-media-start">Media start (g)</label>
+          <input id="recon-media-start" type="number" step="0.01" placeholder="optional pair">
+          <label for="recon-media-end">Media end (g)</label>
+          <input id="recon-media-end" type="number" step="0.01" placeholder="optional pair">
+          <label for="recon-waste-start">Waste start (g)</label>
+          <input id="recon-waste-start" type="number" step="0.01" placeholder="optional pair">
+          <label for="recon-waste-end">Waste end (g)</label>
+          <input id="recon-waste-end" type="number" step="0.01" placeholder="optional pair">
+        </div>
+        <div id="recon-result"></div>
+      </div>
+      <div class="modal-footer wizard-footer">
+        <span></span>
+        <span class="wizard-footer-right">
+          <button class="btn" id="recon-cancel" type="button">Close</button>
+          <button class="btn btn-primary" id="recon-submit" type="button">Reconcile</button>
+        </span>
+      </div>
+    </div>
+  </div>
+
+  <div class="drawer-scrim" id="drawer-scrim"></div>
+  <aside class="alert-drawer" id="alert-drawer" role="dialog"
+         aria-modal="false" aria-labelledby="drawer-title" hidden>
+    <div class="drawer-head">
+      <h2 id="drawer-title">Alerts &amp; events</h2>
+      <button class="btn btn-light" id="drawer-close" type="button">Close</button>
+    </div>
+    <div class="drawer-filters">
+      <label>Level
+        <select id="drawer-level">
+          <option value="">all</option>
+          <option value="info">info +</option>
+          <option value="warning" selected>warning +</option>
+          <option value="critical">critical</option>
+        </select>
+      </label>
+      <label>Vial
+        <select id="drawer-vial"><option value="">all</option></select>
+      </label>
+      <label><input type="checkbox" id="drawer-unacked"> unacknowledged only</label>
+    </div>
+    <div class="drawer-list" id="drawer-list"></div>
+  </aside>
+
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
   <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
@@ -1896,7 +2488,10 @@
     const stirSlider = document.getElementById("stir-slider");
     const stirSliderValue = document.getElementById("stir-slider-value");
     const stirSliderMeta = document.getElementById("stir-slider-meta");
-    const pumpSecondsEl = document.getElementById("pump-seconds");
+    const pumpVolumeEl = document.getElementById("pump-volume");
+    const pumpInputLabel = document.getElementById("pump-input-label");
+    const pumpPreviewText = document.getElementById("pump-preview-text");
+    const pumpAdvancedToggle = document.getElementById("pump-advanced-seconds");
     const applyTempBtn = document.getElementById("apply-temp");
     const applyStirBtn = document.getElementById("apply-stir");
     const pumpInfluxBtn = document.getElementById("pump-influx");
@@ -1917,6 +2512,7 @@
         <span class="pump-indicator" id="pump-ind-${i}" aria-hidden="true"></span>
         <div class="vial-header">
           <span class="vial-name">Vial ${i}</span>
+          <span class="vial-health" id="health-${i}" data-health="ok"></span>
           <span class="vial-status"
                 data-status="idle"
                 id="status-${i}"
@@ -2005,6 +2601,9 @@
         setStatus(i, temperatureStatus(t));
       }
       lastEl.textContent = formatTime(msg.timestamp);
+      // Bus + sleeve health ride the sensor tick, so the indicators refresh at
+      // the 10 s cadence without a second polling loop.
+      applyHealth(msg.health);
       if (modalState.vial !== null) renderModalReadings();
 
       // Server includes a compact experiment summary on every sensor tick
@@ -2054,11 +2653,233 @@
     let toastTimer = null;
     function showToast(message, kind) {
       toastEl.textContent = message;
-      toastEl.classList.remove("ok", "error");
+      toastEl.classList.remove("ok", "error", "warn", "info");
       if (kind) toastEl.classList.add(kind);
       toastEl.classList.add("show");
       clearTimeout(toastTimer);
       toastTimer = setTimeout(() => toastEl.classList.remove("show"), 3500);
+    }
+
+    // --- Alert drawer (SPEC §20.4) --------------------------------------
+    // The toast confirms things the user just did. The drawer is where faults
+    // live: persistent, filterable, and reload-proof. Keeping them separate is
+    // deliberate — a 3.5 s toast cannot carry an overnight failure.
+
+    const ALERT_TOAST_KIND = {
+      critical: "error",
+      warning: "warn",
+      info: "info",
+    };
+
+    const drawer = {
+      el: document.getElementById("alert-drawer"),
+      scrim: document.getElementById("drawer-scrim"),
+      list: document.getElementById("drawer-list"),
+      btn: document.getElementById("alerts-btn"),
+      badge: document.getElementById("alerts-badge"),
+      levelSel: document.getElementById("drawer-level"),
+      vialSel: document.getElementById("drawer-vial"),
+      unackedBox: document.getElementById("drawer-unacked"),
+      open: false,
+      events: [],           // newest first, mirrors the server ring
+      expanded: new Set(),  // event ids whose detail is showing
+    };
+
+    for (let i = 0; i < N_VIALS; i++) {
+      const o = document.createElement("option");
+      o.value = String(i);
+      o.textContent = `Vial ${i}`;
+      drawer.vialSel.appendChild(o);
+    }
+
+    function drawerIngest(evt) {
+      // A live alert either updates an existing row (repeating fault -> rising
+      // count) or becomes a new one. Matching on id is what stops a stuck loop
+      // from producing hundreds of rows.
+      if (!evt || typeof evt !== "object") return;
+      const idx = drawer.events.findIndex((e) => e.id === evt.id);
+      if (idx >= 0) {
+        drawer.events[idx] = Object.assign({}, drawer.events[idx], evt);
+      } else {
+        drawer.events.unshift(evt);
+        if (drawer.events.length > 500) drawer.events.length = 500;
+      }
+      renderDrawer();
+    }
+
+    async function refreshEvents() {
+      // Reload persistence: an alert raised while the browser was closed is
+      // still here on next load, because the ring lives on the server.
+      try {
+        const r = await fetch("/api/events/recent?limit=200");
+        if (!r.ok) return;
+        const d = await r.json();
+        drawer.events = Array.isArray(d.events) ? d.events : [];
+        renderDrawer();
+      } catch (_e) { /* offline; the live socket will refill it */ }
+    }
+
+    const _LEVEL_RANK = { info: 0, warning: 1, critical: 2 };
+
+    function drawerFiltered() {
+      const lvl = drawer.levelSel.value;
+      const vial = drawer.vialSel.value;
+      const unackedOnly = drawer.unackedBox.checked;
+      return drawer.events.filter((e) => {
+        if (lvl && (_LEVEL_RANK[e.level] || 0) < _LEVEL_RANK[lvl]) return false;
+        if (vial !== "" && String(e.vial) !== vial) return false;
+        if (unackedOnly && e.acknowledged) return false;
+        return true;
+      });
+    }
+
+    function renderDrawer() {
+      // The badge counts UNACKNOWLEDGED problems across everything, not just
+      // the current filter — filtering must not hide the count that matters.
+      const unackedCrit = drawer.events.filter(
+        (e) => e.level === "critical" && !e.acknowledged).length;
+      const unackedWarn = drawer.events.filter(
+        (e) => e.level === "warning" && !e.acknowledged).length;
+      const total = unackedCrit + unackedWarn;
+      drawer.badge.textContent = String(total);
+      drawer.btn.classList.toggle("has-unacked", total > 0);
+      drawer.btn.dataset.unacked = unackedCrit > 0 ? "critical" : "warning";
+
+      const rows = drawerFiltered();
+      if (!rows.length) {
+        drawer.list.innerHTML =
+          '<div class="drawer-empty">Nothing to show for this filter.</div>';
+        return;
+      }
+      drawer.list.innerHTML = "";
+      for (const e of rows) {
+        const row = document.createElement("div");
+        row.className = "alert-row" + (e.acknowledged ? " acked" : "");
+        row.dataset.level = e.level;
+
+        const when = formatTime(e.last_timestamp || e.timestamp);
+        const vialTag = (e.vial === null || e.vial === undefined)
+          ? "" : `<span class="alert-cat">vial ${e.vial}</span>`;
+        const countTag = (e.count > 1)
+          ? `<span class="alert-count">&times;${e.count}</span>` : "";
+        const ackTag = e.acknowledged
+          ? `<span class="alert-cat">ack ${escapeHtml(e.acknowledged_by || "")}</span>`
+          : "";
+        const detail = drawer.expanded.has(e.id) && e.data
+          ? `<div class="alert-detail">${escapeHtml(JSON.stringify(e.data, null, 2))}</div>`
+          : "";
+        const ackBtn = (e.level === "critical" && !e.acknowledged)
+          ? `<button class="alert-link" data-ack="${e.id}">Acknowledge</button>` : "";
+        const detailLabel = drawer.expanded.has(e.id) ? "Hide detail" : "Detail";
+        const detailBtn = e.data
+          ? `<button class="alert-link" data-detail="${e.id}">${detailLabel}</button>` : "";
+
+        row.innerHTML = `
+          <div class="stripe"></div>
+          <div>
+            <div class="alert-meta">
+              <span class="alert-level">${escapeHtml(e.level)}</span>
+              <span class="alert-cat">${escapeHtml(e.category || "")}</span>
+              ${vialTag}${countTag}${ackTag}
+              <span>${escapeHtml(when)}</span>
+            </div>
+            <div class="alert-msg">${escapeHtml(e.message || "")}</div>
+            <div class="alert-actions">${ackBtn}${detailBtn}</div>
+            ${detail}
+          </div>`;
+        drawer.list.appendChild(row);
+      }
+    }
+
+    function escapeHtml(v) {
+      return String(v)
+        .replace(/&/g, "&amp;").replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+    }
+
+    drawer.list.addEventListener("click", async (e) => {
+      const ackId = e.target.dataset && e.target.dataset.ack;
+      const detId = e.target.dataset && e.target.dataset.detail;
+      if (detId) {
+        const id = Number(detId);
+        if (drawer.expanded.has(id)) drawer.expanded.delete(id);
+        else drawer.expanded.add(id);
+        renderDrawer();
+        return;
+      }
+      if (ackId) {
+        try {
+          const r = await fetch(`/api/events/${ackId}/ack`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ by: "operator" }),
+          });
+          if (r.ok) {
+            const d = await r.json();
+            drawerIngest(d.event);
+          }
+        } catch (err) { showToast(`Acknowledge failed: ${err.message}`, "error"); }
+      }
+    });
+
+    function setDrawerOpen(open) {
+      drawer.open = open;
+      drawer.el.hidden = false;
+      drawer.el.classList.toggle("open", open);
+      drawer.scrim.classList.toggle("open", open);
+      drawer.btn.setAttribute("aria-expanded", open ? "true" : "false");
+      if (open) refreshEvents();
+    }
+    drawer.btn.addEventListener("click", () => setDrawerOpen(!drawer.open));
+    drawer.scrim.addEventListener("click", () => setDrawerOpen(false));
+    document.getElementById("drawer-close")
+      .addEventListener("click", () => setDrawerOpen(false));
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && drawer.open) setDrawerOpen(false);
+    });
+    for (const el of [drawer.levelSel, drawer.vialSel, drawer.unackedBox]) {
+      el.addEventListener("change", renderDrawer);
+    }
+
+    // --- RS485 bus + per-vial sleeve health (SPEC §20.3 / §20.4) ---------
+    const busEl = document.getElementById("bus-conn");
+
+    function applyHealth(health) {
+      if (!health) return;
+      const bus = health.bus || {};
+      // Worst subsystem wins: one unresponsive Arduino is a dead bus for the
+      // data it owns, even if the other one is answering fine.
+      const states = ["temperature", "od"]
+        .map((k) => (bus[k] || {}).state)
+        .filter(Boolean);
+      const worst = states.includes("down") ? "down"
+        : states.includes("degraded") ? "degraded"
+        : states.length ? "ok" : "unknown";
+      busEl.dataset.bus = worst;
+      busEl.querySelector(".conn-text").textContent =
+        worst === "ok" ? "Bus OK"
+        : worst === "degraded" ? "Bus lossy"
+        : worst === "down" ? "Bus down" : "Bus —";
+      busEl.title = ["temperature", "od"].map((k) => {
+        const b = bus[k] || {};
+        const age = b.seconds_since_success;
+        return `${k}: ${b.state || "?"}` +
+          (age == null ? "" : ` (last read ${age.toFixed(0)}s ago)`);
+      }).join(" | ");
+
+      for (const v of (health.vials || [])) {
+        const el = document.getElementById(`health-${v.vial}`);
+        if (!el) continue;
+        el.dataset.health = v.state;
+        el.textContent =
+          v.state === "degraded" ? "sensor"
+          : v.state === "lossy" ? "lossy"
+          : v.state === "out_of_range" ? "OD hi" : "";
+        el.title =
+          v.state === "out_of_range"
+            ? `OD above calibrated range for ${v.out_of_range_streak} cycles`
+            : `${v.dropped_streak} consecutive dropped reads`;
+      }
     }
 
     // --- Emergency stop ---
@@ -2199,6 +3020,8 @@
       const currentStir = actuatorState.stir[vial] | 0;
       stirSlider.value = String(currentStir);
       updateStirSliderDisplay();
+
+      updatePumpInputMode();
     }
 
     function updateTempSliderDisplay() {
@@ -2265,7 +3088,13 @@
         body: JSON.stringify(body),
       });
       const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      if (!res.ok) {
+        const err = new Error(data.error || `HTTP ${res.status}`);
+        err.status = res.status;
+        err.code = data.code || null;  // e.g. "missing_od_blank", "qc_refused"
+        err.data = data;
+        throw err;
+      }
       return data;
     }
 
@@ -2329,21 +3158,89 @@
       }
     });
 
+    // --- Pump volume/seconds mode (SPEC §16) ---
+    function isPumpAdvancedSeconds() {
+      return pumpAdvancedToggle.checked;
+    }
+
+    let pumpPreviewTimer = null;
+
+    function updatePumpInputMode() {
+      if (isPumpAdvancedSeconds()) {
+        pumpInputLabel.textContent = "Duration (s)";
+        pumpVolumeEl.max = String(actuatorState.limits.pump_max_seconds ?? 60);
+        pumpPreviewText.textContent = "";
+        pumpPreviewText.classList.remove("warn");
+      } else {
+        pumpInputLabel.textContent = "Volume (mL)";
+        pumpVolumeEl.removeAttribute("max");
+        updatePumpPreview();
+      }
+    }
+
+    function updatePumpPreview() {
+      if (isPumpAdvancedSeconds()) return;
+      const i = modalState.vial;
+      const volume = parseFloat(pumpVolumeEl.value);
+      if (i === null || !Number.isFinite(volume) || volume <= 0) {
+        pumpPreviewText.textContent = "";
+        pumpPreviewText.classList.remove("warn");
+        return;
+      }
+      clearTimeout(pumpPreviewTimer);
+      pumpPreviewTimer = setTimeout(async () => {
+        try {
+          const data = await postJson("/api/actuators/pump/preview", {
+            vial: i, direction: "influx", volume_ml: volume,
+          });
+          const maxSeconds = actuatorState.limits.pump_max_seconds ?? 60;
+          if (data.seconds < 1) {
+            pumpPreviewText.textContent =
+              `Below minimum dose for this vial (${data.min_ml.toFixed(2)} mL / 1 s) — will not fire`;
+            pumpPreviewText.classList.add("warn");
+          } else if (data.seconds > maxSeconds) {
+            pumpPreviewText.textContent =
+              `Would require ${data.seconds} s — exceeds the ${maxSeconds}s manual pump ceiling`;
+            pumpPreviewText.classList.add("warn");
+          } else {
+            const note = data.quantised
+              ? " (quantised — firmware fires whole seconds)" : "";
+            pumpPreviewText.textContent =
+              `Will deliver ${data.deliverable_ml.toFixed(2)} mL (${data.seconds} s)${note}`;
+            pumpPreviewText.classList.remove("warn");
+          }
+        } catch (err) {
+          pumpPreviewText.textContent = `Preview failed: ${err.message}`;
+          pumpPreviewText.classList.add("warn");
+        }
+      }, 200);
+    }
+
+    pumpVolumeEl.addEventListener("input", updatePumpPreview);
+    pumpAdvancedToggle.addEventListener("change", updatePumpInputMode);
+
     async function firePump(direction) {
       const i = modalState.vial;
       if (i === null) return;
-      const seconds = parseFloat(pumpSecondsEl.value);
-      if (!Number.isFinite(seconds) || seconds <= 0) {
-        showToast("Pump duration must be > 0", "error");
+      const raw = parseFloat(pumpVolumeEl.value);
+      const advanced = isPumpAdvancedSeconds();
+      if (!Number.isFinite(raw) || raw <= 0) {
+        showToast(advanced ? "Pump duration must be > 0" : "Pump volume must be > 0", "error");
         return;
       }
+      const body = advanced
+        ? { vial: i, direction, seconds: raw }
+        : { vial: i, direction, volume_ml: raw };
       const btn = direction === "influx" ? pumpInfluxBtn : pumpEffluxBtn;
       const original = btn.textContent;
       btn.disabled = true;
       btn.textContent = "Running…";
       try {
-        await postJson("/api/actuators/pump", { vial: i, direction, seconds });
-        showToast(`Vial ${i}: ${direction} for ${seconds}s`, "ok");
+        const data = await postJson("/api/actuators/pump", body);
+        const msg = (typeof data.delivered_ml === "number")
+          ? `Vial ${i}: ${direction} delivered ${data.delivered_ml.toFixed(2)} mL (${data.seconds}s)`
+          : `Vial ${i}: ${direction} for ${raw}s`;
+        showToast(msg, "ok");
       } catch (err) {
         showToast(`Pump failed: ${err.message}`, "error");
       } finally {
@@ -2368,8 +3265,9 @@
       pumpCount: 0,      // counts pump events since the experiment started
       media: null,       // {bottles: [...], vial_to_bottle: {...}, waste: {...}}
                          // from /status — bottles get an index used for color lookup.
-      maintenance: null, // {active, entered_at, auto_resume_in_seconds, queued_pump_count}
+      maintenance: null, // {active, reason, entered_at, auto_resume_in_seconds, queued_pump_count}
       morbidostat: null, // {per_vial: {"3": {drug_conc, growth_rate_per_hour, ...}}}
+      perVial: {},       // {"0": {..., consumables_blocked: null|"media_empty"|"waste_full"}} from /status
       escalationPendingVials: [], // from sensor_update.experiment.escalation_pending_vials
     };
 
@@ -2454,7 +3352,8 @@
         if (lockedSet.has(i)) {
           card.classList.add("locked");
           card.dataset.exp = expState.name || "";
-          _setVialBottleDot(card, i, v2b, bottleIdxById);
+          const blockedReason = (expState.perVial[String(i)] || {}).consumables_blocked || null;
+          _setVialBottleDot(card, i, v2b, bottleIdxById, blockedReason);
         } else {
           card.classList.remove("locked");
           card.removeAttribute("data-exp");
@@ -2465,13 +3364,13 @@
       if (modalState.vial !== null) updateModalLockedState();
     }
 
-    function _setVialBottleDot(card, vial, v2b, bottleIdxById) {
+    function _setVialBottleDot(card, vial, v2b, bottleIdxById, blockedReason) {
       const bid = v2b[String(vial)];
-      if (!bid) {
+      if (!bid && !blockedReason) {
         _clearVialBottleDot(card);
         return;
       }
-      const idx = bottleIdxById[bid];
+      const idx = bid ? bottleIdxById[bid] : null;
       const color = idx != null ? BOTTLE_PALETTE[idx % BOTTLE_PALETTE.length] : "#9ca3af";
       const nameEl = card.querySelector(".vial-name");
       if (!nameEl) return;
@@ -2481,8 +3380,20 @@
         dot.className = "bottle-dot";
         nameEl.prepend(dot);
       }
-      dot.style.background = color;
-      dot.title = `Media: ${bid}`;
+      // Consumables interlock (SPEC §15): a blocked vial's dot turns
+      // critical-red regardless of its bottle's normal palette color, so a
+      // suppressed pump is visible at a glance on the dashboard grid.
+      if (blockedReason) {
+        dot.classList.add("blocked");
+        dot.style.background = "var(--status-critical)";
+        dot.title = blockedReason === "waste_full"
+          ? "Pumping suppressed — waste container full"
+          : "Pumping suppressed — media bottle empty";
+      } else {
+        dot.classList.remove("blocked");
+        dot.style.background = color;
+        dot.title = `Media: ${bid}`;
+      }
     }
     function _clearVialBottleDot(card) {
       const dot = card.querySelector(".bottle-dot");
@@ -2498,18 +3409,26 @@
     function renderMaintenanceBanner() {
       const m = expState.maintenance;
       if (!m || !m.active) {
-        maintBanner.classList.remove("show");
+        maintBanner.classList.remove("show", "consumables");
         maintCountdownEl.textContent = "";
         return;
       }
       maintBanner.classList.add("show");
-      const seconds = Math.max(0, Math.floor(Number(m.auto_resume_in_seconds) || 0));
-      const min = Math.floor(seconds / 60);
-      const sec = seconds % 60;
       const queued = Number(m.queued_pump_count || 0);
       const queuedStr = queued > 0 ? ` · ${queued} pump${queued === 1 ? "" : "s"} queued` : "";
-      maintCountdownEl.textContent =
-        `Auto-resume in ${min}:${String(sec).padStart(2, "0")}${queuedStr}`;
+      // Consumables-triggered maintenance has no auto-resume (SPEC §15 --
+      // sticky until refill_media), so there is no countdown to show.
+      if (m.reason === "consumables") {
+        maintBanner.classList.add("consumables");
+        maintCountdownEl.textContent = `Blocked — refill required to resume${queuedStr}`;
+      } else {
+        maintBanner.classList.remove("consumables");
+        const seconds = Math.max(0, Math.floor(Number(m.auto_resume_in_seconds) || 0));
+        const min = Math.floor(seconds / 60);
+        const sec = seconds % 60;
+        maintCountdownEl.textContent =
+          `Auto-resume in ${min}:${String(sec).padStart(2, "0")}${queuedStr}`;
+      }
     }
 
     // Countdown ticks every second purely client-side. The authoritative
@@ -2754,16 +3673,22 @@
         return;
       }
       mediaPanel.classList.add("show");
+      const estimateTag = (q) => q === "uncalibrated"
+        ? `<span class="estimate-tag" title="Flow rates are the hardcoded defaults, not measured (SPEC §19) -- treat levels as a rough estimate">uncalibrated estimate</span>`
+        : "";
       const rows = bottles.map((b, idx) => {
         const color = BOTTLE_PALETTE[idx % BOTTLE_PALETTE.length];
         const pct = Math.max(0, Math.min(100, Number(b.remaining_pct) || 0));
+        // "blocked" (SPEC §15 consumables interlock -- pumping actually
+        // suppressed) is more severe than "warn" (just running low).
         const warn = b.alerted_low || pct <= 10;
+        const blocked = !!b.blocked;
         return `
-          <div class="media-row bottle ${warn ? "warn" : ""}">
+          <div class="media-row bottle ${blocked ? "blocked" : (warn ? "warn" : "")}">
             <span class="swatch" style="background:${color}"></span>
-            <span class="label" title="${escapeHtml(b.contents || "")}">${escapeHtml(b.name)}</span>
+            <span class="label" title="${escapeHtml(b.contents || "")}">${escapeHtml(b.name)}${blocked ? " — BLOCKED" : ""}</span>
             <div class="bar"><div class="fill" style="width:${pct}%"></div></div>
-            <span class="num">${(b.remaining_ml || 0).toFixed(0)} / ${(b.initial_volume_ml || 0).toFixed(0)} mL</span>
+            <span class="num">${(b.remaining_ml || 0).toFixed(0)} / ${(b.initial_volume_ml || 0).toFixed(0)} mL${estimateTag(b.estimate_quality)}</span>
           </div>
         `;
       }).join("");
@@ -2771,12 +3696,13 @@
       if (waste) {
         const pct = Math.max(0, Math.min(100, Number(waste.filled_pct) || 0));
         const warn = waste.alerted_high || pct >= 90;
+        const blocked = !!waste.blocked;
         wasteRow = `
-          <div class="media-row waste ${warn ? "warn" : ""}">
+          <div class="media-row waste ${blocked ? "blocked" : (warn ? "warn" : "")}">
             <span class="swatch" style="background:#9ca3af"></span>
-            <span class="label">${escapeHtml(waste.name || "Waste")}</span>
+            <span class="label">${escapeHtml(waste.name || "Waste")}${blocked ? " — BLOCKED" : ""}</span>
             <div class="bar"><div class="fill" style="width:${pct}%"></div></div>
-            <span class="num">${(waste.filled_ml || 0).toFixed(0)} / ${(waste.capacity_ml || 0).toFixed(0)} mL</span>
+            <span class="num">${(waste.filled_ml || 0).toFixed(0)} / ${(waste.capacity_ml || 0).toFixed(0)} mL${estimateTag(waste.estimate_quality)}</span>
           </div>
         `;
       }
@@ -2888,7 +3814,8 @@
       // Disable input affordances when locked.
       tempSlider.disabled = isLocked;
       stirSlider.disabled = isLocked;
-      pumpSecondsEl.disabled = isLocked;
+      pumpVolumeEl.disabled = isLocked;
+      pumpAdvancedToggle.disabled = isLocked;
       applyTempBtn.disabled = isLocked;
       applyStirBtn.disabled = isLocked;
       pumpInfluxBtn.disabled = isLocked;
@@ -2921,6 +3848,7 @@
               expState.media = s.media || null;
               expState.maintenance = s.maintenance || null;
               expState.morbidostat = s.morbidostat || null;
+              expState.perVial = s.per_vial || {};
             } else {
               expState.name = loaded.name;
               expState.status = loaded.status;
@@ -2930,6 +3858,7 @@
               expState.media = null;
               expState.maintenance = null;
               expState.morbidostat = null;
+              expState.perVial = {};
             }
           } catch {
             expState.name = loaded.name;
@@ -2939,6 +3868,7 @@
             expState.media = null;
             expState.maintenance = null;
             expState.morbidostat = null;
+            expState.perVial = {};
           }
         } else {
           expState.name = null;
@@ -2948,6 +3878,7 @@
           expState.media = null;
           expState.maintenance = null;
           expState.morbidostat = null;
+          expState.perVial = {};
           expState.escalationPendingVials = [];
         }
         renderExpBar();
@@ -2974,11 +3905,37 @@
       }
     }
 
+    // Start an experiment, handling the Session O missing-blank hard block:
+    // offer the OD blank wizard first, or an explicit recorded override.
+    async function startExperimentWithBlankGuard(name) {
+      try {
+        await postJson(`/api/experiments/${encodeURIComponent(name)}/start`, {});
+        return true;
+      } catch (err) {
+        if (err.code !== "missing_od_blank") throw err;
+        const startAnyway = confirm(
+          `No per-run OD blank has been taken for "${name}".\n\n` +
+          "Without one, reported OD carries a vial-specific offset of up to " +
+          "~0.44 (CALIBRATION_PROTOCOL §1.1).\n\n" +
+          "OK — start anyway (recorded as a warning)\n" +
+          "Cancel — go to the Calibration tab and take the blank first"
+        );
+        if (!startAnyway) {
+          showView("cal");
+          openBlankModal();
+          return false;
+        }
+        await postJson(`/api/experiments/${encodeURIComponent(name)}/start`,
+                       { allow_missing_od_blank: true });
+        return true;
+      }
+    }
+
     async function startCreatedExperiment() {
       if (!expState.name) return;
       try {
-        await postJson(`/api/experiments/${encodeURIComponent(expState.name)}/start`, {});
-        showToast(`Experiment "${expState.name}" started`, "ok");
+        const started = await startExperimentWithBlankGuard(expState.name);
+        if (started) showToast(`Experiment "${expState.name}" started`, "ok");
         await refreshExperimentStatus();
       } catch (err) {
         showToast(`Start failed: ${err.message}`, "error");
@@ -3534,8 +4491,15 @@
       try {
         await postJson("/api/experiments/create", body);
         wizardNext.textContent = "Starting…";
-        await postJson(`/api/experiments/${encodeURIComponent(wizardState.name)}/start`, {});
-        showToast(`Experiment "${wizardState.name}" started`, "ok");
+        const started = await startExperimentWithBlankGuard(wizardState.name);
+        if (started) {
+          showToast(`Experiment "${wizardState.name}" started`, "ok");
+        } else {
+          showToast(
+            `Experiment "${wizardState.name}" created — take the OD blank, ` +
+            "then start it from the status bar", "warn"
+          );
+        }
         closeExpModal();
         await refreshExperimentStatus();
       } catch (err) {
@@ -3583,36 +4547,45 @@
     }
 
     // Draws per-vial pump markers (diamonds at the OD recorded when the pump
-    // fired) onto an OD chart. Marker list is attached as u._pumpMarkers.
-    function pumpMarkerPlugin() {
-      return { hooks: { draw: (u) => {
-        const marks = u._pumpMarkers;
-        if (!marks || !marks.length) return;
-        const ctx = u.ctx;
-        const dpr = u.pxRatio || 1;
-        const { left, top, width, height } = u.bbox;
-        const r = 4 * dpr;
-        ctx.save();
-        ctx.beginPath();
-        ctx.rect(left, top, width, height);
-        ctx.clip();
-        for (const m of marks) {
-          if (m.t == null || m.od == null || !Number.isFinite(m.od)) continue;
-          const x = u.valToPos(m.t, "x", true);
-          const y = u.valToPos(m.od, "y", true);
-          if (x < left || x > left + width) continue;
+    // fired) onto an OD chart. Markers are passed in here and stashed on
+    // u._pumpMarkers by the init hook, so they are present for uPlot's FIRST
+    // draw. Do NOT go back to assigning u._pumpMarkers after construction and
+    // calling u.redraw() to pick them up: uPlot converges its scales
+    // asynchronously, so a redraw() on the same tick re-applies an x scale
+    // that is still {min: null, max: null} and pins it there permanently --
+    // the chart then renders its axes and legend but no trace. (Later
+    // redraw() calls, e.g. appending a live pump marker, are fine.)
+    function pumpMarkerPlugin(marks0) {
+      return { hooks: {
+        init: (u) => { u._pumpMarkers = marks0 || []; },
+        draw: (u) => {
+          const marks = u._pumpMarkers;
+          if (!marks || !marks.length) return;
+          const ctx = u.ctx;
+          const dpr = u.pxRatio || 1;
+          const { left, top, width, height } = u.bbox;
+          const r = 4 * dpr;
+          ctx.save();
           ctx.beginPath();
-          ctx.moveTo(x, y - r); ctx.lineTo(x + r, y);
-          ctx.lineTo(x, y + r); ctx.lineTo(x - r, y);
-          ctx.closePath();
-          ctx.fillStyle = m.color;
-          ctx.fill();
-          ctx.lineWidth = dpr;
-          ctx.strokeStyle = "#ffffff";
-          ctx.stroke();
-        }
-        ctx.restore();
-      } } };
+          ctx.rect(left, top, width, height);
+          ctx.clip();
+          for (const m of marks) {
+            if (m.t == null || m.od == null || !Number.isFinite(m.od)) continue;
+            const x = u.valToPos(m.t, "x", true);
+            const y = u.valToPos(m.od, "y", true);
+            if (x < left || x > left + width) continue;
+            ctx.beginPath();
+            ctx.moveTo(x, y - r); ctx.lineTo(x + r, y);
+            ctx.lineTo(x, y + r); ctx.lineTo(x - r, y);
+            ctx.closePath();
+            ctx.fillStyle = m.color;
+            ctx.fill();
+            ctx.lineWidth = dpr;
+            ctx.strokeStyle = "#ffffff";
+            ctx.stroke();
+          }
+          ctx.restore();
+        } } };
     }
 
     function makeChart(el, series, data, opts) {
@@ -3713,19 +4686,24 @@
     let plotsLoadToken = 0;
 
     const plotsView = document.getElementById("plots-view");
+    const calView = document.getElementById("cal-view");
     const mainView = document.querySelector("main");
 
     function showView(which) {
-      const isPlots = which === "plots";
-      plotsView.classList.toggle("view-hidden", !isPlots);
-      mainView.classList.toggle("view-hidden", isPlots);
-      const navPlots = document.getElementById("nav-plots");
-      const navDash = document.getElementById("nav-dashboard");
-      navPlots.classList.toggle("active", isPlots);
-      navDash.classList.toggle("active", !isPlots);
-      navPlots.setAttribute("aria-selected", String(isPlots));
-      navDash.setAttribute("aria-selected", String(!isPlots));
-      if (isPlots) plotsOnOpen();
+      const views = [
+        ["dashboard", mainView, "nav-dashboard"],
+        ["plots", plotsView, "nav-plots"],
+        ["cal", calView, "nav-cal"],
+      ];
+      for (const [name, el, navId] of views) {
+        const active = name === which;
+        el.classList.toggle("view-hidden", !active);
+        const nav = document.getElementById(navId);
+        nav.classList.toggle("active", active);
+        nav.setAttribute("aria-selected", String(active));
+      }
+      if (which === "plots") plotsOnOpen();
+      if (which === "cal") refreshCalibration();
     }
 
     async function plotsPopulateExperiments() {
@@ -3876,9 +4854,9 @@
       if (plots.showOD) {
         const data = buildAligned(plots._odByVial, vials);
         plots.od = makeChart(document.getElementById("plots-od-chart"),
-          seriesForVials(vials), data, { height: 280, plugins: [pumpMarkerPlugin()] });
-        plots.od._pumpMarkers = plots.showPump ? collectPumpMarkers(vials) : [];
-        plots.od.redraw();
+          seriesForVials(vials), data, { height: 280,
+            plugins: [pumpMarkerPlugin(
+              plots.showPump ? collectPumpMarkers(vials) : [])] });
       }
       if (plots.showTemp) {
         const data = buildAligned(plots._tempByVial, vials);
@@ -4003,9 +4981,8 @@
           [{ label: "Time" },
            { label: `Vial ${vial}`, stroke: vialColor(vial), width: 1.5,
              spanGaps: false, points: { show: false } }],
-          odData, { height: 170, legend: false, plugins: [pumpMarkerPlugin()] });
-        modalTrends.od._pumpMarkers = pumpMarks;
-        modalTrends.od.redraw();
+          odData, { height: 170, legend: false,
+                    plugins: [pumpMarkerPlugin(pumpMarks)] });
         modalTrends.temp = makeChart(
           document.getElementById("modal-temp-chart"),
           [{ label: "Time" },
@@ -4184,6 +5161,8 @@
         .addEventListener("click", () => showView("dashboard"));
       document.getElementById("nav-plots")
         .addEventListener("click", () => showView("plots"));
+      document.getElementById("nav-cal")
+        .addEventListener("click", () => showView("cal"));
       document.getElementById("plots-exp").addEventListener("change", (e) => {
         plots.exp = e.target.value || null;
         const opt = e.target.selectedOptions[0];
@@ -4215,20 +5194,835 @@
         .addEventListener("change", (e) => { modalTrends.showPump = e.target.checked; modalTrendsLoad(); });
     })();
 
+    // ============================================================
+    //  Calibration (SPEC §19 / CALIBRATION_PROTOCOL Part II)
+    // ============================================================
+
+    const calState = {
+      index: null,          // GET /api/calibration/ payload
+      blank: {              // OD blank wizard
+        session: null, step: 1, thermal: null,
+        dark: null, blank: null, vials: [], excluded: new Set(),
+        conditions: null, committed: null, needOverride: false,
+      },
+      pump: {               // pump gravimetric wizard
+        session: null, selected: null, review: null, needOverride: false,
+        setupPumps: new Set([...Array(32).keys()]),
+      },
+    };
+
+    function _fmt(x, digits = 2) {
+      return (typeof x === "number" && isFinite(x)) ? x.toFixed(digits) : "—";
+    }
+    function _pumpLabel(p) {
+      return p < 16 ? `I${p}` : `E${p - 16}`;
+    }
+
+    async function refreshCalibration() {
+      try {
+        const res = await fetch("/api/calibration/");
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        calState.index = await res.json();
+        renderCalCards();
+        renderCalBanner();
+      } catch (err) {
+        console.warn("refreshCalibration failed:", err.message);
+      }
+    }
+
+    function renderCalBanner() {
+      const banner = document.getElementById("cal-banner");
+      const textEl = document.getElementById("cal-banner-text");
+      const stale = calState.index && calState.index.staleness;
+      if (!stale || !stale.any_stale) {
+        banner.classList.remove("show");
+        return;
+      }
+      const parts = [];
+      for (const key of ["od_blank", "pump", "od", "temperature", "stir"]) {
+        const s = stale[key];
+        if (s && s.stale) parts.push(key === "od_blank" ? "OD blank" : key);
+      }
+      textEl.innerHTML =
+        `<strong>Calibration overdue:</strong> ${escapeHtml(parts.join(", "))} ` +
+        `— details in the Calibration tab`;
+      banner.classList.add("show");
+    }
+
+    function renderCalCards() {
+      const wrap = document.getElementById("cal-cards");
+      const idx = calState.index;
+      if (!idx) { wrap.innerHTML = ""; return; }
+      const stale = idx.staleness || {};
+      const subs = idx.subsystems || {};
+      const TITLES = {
+        od: "OD curve (4-parameter sigmoid)",
+        temperature: "Temperature (thermistor slope/intercept)",
+        pump: "Pump flow rates (32 pumps, gravimetric)",
+        stir: "Stir PWM → RPM",
+      };
+      const cards = [];
+
+      // Per-run blank card first — it is the every-run action.
+      const blankStale = stale.od_blank || {};
+      const blankBadge = blankStale.stale
+        ? '<span class="cal-badge missing">required</span>'
+        : (blankStale.experiment
+           ? '<span class="cal-badge ok">taken</span>'
+           : '<span class="cal-badge ok">n/a</span>');
+      cards.push(`
+        <div class="cal-card">
+          <h3>OD blank (per-run) ${blankBadge}</h3>
+          <p class="cal-meta">${
+            blankStale.experiment
+              ? `Experiment: ${escapeHtml(blankStale.experiment)}`
+              : "No experiment loaded — taken against a CREATED experiment, " +
+                "immediately before start."
+          }</p>
+          ${(blankStale.reasons || []).length
+            ? `<ul class="cal-reasons">${blankStale.reasons.map(r =>
+                `<li>${escapeHtml(r)}</li>`).join("")}</ul>` : ""}
+        </div>
+      `);
+
+      for (const key of ["pump", "od", "temperature", "stir"]) {
+        const sub = subs[key];
+        const st = stale[key] || {};
+        const badge = sub === null
+          ? '<span class="cal-badge missing">missing</span>'
+          : (st.stale
+             ? '<span class="cal-badge stale">stale</span>'
+             : '<span class="cal-badge ok">current</span>');
+        let meta = "Never calibrated.";
+        if (sub) {
+          meta = `Version ${escapeHtml(sub.version)} · ` +
+                 `${_fmt(sub.age_days, 0)} days old · ` +
+                 `source: ${escapeHtml(sub.source || "?")}`;
+        }
+        const warnings = (sub && sub.qc && sub.qc.warnings) || [];
+        cards.push(`
+          <div class="cal-card">
+            <h3>${TITLES[key]} ${badge}</h3>
+            <p class="cal-meta">${meta}</p>
+            ${(st.reasons || []).length
+              ? `<ul class="cal-reasons">${st.reasons.map(r =>
+                  `<li>${escapeHtml(r)}</li>`).join("")}</ul>` : ""}
+            ${warnings.length
+              ? `<ul class="cal-reasons">${warnings.map(w =>
+                  `<li>⚠ ${escapeHtml(w)}</li>`).join("")}</ul>` : ""}
+          </div>
+        `);
+      }
+      wrap.innerHTML = cards.join("");
+    }
+
+    // ------------------------------------------------------------
+    //  OD blank wizard
+    // ------------------------------------------------------------
+
+    const blankModal = document.getElementById("blank-modal");
+
+    function openBlankModal() {
+      if (expState.status !== "created") {
+        showToast(
+          "The OD blank needs a CREATED experiment (create one, don't start " +
+          "it yet). It is taken under final run conditions, immediately " +
+          "before inoculation.", "warn");
+        return;
+      }
+      const b = calState.blank;
+      b.session = null; b.step = 1; b.thermal = null;
+      b.dark = null; b.blank = null; b.excluded = new Set();
+      b.committed = null; b.needOverride = false;
+      blankModal.hidden = false;
+      requestAnimationFrame(() => blankModal.classList.add("open"));
+      blankStartSession();
+    }
+
+    function closeBlankModal() {
+      blankModal.classList.remove("open");
+      setTimeout(() => {
+        if (!blankModal.classList.contains("open")) blankModal.hidden = true;
+      }, 160);
+    }
+
+    async function blankStartSession() {
+      const b = calState.blank;
+      try {
+        const d = await postJson("/api/calibration/od/blank/start", {});
+        b.session = d.session;
+        b.thermal = d.thermal;
+        b.vials = d.vials || [];
+      } catch (err) {
+        showToast(`Blank session failed: ${err.message}`, "error");
+      }
+      renderBlank();
+    }
+
+    function _blankStatsTable(stats, sdLimit) {
+      if (!stats) return "";
+      const b = calState.blank;
+      const rows = b.vials.map(v => {
+        const sd = stats.sd[v];
+        const sdBad = typeof sd === "number" && sd > sdLimit;
+        return `<tr>
+          <td>Vial ${v}</td>
+          <td>${_fmt(stats.median[v], 0)}</td>
+          <td class="${sdBad ? "bad" : ""}">${_fmt(sd, 0)}</td>
+          <td>${stats.n_valid[v]}</td>
+        </tr>`;
+      }).join("");
+      return `<table class="cal-table">
+        <thead><tr><th>Vial</th><th>Median (counts)</th>
+        <th>SD (limit ${sdLimit})</th><th>n valid</th></tr></thead>
+        <tbody>${rows}</tbody></table>`;
+    }
+
+    function renderBlank() {
+      const b = calState.blank;
+      const body = document.getElementById("blank-body");
+      document.querySelectorAll("#blank-steps .wizard-step").forEach(el => {
+        const s = Number(el.dataset.step);
+        el.classList.toggle("active", s === b.step);
+        el.classList.toggle("done", s < b.step);
+      });
+      const backBtn = document.getElementById("blank-back");
+      const nextBtn = document.getElementById("blank-next");
+      backBtn.disabled = b.step === 1 || !!b.committed;
+
+      if (b.committed) {
+        const rows = Object.entries(b.committed.od_offset_removed).map(
+          ([v, off]) => `<tr><td>Vial ${v}</td>
+            <td>${_fmt(b.committed.c_run[v], 4)}</td>
+            <td>${_fmt(off, 3)}</td></tr>`).join("");
+        body.innerHTML = `
+          <p class="blank-status ok">Blank committed — row 2 re-anchored;
+          the offsets below were being reported as growth before this blank.</p>
+          <table class="cal-table">
+            <thead><tr><th>Vial</th><th>c_run</th>
+            <th>OD offset removed</th></tr></thead>
+            <tbody>${rows}</tbody></table>
+          ${b.committed.qc.warnings.length
+            ? `<ul class="cal-reasons">${b.committed.qc.warnings.map(w =>
+                `<li>⚠ ${escapeHtml(w)}</li>`).join("")}</ul>` : ""}`;
+        nextBtn.textContent = "Done";
+        return;
+      }
+
+      if (b.step === 1) {
+        const settled = b.thermal && b.thermal.settled;
+        body.innerHTML = `
+          <p class="cal-hint">
+            Preconditions (§5.4, all mandatory): sterile medium at working
+            volume, no cells; sleeves seated; stir at the run's PWM;
+            temperature equilibrated ≥ 10 min; bubbles settled; LED at the
+            run's power (2125). Taken <strong>last, immediately before
+            inoculation</strong>.
+          </p>
+          <div class="blank-status ${settled ? "ok" : "wait"}" id="blank-thermal">
+            ${settled
+              ? "Thermally settled — all vials within ±0.3 °C of setpoint for ≥ 10 min."
+              : "Not thermally settled yet — commit is blocked until every " +
+                "vial has held ±0.3 °C of setpoint for 10 minutes."}
+          </div>
+          <div class="pump-buttons" style="display:flex; gap:8px;">
+            <button class="btn" id="blank-apply-conditions" type="button"
+                    title="Sets the run's target temperature and stir PWM on the experiment's vials">
+              Apply run conditions
+            </button>
+            <button class="btn" id="blank-refresh-thermal" type="button">
+              Refresh status
+            </button>
+          </div>`;
+        document.getElementById("blank-apply-conditions")
+          .addEventListener("click", blankApplyRunConditions);
+        document.getElementById("blank-refresh-thermal")
+          .addEventListener("click", blankStartSession);
+        nextBtn.textContent = "Next";
+        nextBtn.disabled = !b.session;
+      } else if (b.step === 2) {
+        body.innerHTML = `
+          <p class="cal-hint">LED power 0, ${5} reads. The dark read is a
+          <strong>diagnostic</strong>, not a correction — the installed curve
+          was fit on non-dark-subtracted signal (§5.4).</p>
+          <button class="btn btn-primary" id="blank-take-dark" type="button">
+            Take dark read (LED 0)
+          </button>
+          ${_blankStatsTable(b.dark, 150)}`;
+        document.getElementById("blank-take-dark")
+          .addEventListener("click", async () => {
+            try {
+              calState.blank.dark = await postJson(
+                "/api/calibration/od/blank/dark",
+                { session: b.session });
+              renderBlank();
+            } catch (err) { showToast(`Dark read failed: ${err.message}`, "error"); }
+          });
+        nextBtn.textContent = "Next";
+        nextBtn.disabled = !b.dark;
+      } else if (b.step === 3) {
+        body.innerHTML = `
+          <p class="cal-hint">LED at the run's power. Wait 5 min after any
+          handling so bubbles settle, then read.</p>
+          <button class="btn btn-primary" id="blank-take-blank" type="button">
+            Take blank read
+          </button>
+          ${_blankStatsTable(b.blank, 300)}`;
+        document.getElementById("blank-take-blank")
+          .addEventListener("click", async () => {
+            try {
+              calState.blank.blank = await postJson(
+                "/api/calibration/od/blank/measure",
+                { session: b.session });
+              renderBlank();
+            } catch (err) { showToast(`Blank read failed: ${err.message}`, "error"); }
+          });
+        nextBtn.textContent = "Next";
+        nextBtn.disabled = !b.blank;
+      } else {
+        // Step 4: review + exclusions + commit.
+        const rows = b.vials.map(v => {
+          const excluded = b.excluded.has(v);
+          return `<tr>
+            <td><label class="chk">
+              <input type="checkbox" data-exclude-vial="${v}"
+                     ${excluded ? "checked" : ""}> exclude</label></td>
+            <td>Vial ${v}</td>
+            <td>${_fmt(b.dark && b.dark.median[v], 0)}</td>
+            <td>${_fmt(b.dark && b.dark.sd[v], 0)}</td>
+            <td>${_fmt(b.blank && b.blank.median[v], 0)}</td>
+            <td>${_fmt(b.blank && b.blank.sd[v], 0)}</td>
+          </tr>`;
+        }).join("");
+        body.innerHTML = `
+          <p class="cal-hint">Review before committing (§13: "review screens
+          are the point"). Reseat and repeat a failing vial once; then exclude
+          it. Committing re-anchors calibration row 2 only — rows 0/1/3 are
+          never modified by a blank.</p>
+          <table class="cal-table">
+            <thead><tr><th></th><th>Vial</th><th>Dark med</th><th>Dark SD</th>
+            <th>Blank med</th><th>Blank SD</th></tr></thead>
+            <tbody>${rows}</tbody></table>
+          ${b.needOverride ? `
+            <div class="field-row">
+              <label class="field-label" for="blank-override">
+                QC failed — override reason (recorded in the blank's qc block)
+              </label>
+              <input type="text" id="blank-override"
+                     placeholder="why this blank is acceptable anyway">
+            </div>` : ""}
+          <div id="blank-qc-failures"></div>`;
+        body.querySelectorAll("[data-exclude-vial]").forEach(cb => {
+          cb.addEventListener("change", () => {
+            const v = Number(cb.dataset.excludeVial);
+            if (cb.checked) b.excluded.add(v); else b.excluded.delete(v);
+          });
+        });
+        nextBtn.textContent = "Commit blank";
+        nextBtn.disabled = false;
+      }
+    }
+
+    async function blankApplyRunConditions() {
+      // Push the run's target temperature + stir PWM onto the experiment's
+      // vials via the ordinary actuator routes (legal: experiment is CREATED,
+      // not RUNNING). Non-experiment vials keep their current setpoints.
+      try {
+        const cfg = await (await fetch(
+          `/api/experiments/${encodeURIComponent(expState.name)}`)).json();
+        const params = cfg.parameters || {};
+        const target = Number(params.temperature_c ?? 37);
+        const stir = Number(params.stir_rate ?? 10);
+        const vialSet = new Set(cfg.vials || []);
+        const values_c = actuatorState.temperatureSetpointRaw.map((raw, vial) => {
+          if (vialSet.has(vial)) return target;
+          return raw >= HEATER_OFF_SETPOINT
+            ? (actuatorState.limits.temp_min_c ?? 22)
+            : Math.max(actuatorState.limits.temp_min_c ?? 22,
+                Math.min(actuatorState.limits.temp_max_c ?? 45,
+                         rawToCelsius(vial, raw)));
+        });
+        await postJson("/api/actuators/temperature", { values_c });
+        const stirValues = actuatorState.stir.map((s, vial) =>
+          vialSet.has(vial) ? stir : s);
+        await postJson("/api/actuators/stir", { values: stirValues });
+        showToast(
+          `Run conditions applied: ${target.toFixed(1)} °C, stir ${stir} on ` +
+          `vials ${[...vialSet].join(", ")} — now equilibrate ≥ 10 min`, "ok");
+        fetchActuatorState();
+      } catch (err) {
+        showToast(`Apply conditions failed: ${err.message}`, "error");
+      }
+    }
+
+    async function blankNext() {
+      const b = calState.blank;
+      if (b.committed) { closeBlankModal(); refreshCalibration(); return; }
+      if (b.step < 4) { b.step += 1; renderBlank(); return; }
+      // Commit.
+      const overrideEl = document.getElementById("blank-override");
+      const payload = {
+        session: b.session,
+        exclude_vials: [...b.excluded],
+        operator: "gui",
+      };
+      if (overrideEl && overrideEl.value.trim()) {
+        payload.override_reason = overrideEl.value.trim();
+      }
+      try {
+        b.committed = await postJson("/api/calibration/od/blank/commit", payload);
+        showToast("OD blank committed — row 2 re-anchored", "ok");
+        renderBlank();
+        refreshCalibration();
+        refreshExperimentStatus();
+      } catch (err) {
+        if (err.code === "qc_refused") {
+          b.needOverride = true;
+          renderBlank();
+          const failEl = document.getElementById("blank-qc-failures");
+          if (failEl && err.data && err.data.qc) {
+            failEl.innerHTML = `<ul class="cal-reasons">${
+              err.data.qc.failures.map(f =>
+                `<li class="bad">✗ ${escapeHtml(f)}</li>`).join("")}</ul>`;
+          }
+          showToast("Blank failed acceptance criteria — see the review list",
+                    "warn");
+        } else {
+          showToast(`Commit failed: ${err.message}`, "error");
+        }
+      }
+    }
+
+    async function blankAbort() {
+      const b = calState.blank;
+      if (b.session && !b.committed) {
+        try {
+          await postJson("/api/calibration/od/blank/abort",
+                         { session: b.session });
+        } catch (_e) { /* session may already be gone */ }
+      }
+      closeBlankModal();
+    }
+
+    // ------------------------------------------------------------
+    //  Pump gravimetric wizard
+    // ------------------------------------------------------------
+
+    const pumpCalModal = document.getElementById("pumpcal-modal");
+
+    async function openPumpCalModal() {
+      const p = calState.pump;
+      p.review = null; p.selected = null; p.needOverride = false;
+      pumpCalModal.hidden = false;
+      requestAnimationFrame(() => pumpCalModal.classList.add("open"));
+      try {
+        const res = await fetch("/api/calibration/pump/session");
+        const d = await res.json();
+        p.session = d.active ? d : null;
+      } catch (_e) { p.session = null; }
+      renderPumpCal();
+    }
+
+    function closePumpCalModal() {
+      pumpCalModal.classList.remove("open");
+      setTimeout(() => {
+        if (!pumpCalModal.classList.contains("open")) pumpCalModal.hidden = true;
+      }, 160);
+    }
+
+    function renderPumpCal() {
+      const p = calState.pump;
+      const body = document.getElementById("pumpcal-body");
+      const finishBtn = document.getElementById("pumpcal-finish");
+      const abortBtn = document.getElementById("pumpcal-abort");
+
+      if (p.review) {
+        // Post-install review screen: new vs previous vs delta per pump.
+        const rows = Object.entries(p.review.review).map(([id, r]) => {
+          const delta = r.delta_pct;
+          const cls = (delta != null && Math.abs(delta) > 15) ? "warn" : "";
+          return `<tr><td>${_pumpLabel(Number(id))}</td>
+            <td>${_fmt(r.rate_ml_s, 3)}</td>
+            <td>${r.previous_rate_ml_s != null ? _fmt(r.previous_rate_ml_s, 3) : "—"}</td>
+            <td class="${cls}">${delta != null ? _fmt(delta, 1) + "%" : "—"}</td>
+            <td>${r.cv != null ? _fmt(100 * r.cv, 1) + "%" : "—"}</td></tr>`;
+        }).join("");
+        body.innerHTML = `
+          <p class="blank-status ok">Calibration installed as version
+          ${escapeHtml(p.review.version)}${p.review.flow_rates_complete
+            ? " — all 32 pumps have measured rates; new experiments will use them."
+            : " — PARTIAL: unmeasured pumps keep their previous/default rates."}
+          </p>
+          <table class="cal-table">
+            <thead><tr><th>Pump</th><th>mL/s</th><th>Previous</th>
+            <th>Δ</th><th>CV</th></tr></thead>
+            <tbody>${rows}</tbody></table>`;
+        finishBtn.hidden = true;
+        abortBtn.hidden = true;
+        return;
+      }
+
+      finishBtn.hidden = false;
+      abortBtn.hidden = false;
+
+      if (!p.session) {
+        // Setup screen.
+        const tiles = [...Array(32).keys()].map(i => `
+          <div class="pump-tile ${p.setupPumps.has(i) ? "" : "excluded"}"
+               data-setup-pump="${i}" title="canonical pump index ${i}">
+            ${_pumpLabel(i)}
+          </div>`).join("");
+        body.innerHTML = `
+          <p class="cal-hint">
+            Gravimetric calibration (§7): per pump — prime until bubble-free,
+            tare a vessel, fire for a fixed duration, weigh, repeat. ~1 h for
+            all 32; the session is <strong>resumable</strong>, so stopping
+            halfway loses nothing. For the per-run four-line spot-check
+            (§5.2), select just those four pumps.
+          </p>
+          <div class="cal-form-grid">
+            <label for="pc-fire">Fire duration (s)</label>
+            <input id="pc-fire" type="number" min="5" max="60" value="20">
+            <label for="pc-reps">Replicates</label>
+            <input id="pc-reps" type="number" min="1" max="10" value="3">
+            <label for="pc-fluid">Fluid</label>
+            <input id="pc-fluid" type="text" value="water">
+            <label for="pc-density">Density (g/mL) at bench temp</label>
+            <input id="pc-density" type="number" step="0.0001" value="0.9977">
+            <label for="pc-bench">Bench temp (°C)</label>
+            <input id="pc-bench" type="number" step="0.1" placeholder="22.0">
+            <label for="pc-operator">Operator</label>
+            <input id="pc-operator" type="text" placeholder="initials">
+          </div>
+          <p class="cal-hint">Pumps to calibrate (click to toggle;
+            I = influx, E = efflux — they are physically separate pumps):</p>
+          <div class="pump-cal-grid">${tiles}</div>
+          <button class="btn btn-primary" id="pc-start" type="button">
+            Start session (${p.setupPumps.size} pumps)
+          </button>`;
+        body.querySelectorAll("[data-setup-pump]").forEach(tile => {
+          tile.addEventListener("click", () => {
+            const i = Number(tile.dataset.setupPump);
+            if (p.setupPumps.has(i)) p.setupPumps.delete(i);
+            else p.setupPumps.add(i);
+            // Toggle in place — a full re-render would wipe the typed
+            // fire/replicates/fluid/density field values.
+            tile.classList.toggle("excluded", !p.setupPumps.has(i));
+            document.getElementById("pc-start").textContent =
+              `Start session (${p.setupPumps.size} pumps)`;
+          });
+        });
+        document.getElementById("pc-start").addEventListener("click", async () => {
+          try {
+            const d = await postJson("/api/calibration/pump/start", {
+              pumps: [...p.setupPumps].sort((a, b) => a - b),
+              fire_seconds: Number(document.getElementById("pc-fire").value),
+              replicates: Number(document.getElementById("pc-reps").value),
+              fluid: document.getElementById("pc-fluid").value.trim() || "water",
+              fluid_density_g_ml:
+                Number(document.getElementById("pc-density").value),
+              bench_temp_c:
+                document.getElementById("pc-bench").value === ""
+                  ? null : Number(document.getElementById("pc-bench").value),
+              operator:
+                document.getElementById("pc-operator").value.trim() || "gui",
+            });
+            p.session = d;
+            renderPumpCal();
+          } catch (err) {
+            showToast(`Start failed: ${err.message}`, "error");
+          }
+        });
+        return;
+      }
+
+      // Active session: 32-tile grid + per-pump detail.
+      const s = p.session;
+      const per = s.per_pump || {};
+      const tiles = [...Array(32).keys()].map(i => {
+        const st = per[String(i)];
+        let cls = "excluded";
+        let sub = "";
+        if (st) {
+          cls = st.done ? "done" : (st.recorded > 0 ? "partial" : "");
+          sub = `<small>${st.recorded}/${st.replicates}</small>`;
+        }
+        if (p.selected === i) cls += " selected";
+        return `<div class="pump-tile ${cls}" data-pump="${i}">
+          ${_pumpLabel(i)}${sub}</div>`;
+      }).join("");
+      let detail = `<p class="cal-hint">Select a pump tile to fire and record
+        masses. ${s.remaining.length} of ${s.pumps.length} pumps remaining ·
+        ${_fmt(s.fire_seconds, 0)} s fires × ${s.replicates} replicates ·
+        ${escapeHtml(s.fluid)} @ ${_fmt(s.fluid_density_g_ml, 4)} g/mL</p>`;
+      if (p.selected != null && per[String(p.selected)]) {
+        const st = per[String(p.selected)];
+        const repRows = [...Array(s.replicates).keys()].map(r => {
+          const mass = st.masses_g[r];
+          return `<div class="rep-row">
+            <span>Replicate ${r + 1}</span>
+            <input type="number" step="0.01" min="0" data-rep="${r}"
+                   value="${mass != null ? mass : ""}" placeholder="mass (g)">
+            <button class="btn" data-save-rep="${r}" type="button">Save</button>
+          </div>`;
+        }).join("");
+        detail += `<div class="pump-detail">
+          <strong>${_pumpLabel(p.selected)}</strong>
+          — vial ${p.selected % 16}, ${p.selected < 16 ? "influx" : "efflux"}
+          <div class="rep-row">
+            <button class="btn btn-primary" id="pc-fire-btn" type="button">
+              Fire ${_fmt(s.fire_seconds, 0)} s
+            </button>
+            <span class="cal-meta">fired ${st.fired}× ·
+              rate ${st.rate_ml_s != null ? _fmt(st.rate_ml_s, 3) + " mL/s" : "—"} ·
+              CV ${st.cv != null ? _fmt(100 * st.cv, 1) + "% (limit 5%)" : "—"}
+            </span>
+          </div>
+          ${repRows}
+        </div>`;
+      }
+      body.innerHTML = `
+        <div class="pump-cal-grid">${tiles}</div>
+        ${detail}
+        ${p.needOverride ? `
+          <div class="field-row">
+            <label class="field-label" for="pc-override">
+              QC failed — override reason (recorded in qc.overridden_by)
+            </label>
+            <input type="text" id="pc-override"
+                   placeholder="why these numbers are acceptable anyway">
+          </div>` : ""}
+        <div id="pc-qc-failures"></div>`;
+      body.querySelectorAll("[data-pump]").forEach(tile => {
+        tile.addEventListener("click", () => {
+          const i = Number(tile.dataset.pump);
+          if (!per[String(i)]) return;  // not part of this session
+          p.selected = i;
+          renderPumpCal();
+        });
+      });
+      const fireBtn = document.getElementById("pc-fire-btn");
+      if (fireBtn) {
+        fireBtn.addEventListener("click", async () => {
+          try {
+            await postJson("/api/calibration/pump/fire",
+                           { pump_id: p.selected });
+            showToast(`${_pumpLabel(p.selected)} firing for ` +
+                      `${_fmt(s.fire_seconds, 0)} s`, "ok");
+            await pumpCalRefreshSession();
+          } catch (err) { showToast(`Fire failed: ${err.message}`, "error"); }
+        });
+      }
+      body.querySelectorAll("[data-save-rep]").forEach(btn => {
+        btn.addEventListener("click", async () => {
+          const r = Number(btn.dataset.saveRep);
+          const input = body.querySelector(`input[data-rep="${r}"]`);
+          const mass = Number(input.value);
+          if (!(mass > 0)) { showToast("Enter the mass in grams.", "error"); return; }
+          try {
+            await postJson("/api/calibration/pump/record",
+                           { pump_id: p.selected, replicate: r, mass_g: mass });
+            await pumpCalRefreshSession();
+          } catch (err) { showToast(`Record failed: ${err.message}`, "error"); }
+        });
+      });
+    }
+
+    async function pumpCalRefreshSession() {
+      const p = calState.pump;
+      try {
+        const d = await (await fetch("/api/calibration/pump/session")).json();
+        p.session = d.active ? d : null;
+      } catch (_e) { /* keep the stale view */ }
+      renderPumpCal();
+    }
+
+    async function pumpCalFinish() {
+      const p = calState.pump;
+      if (!p.session) { showToast("No active session.", "warn"); return; }
+      const overrideEl = document.getElementById("pc-override");
+      const payload = { operator: "gui" };
+      if (overrideEl && overrideEl.value.trim()) {
+        payload.override_reason = overrideEl.value.trim();
+      }
+      try {
+        p.review = await postJson("/api/calibration/pump/finish", payload);
+        p.session = null;
+        showToast(`Pump calibration installed (${p.review.version})`, "ok");
+        renderPumpCal();
+        refreshCalibration();
+      } catch (err) {
+        if (err.code === "qc_refused") {
+          p.needOverride = true;
+          renderPumpCal();
+          const failEl = document.getElementById("pc-qc-failures");
+          if (failEl && err.data && err.data.qc) {
+            failEl.innerHTML = `<ul class="cal-reasons">${
+              err.data.qc.failures.map(f =>
+                `<li class="bad">✗ ${escapeHtml(f)}</li>`).join("")}</ul>`;
+          }
+          showToast("Calibration failed acceptance criteria — fix or override",
+                    "warn");
+        } else {
+          showToast(`Finish failed: ${err.message}`, "error");
+        }
+      }
+    }
+
+    async function pumpCalAbort() {
+      if (!calState.pump.session) { closePumpCalModal(); return; }
+      if (!confirm("Abort the pump calibration session? Recorded masses will " +
+                   "be discarded and no calibration file written.")) return;
+      try {
+        await postJson("/api/calibration/pump/abort", {});
+        calState.pump.session = null;
+        showToast("Pump calibration session aborted", "ok");
+        renderPumpCal();
+      } catch (err) { showToast(`Abort failed: ${err.message}`, "error"); }
+    }
+
+    // ------------------------------------------------------------
+    //  Post-run mass reconciliation
+    // ------------------------------------------------------------
+
+    const reconModal = document.getElementById("recon-modal");
+
+    async function openReconModal() {
+      reconModal.hidden = false;
+      requestAnimationFrame(() => reconModal.classList.add("open"));
+      document.getElementById("recon-result").innerHTML = "";
+      const sel = document.getElementById("recon-exp");
+      sel.innerHTML = "";
+      try {
+        const d = await (await fetch("/api/experiments")).json();
+        const list = (d.experiments || []).filter(e => e.status !== "running");
+        if (!list.length) {
+          sel.innerHTML = "<option value=''>No stopped experiments</option>";
+        } else {
+          for (const e of list) {
+            const o = document.createElement("option");
+            o.value = e.name;
+            o.textContent = `${e.name} (${e.status})`;
+            sel.appendChild(o);
+          }
+        }
+      } catch (_e) { sel.innerHTML = "<option value=''>—</option>"; }
+    }
+
+    function closeReconModal() {
+      reconModal.classList.remove("open");
+      setTimeout(() => {
+        if (!reconModal.classList.contains("open")) reconModal.hidden = true;
+      }, 160);
+    }
+
+    async function submitReconciliation() {
+      const name = document.getElementById("recon-exp").value;
+      if (!name) { showToast("Pick an experiment.", "error"); return; }
+      const num = (id) => {
+        const v = document.getElementById(id).value;
+        return v === "" ? null : Number(v);
+      };
+      const payload = { density_g_ml: num("recon-density"), operator: "gui" };
+      const pairs = [["media_start_g", "recon-media-start"],
+                     ["media_end_g", "recon-media-end"],
+                     ["waste_start_g", "recon-waste-start"],
+                     ["waste_end_g", "recon-waste-end"]];
+      for (const [key, id] of pairs) {
+        const v = num(id);
+        if (v != null) payload[key] = v;
+      }
+      try {
+        const r = await postJson(
+          `/api/experiments/${encodeURIComponent(name)}/reconcile`, payload);
+        const side = (label, s) => s == null ? "" : `<tr>
+          <td>${label}</td><td>${_fmt(s.inferred_ml, 1)}</td>
+          <td>${_fmt(s.measured_ml, 1)}</td>
+          <td class="${s.within_tolerance ? "" : "bad"}">
+            ${s.ratio != null ? _fmt(s.ratio, 3) : "—"}</td>
+          <td>${s.within_tolerance ? "✓" : "✗"}</td></tr>`;
+        document.getElementById("recon-result").innerHTML = `
+          <div class="blank-status ${r.within_tolerance ? "ok" : "wait"}">
+            ${r.within_tolerance
+              ? "Within ±10 % — the open-loop volume chain checks out."
+              : "OUTSIDE ±10 % — stale flow rates, an occluded line, or a " +
+                "slipping pump. The pump calibration is now flagged stale."}
+          </div>
+          <table class="cal-table">
+            <thead><tr><th></th><th>Inferred (mL)</th><th>Measured (mL)</th>
+            <th>Ratio</th><th>Pass</th></tr></thead>
+            <tbody>${side("Media", r.media)}${side("Waste", r.waste)}</tbody>
+          </table>`;
+        refreshCalibration();
+      } catch (err) {
+        showToast(`Reconcile failed: ${err.message}`, "error");
+      }
+    }
+
+    // ------------------------------------------------------------
+    //  Calibration UI wiring
+    // ------------------------------------------------------------
+
+    (function initCalibrationUI() {
+      document.getElementById("cal-banner-open")
+        .addEventListener("click", () => showView("cal"));
+      document.getElementById("cal-refresh")
+        .addEventListener("click", refreshCalibration);
+      document.getElementById("cal-open-blank")
+        .addEventListener("click", openBlankModal);
+      document.getElementById("cal-open-pump")
+        .addEventListener("click", openPumpCalModal);
+      document.getElementById("cal-open-recon")
+        .addEventListener("click", openReconModal);
+
+      document.getElementById("blank-modal-close")
+        .addEventListener("click", blankAbort);
+      document.getElementById("blank-abort")
+        .addEventListener("click", blankAbort);
+      document.getElementById("blank-back")
+        .addEventListener("click", () => {
+          const b = calState.blank;
+          if (b.step > 1) { b.step -= 1; renderBlank(); }
+        });
+      document.getElementById("blank-next")
+        .addEventListener("click", blankNext);
+
+      document.getElementById("pumpcal-modal-close")
+        .addEventListener("click", closePumpCalModal);
+      document.getElementById("pumpcal-close-btn")
+        .addEventListener("click", closePumpCalModal);
+      document.getElementById("pumpcal-abort")
+        .addEventListener("click", pumpCalAbort);
+      document.getElementById("pumpcal-finish")
+        .addEventListener("click", pumpCalFinish);
+
+      document.getElementById("recon-modal-close")
+        .addEventListener("click", closeReconModal);
+      document.getElementById("recon-cancel")
+        .addEventListener("click", closeReconModal);
+      document.getElementById("recon-submit")
+        .addEventListener("click", submitReconciliation);
+    })();
+
     // --- Socket.IO ---
     const socket = io({ transports: ["websocket", "polling"] });
     socket.on("connect", () => {
       setConnection("connected");
+      refreshEvents();
       if (!actuatorState.loaded) fetchActuatorState();
       refreshExperimentStatus();
+      refreshCalibration();
     });
     socket.on("disconnect", () => setConnection("disconnected"));
     socket.on("sensor_update", updateVials);
     socket.on("sensor_update", (msg) => { plotsOnSensorUpdate(msg); modalTrendsAppend(msg); });
     socket.on("experiment_event", plotsOnExperimentEvent);
     socket.on("alert", (msg) => {
-      const kind = msg.level === "critical" ? "error" : "ok";
+      // Three distinct levels. NEVER map an alert to "ok" -- that is the
+      // success colour, and it is what made warnings invisible (SPEC §20.4).
+      const kind = ALERT_TOAST_KIND[msg.level] || "warn";
       showToast(msg.message || "Alert", kind);
+      drawerIngest(msg);
     });
     socket.on("experiment_event", (msg) => {
       if (msg && msg.type === "pump" && typeof msg.vial === "number") {
@@ -4241,7 +6035,7 @@
         flashPump(msg.vial, msg.direction, msg.duration_seconds);
       }
       if (["created", "started", "stopped", "resumed", "error",
-           "maintenance_entered", "maintenance_exited",
+           "maintenance_entered", "maintenance_exited", "pump_suppressed",
            "escalation_proposed", "escalation_confirmed"].includes(msg && msg.type)) {
         // Reset pump count when a new experiment starts or the current one
         // ends so the displayed total reflects the active run.
@@ -4278,6 +6072,8 @@
     fetchActuatorState();
     refreshExperimentStatus();
     renderExpBar();
+    refreshEvents();
+    refreshCalibration();
   </script>
 </body>
 </html>

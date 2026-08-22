@@ -41,7 +41,10 @@ from typing import Any, Callable, Optional
 
 import numpy as np
 
-from control_modes.chemostat import ChemostatController
+from control_modes.chemostat import (
+    MIN_BOLUS_INTERVAL_SECONDS,
+    ChemostatController,
+)
 from control_modes.morbidostat import EscalationEvent, MorbidostatController
 from control_modes.turbidostat import PumpAction, TurbidostatController
 from data_export import filter_rows_by_hours
@@ -73,6 +76,7 @@ _VALID_BOTTLE_ID = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 
 
 N_VIALS = 16
+N_PUMPS = 32  # 16 influx + 16 efflux; canonical pump index (CLAUDE.md)
 STIR_MAX = 15
 DEFAULT_HEATER_OVERRUN_C = 5.0
 DEFAULT_HEATER_CRITICAL_C = 50.0
@@ -81,6 +85,14 @@ DEFAULT_SENSOR_FAILURE_THRESHOLD = 3
 DEFAULT_CYCLE_INTERVAL_SECONDS = 10.0
 PUMP_DURATION_HARD_CAP_SECONDS = 30.0  # engine-level safety cap (SPEC §10)
 DEFAULT_MAINTENANCE_TIMEOUT_MINUTES = 30.0  # auto-resume failsafe
+
+# Consumables safety interlock (SPEC §15). Reserve floors are generous
+# because the tracked volume is inferred (duration x flow_rate), not
+# measured, and drifts with pump wear/tubing compliance/calibration error.
+MEDIA_RESERVE_MIN_ML = 50.0
+MEDIA_RESERVE_FRACTION = 0.05
+WASTE_RESERVE_MIN_ML = 100.0
+WASTE_RESERVE_FRACTION = 0.05
 
 # Defaults if no per-vial pump_flow_rates supplied. Same constants used by
 # the mock; lifted here so the engine doesn't import the mock.
@@ -125,6 +137,18 @@ def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _media_reserve_ml(initial_volume_ml: float) -> float:
+    """SPEC §15: reserve floor below which influx from this bottle is
+    suppressed."""
+    return max(MEDIA_RESERVE_MIN_ML, MEDIA_RESERVE_FRACTION * initial_volume_ml)
+
+
+def _waste_reserve_ml(capacity_ml: float) -> float:
+    """SPEC §15: headroom above which all pumping is suppressed (an influx
+    without a matching efflux would overflow the vial)."""
+    return max(WASTE_RESERVE_MIN_ML, WASTE_RESERVE_FRACTION * capacity_ml)
+
+
 def _iso_now() -> str:
     return _now_utc().isoformat(timespec="seconds")
 
@@ -150,6 +174,199 @@ def _as_list_of_16(value: Any, *, default: float, name: str) -> list[float]:
             )
         return [float(v) for v in value]
     raise ValueError(f"'{name}' must be a number or a list of {N_VIALS} numbers")
+
+
+def _as_flow_rates_32(value: Any) -> list[float]:
+    """Coerce ``pump_flow_rates`` into the canonical flat-32 form (CLAUDE.md
+    "Pump command format": index 0..15 = influx pump for vial, 16..31 =
+    efflux pump for vial-16, i.e. index == the exponent in the hardware's
+    binary pump address).
+
+    Accepts, in order of increasing information:
+      - ``None``   → the hardcoded per-vial defaults, applied to both directions
+      - a scalar   → broadcast to all 32 pumps
+      - length 16  → each vial's rate applied to both its influx and efflux
+                     pump (the pre-O3 behaviour, and the correct initial state:
+                     the directions start equal until Tier 2 measures otherwise)
+      - length 32  → used as-is
+    """
+    if value is None:
+        value = list(DEFAULT_FLOW_RATES_ML_PER_SEC)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return [float(value)] * N_PUMPS
+    if isinstance(value, (list, tuple)):
+        if len(value) == N_VIALS:
+            per_vial = [float(v) for v in value]
+            return per_vial + per_vial
+        if len(value) == N_PUMPS:
+            return [float(v) for v in value]
+        raise ValueError(
+            f"'pump_flow_rates' list must have length {N_VIALS} (per vial, "
+            f"broadcast to both directions) or {N_PUMPS} (canonical pump "
+            f"index), got {len(value)}"
+        )
+    raise ValueError(
+        f"'pump_flow_rates' must be a number or a list of {N_VIALS} or "
+        f"{N_PUMPS} numbers"
+    )
+
+
+def validate_control_parameters(
+    mode: str,
+    parameters: dict,
+    flow_rates: list[float],
+    vials: list[int],
+) -> list[str]:
+    """Validate the control parameters for `mode` at experiment-creation
+    time (CONTROL_MODE_AUDIT.md C-3, and the precondition for T-3).
+
+    Raises ``ValueError`` for a configuration that cannot dilute at all --
+    the API maps that to HTTP 400. Returns a list of human-readable warnings
+    for configurations that *will* run but not deliver what was asked for.
+
+    Until this existed, ``create_experiment`` validated the mode name, the
+    OD acquisition block and the flow-rate array shape, but **no control
+    parameters at all**: a band too narrow to produce a fireable bolus, or a
+    bolus interval below the firmware's resolution, both started happily and
+    then delivered nothing for the length of the run.
+    """
+    warnings: list[str] = []
+    if not vials:
+        return warnings
+    volume_ml = float(parameters.get("volume_ml", DEFAULT_VOLUME_ML))
+    if volume_ml <= 0:
+        raise ValueError(f"'volume_ml' must be > 0, got {volume_ml}")
+    influx_rates = [flow_rates[v] for v in vials]
+
+    if mode in ("turbidostat", "morbidostat"):
+        if mode == "turbidostat":
+            od_lower = _as_list_of_16(
+                parameters.get("od_lower_thresh", parameters.get("od_lower", 0.2)),
+                default=0.2, name="od_lower_thresh",
+            )
+            od_upper = _as_list_of_16(
+                parameters.get("od_upper_thresh", parameters.get("od_upper", 0.4)),
+                default=0.4, name="od_upper_thresh",
+            )
+        else:
+            od_lower = _as_list_of_16(
+                parameters.get("od_lower", 0.2), default=0.2, name="od_lower",
+            )
+            od_upper = _as_list_of_16(
+                parameters.get("target_od", 0.4), default=0.4, name="target_od",
+            )
+        for vial in vials:
+            lo, hi = od_lower[vial], od_upper[vial]
+            if lo <= 0:
+                raise ValueError(f"vial {vial}: OD lower threshold must be > 0, got {lo}")
+            if hi <= lo:
+                raise ValueError(
+                    f"vial {vial}: OD upper threshold ({hi}) must be > lower ({lo})"
+                )
+            flow = flow_rates[vial]
+            # Smallest bolus the controller can ever be asked for: the one
+            # that takes OD from `hi` (where hysteresis flips the target)
+            # down to `lo`. The turbidostat truncates to whole seconds and
+            # carries nothing (T-3), so if even this is sub-second the vial
+            # never dilutes -- silently, exactly the legacy `%d` bug.
+            min_bolus_s = math.log(hi / lo) * volume_ml / flow
+            if min_bolus_s < 1.0:
+                widest = lo * math.exp(flow / volume_ml)
+                raise ValueError(
+                    f"vial {vial}: OD band [{lo:g}, {hi:g}] is too narrow to "
+                    f"dilute -- the largest bolus it can ever call for is "
+                    f"{min_bolus_s:.2f} s, and the 2016 firmware accepts whole "
+                    f"seconds only, so nothing would ever fire. With "
+                    f"volume_ml={volume_ml:g} and this vial's influx rate "
+                    f"{flow:g} mL/s the upper threshold must be at least "
+                    f"{widest:.3f}"
+                )
+            if min_bolus_s < 2.0:
+                warnings.append(
+                    f"vial {vial}: OD band [{lo:g}, {hi:g}] gives a "
+                    f"{min_bolus_s:.2f} s bolus; whole-second truncation "
+                    f"discards up to "
+                    f"{100.0 * (min_bolus_s - int(min_bolus_s)) / min_bolus_s:.0f}% "
+                    "of each dilution. Widen the band for finer control."
+                )
+
+    elif mode == "chemostat":
+        dilution_rate = float(parameters.get("dilution_rate_per_hour", 0.5))
+        if dilution_rate <= 0:
+            raise ValueError(
+                f"'dilution_rate_per_hour' must be > 0, got {dilution_rate}"
+            )
+        bolus_interval = parameters.get("bolus_interval_seconds")
+        if bolus_interval is None:
+            bolus_interval = DEFAULT_CYCLE_INTERVAL_SECONDS
+        bolus_interval = float(bolus_interval)
+        if bolus_interval < MIN_BOLUS_INTERVAL_SECONDS:
+            raise ValueError(
+                f"'bolus_interval_seconds' must be >= "
+                f"{MIN_BOLUS_INTERVAL_SECONDS} s, got {bolus_interval}: the "
+                "per-bolus duration is capped at bolus_interval - 1 s so "
+                "consecutive boli cannot overlap, and below 2 s that cap falls "
+                "under the firmware's 1 s resolution -- the run would deliver "
+                "no media at all while booking the full requested volume"
+            )
+        safety_cap = min(20.0, max(bolus_interval - 1.0, 0.1))
+        for vial in vials:
+            flow = flow_rates[vial]
+            needed_s = dilution_rate * volume_ml * bolus_interval / 3600.0 / flow
+            if needed_s > safety_cap:
+                achievable_d = safety_cap * flow * 3600.0 / (volume_ml * bolus_interval)
+                warnings.append(
+                    f"vial {vial}: D={dilution_rate:g}/h needs {needed_s:.1f} s "
+                    f"per bolus but the safety cap is {safety_cap:.1f} s -- every "
+                    f"bolus will be clipped and the delivered rate will be about "
+                    f"{achievable_d:.2f}/h. Lengthen bolus_interval_seconds or "
+                    "lower the dilution rate."
+                )
+        start_od = parameters.get("start_od")
+        if start_od is not None and float(start_od) <= 0:
+            raise ValueError(f"'start_od' must be > 0 when given, got {start_od}")
+        start_after = parameters.get("start_after_seconds")
+        if start_after is not None and float(start_after) < 0:
+            raise ValueError(
+                f"'start_after_seconds' must be >= 0 when given, got {start_after}"
+            )
+
+    if float(parameters.get("efflux_extra_seconds", DEFAULT_EFFLUX_EXTRA_SECONDS)) <= 0:
+        warnings.append(
+            "efflux_extra_seconds is 0: vial volume is not pinned by the efflux "
+            "straw, so level drifts with influx/efflux flow mismatch and no "
+            "sensor can detect it (SPEC.md §16.2)."
+        )
+    if min(influx_rates) <= 0:
+        raise ValueError("every active vial needs a positive influx flow rate")
+    return warnings
+
+
+def compute_pump_quantization(volume_ml: float, flow_rate_ml_s: float) -> dict:
+    """SPEC §16: the 2016 firmware accepts whole seconds only, so a
+    requested mL dose quantises to ``floor(volume_ml / flow_rate)`` seconds.
+
+    Returns ``{"seconds": int, "deliverable_ml": float, "min_ml": float,
+    "quantised": bool}``. ``min_ml`` is the smallest non-zero dose this
+    vial/direction can deliver (one whole second); the caller is
+    responsible for rejecting requests where ``seconds == 0`` rather than
+    silently firing nothing -- that silent-truncation failure mode is the
+    legacy `%d` bug documented in SPEC §9."""
+    if flow_rate_ml_s <= 0:
+        raise ValueError(f"flow_rate_ml_s must be positive, got {flow_rate_ml_s}")
+    if volume_ml < 0:
+        raise ValueError(f"volume_ml must be >= 0, got {volume_ml}")
+    raw_seconds = volume_ml / flow_rate_ml_s
+    # Epsilon nudge so an exact multiple isn't floored down by fp noise
+    # (e.g. 5.0 / 1.0000000000000002 landing at 4.999999999999999).
+    seconds = int(math.floor(raw_seconds + 1e-9))
+    deliverable_ml = seconds * flow_rate_ml_s
+    return {
+        "seconds": seconds,
+        "deliverable_ml": deliverable_ml,
+        "min_ml": flow_rate_ml_s,
+        "quantised": abs(deliverable_ml - volume_ml) > 1e-9,
+    }
 
 
 def _parse_od_acquisition(parameters: dict) -> dict:
@@ -339,14 +556,24 @@ class ExperimentEngine:
         self._vial_to_bottle: dict[int, str] = {}     # vial -> bottle id
         self._bottle_consumed_ml: dict[str, float] = {}
         self._bottle_alerted_low: dict[str, bool] = {}
+        # Consumables interlock (SPEC §15) — one-shot critical-alert latches,
+        # distinct from the low/high warning latches above (different
+        # thresholds: low_volume_alert_ml/high_fill_alert_ml are a
+        # user-configurable heads-up, reserve_ml is the hard-stop floor).
+        self._bottle_alerted_blocked: dict[str, bool] = {}
         self._waste_config: Optional[dict] = None
         self._waste_filled_ml: float = 0.0
         self._waste_alerted_high: bool = False
+        self._waste_alerted_blocked: bool = False
 
         # Maintenance mode (pauses pump execution; coalesces decisions per
         # vial so we don't over-dilute on resume). Cleared on stop.
         self._maintenance_active: bool = False
         self._maintenance_entered_at: Optional[datetime] = None
+        # "manual" (user-requested) or "consumables" (auto-entered by the
+        # interlock when every active vial is blocked). Consumables-reason
+        # maintenance is exempt from the 30 min auto-resume failsafe.
+        self._maintenance_reason: Optional[str] = None
         # vial -> (PumpAction, ts_iso captured at decide time)
         self._pending_pump_actions: dict[int, tuple[PumpAction, str]] = {}
 
@@ -421,7 +648,25 @@ class ExperimentEngine:
 
         # Validate the optional od_acquisition block up front so a malformed
         # config fails at create time (HTTP 400) rather than at first read.
-        _parse_od_acquisition(parameters or {})
+        od_acq = _parse_od_acquisition(parameters or {})
+        # Dark-subtraction coherence guard (SPEC §19.2 / CALIBRATION_PROTOCOL
+        # §13): a curve fit on non-dark-subtracted signal gives silently wrong
+        # OD when the reader subtracts the dark first. Hard error, not a
+        # warning — the sidecar (OD_cal.meta.json) is the only thing that may
+        # authorise it.
+        if od_acq["dark_subtract"] and not getattr(
+            self._manager, "od_cal_dark_subtracted", False
+        ):
+            raise ValueError(
+                "od_acquisition.dark_subtract=true requires an OD calibration "
+                "whose OD_cal.meta.json sidecar records dark_subtracted=true; "
+                "the loaded calibration was fit on non-dark-subtracted signal "
+                "(see CALIBRATION_PROTOCOL.md §5.4)"
+            )
+
+        # Validate pump_flow_rates shape up front so a malformed array fails
+        # at create time (HTTP 400), not at start_experiment.
+        flow_rates = self._resolve_flow_rates(parameters or {}, calibration or {})
 
         normalized_media: Optional[dict] = None
         if media is not None:
@@ -438,6 +683,16 @@ class ExperimentEngine:
 
         if vials is None or len(vials) == 0:
             raise ValueError("'vials' must be a non-empty list (or supply 'media')")
+
+        # Control parameters, now that the vial list is settled. Hard errors
+        # (a band that cannot dilute, a sub-2 s bolus interval) become HTTP
+        # 400; the warnings are returned to the caller and raised as alerts
+        # so they land in the run's event log rather than only in a response
+        # body someone may not read.
+        control_warnings = validate_control_parameters(
+            mode, parameters or {}, flow_rates,
+            sorted(int(v) for v in vials),
+        )
 
         with self._lock:
             self._assert_status(ExperimentStatus.IDLE, ExperimentStatus.STOPPED, ExperimentStatus.ERROR)
@@ -481,7 +736,16 @@ class ExperimentEngine:
             self._save_state_locked()
 
         self._broadcast_event({"type": "created", "name": name, "vials": self._vials})
+        for warning in control_warnings:
+            log.warning("experiment '%s': %s", name, warning)
+            self._broadcast_alert(
+                level="warning",
+                message=f"'{name}' control parameters: {warning}",
+                category="lifecycle",
+            )
         log.info("experiment '%s' created (vials=%s)", name, self._vials)
+        config = dict(config)
+        config["warnings"] = control_warnings
         return config
 
     def start_experiment(self, name: Optional[str] = None) -> dict:
@@ -519,8 +783,32 @@ class ExperimentEngine:
             self._status = ExperimentStatus.RUNNING
             self._save_state_locked()
             cfg = dict(self._config)
+            efflux_extra = float(
+                params.get("efflux_extra_seconds", DEFAULT_EFFLUX_EXTRA_SECONDS)
+            )
 
         self._broadcast_event({"type": "started", "name": cfg["name"], "vials": self._vials})
+        # X-1 (CONTROL_MODE_AUDIT.md / SPEC §16.2): efflux overrun is what
+        # engages the ONLY volume-regulation loop this machine has -- the
+        # efflux straw draws air once the level reaches its tip, pinning
+        # working volume to the straw height on every dilution. At 0.0 that
+        # loop is disengaged and the level becomes an open-loop integral of
+        # influx/efflux flow mismatch, which no software can observe because
+        # there is no level sensor. Whether 0.0 is right is a bench question
+        # (see SPEC §16.2); making the run start silently is not.
+        if efflux_extra <= 0.0:
+            self._broadcast_alert(
+                level="warning",
+                message=(
+                    "efflux_extra_seconds is 0 -- vial volume regulation is "
+                    "DISENGAGED. Working volume is not pinned by the efflux "
+                    "straw, so level drifts with influx/efflux flow mismatch "
+                    "and there is no level sensor to catch it. See SPEC.md "
+                    "§16.2 before running unattended."
+                ),
+                category="pump",
+                dedup_key="efflux_overrun_disabled",
+            )
         log.info("experiment '%s' started", cfg["name"])
         return cfg
 
@@ -697,6 +985,30 @@ class ExperimentEngine:
         log.info("experiment '%s' metadata updated (%s)", name, list(partial))
         return merged
 
+    def record_calibration_provenance(self, name: str, partial: dict) -> dict:
+        """Deep-merge keys into an experiment's ``config.json`` ``calibration``
+        block (SPEC §19.1 provenance: subsystem versions, per-run blank path,
+        measured ``pump_flow_rates``) and refresh the in-memory config when
+        ``name`` is loaded, so a blank committed against a CREATED experiment
+        is visible to :meth:`start_experiment` without a reload.
+
+        Raises ``ValueError`` on a non-dict partial;
+        ``FileNotFoundError`` from the DataLogger when config.json is missing.
+        """
+        if not isinstance(partial, dict) or not partial:
+            raise ValueError("calibration provenance must be a non-empty object")
+        merged = self._data_logger.update_experiment_config(
+            name, {"calibration": partial}
+        )
+        with self._lock:
+            if self._name == name and self._config is not None:
+                self._config = merged
+        log.info(
+            "experiment '%s' calibration provenance updated (%s)",
+            name, list(partial),
+        )
+        return merged
+
     def handle_emergency_stop(self) -> None:
         """Called by `api_emergency_stop` after `manager.emergency_shutdown()`
         has already zeroed everything: broadcast a critical alert, then
@@ -714,6 +1026,7 @@ class ExperimentEngine:
         self._broadcast_alert(
             level="critical",
             message=f"Experiment '{name}' stopped by emergency stop",
+            category="lifecycle",
         )
         # stop_experiment is idempotent and re-entrant under the RLock.
         self.stop_experiment(reason="emergency_stop")
@@ -737,35 +1050,61 @@ class ExperimentEngine:
         with self._lock:
             return self._maintenance_active
 
-    def enter_maintenance(self) -> dict:
+    def enter_maintenance(self, reason: str = "manual") -> dict:
         """Enter maintenance mode. Subsequent run_cycle calls queue pump
         actions instead of returning them for execution. Idempotent — a
-        no-op when already active. Allowed only while RUNNING."""
+        no-op when already active. Allowed only while RUNNING.
+
+        ``reason`` distinguishes a manually-requested pause ("manual", the
+        default) from an automatic one raised by the consumables interlock
+        ("consumables") when every active vial is blocked. Consumables-reason
+        maintenance is exempt from the 30 min auto-resume failsafe (see
+        check_maintenance_timeout) — auto-resuming into a still-empty bottle
+        would defeat SPEC §15's "clears only on refill_media" requirement."""
         with self._lock:
             if self._status != ExperimentStatus.RUNNING:
                 raise InvalidExperimentStateError(
                     f"maintenance mode is only allowed while RUNNING; "
                     f"current status={self._status}"
                 )
-            if self._maintenance_active:
-                return self._maintenance_status_locked()
-            self._maintenance_active = True
-            self._maintenance_entered_at = _now_utc()
-            self._pending_pump_actions = {}
-            self._save_state_locked()
-            status = self._maintenance_status_locked()
+            return self._enter_maintenance_locked(reason)
+
+    def _enter_maintenance_locked(self, reason: str = "manual") -> dict:
+        if self._maintenance_active:
+            return self._maintenance_status_locked()
+        self._maintenance_active = True
+        self._maintenance_entered_at = _now_utc()
+        self._maintenance_reason = reason
+        self._pending_pump_actions = {}
+        self._save_state_locked()
+        status = self._maintenance_status_locked()
         self._broadcast_event({
             "type": "maintenance_entered",
             "name": self._name,
+            "reason": reason,
         })
-        self._broadcast_alert(
-            level="warning",
-            message=(
-                "Maintenance mode — pumps suppressed. "
-                f"Auto-resume in {self._maintenance_timeout_seconds / 60:.0f} min."
-            ),
+        if reason == "consumables":
+            self._broadcast_alert(
+                level="critical",
+                message=(
+                    "Maintenance mode — pumps suppressed (consumables "
+                    "blocked). Refill required; will not auto-resume."
+                ),
+                category="maintenance",
+            )
+        else:
+            self._broadcast_alert(
+                level="warning",
+                message=(
+                    "Maintenance mode — pumps suppressed. "
+                    f"Auto-resume in {self._maintenance_timeout_seconds / 60:.0f} min."
+                ),
+                category="maintenance",
+            )
+        log.warning(
+            "maintenance mode entered for experiment '%s' (reason=%s)",
+            self._name, reason,
         )
-        log.warning("maintenance mode entered for experiment '%s'", self._name)
         return status
 
     def exit_maintenance(
@@ -783,6 +1122,7 @@ class ExperimentEngine:
             ]
             self._maintenance_active = False
             self._maintenance_entered_at = None
+            self._maintenance_reason = None
             self._pending_pump_actions = {}
             self._save_state_locked()
         self._broadcast_event({
@@ -807,6 +1147,10 @@ class ExperimentEngine:
         with self._lock:
             if not self._maintenance_active or self._maintenance_entered_at is None:
                 return None
+            if self._maintenance_reason == "consumables":
+                # Sticky by design (SPEC §15) — only refill_media clears
+                # this, never a timer.
+                return None
             elapsed = (_now_utc() - self._maintenance_entered_at).total_seconds()
             if elapsed < self._maintenance_timeout_seconds:
                 return None
@@ -818,6 +1162,7 @@ class ExperimentEngine:
                 f"{self._maintenance_timeout_seconds / 60:.0f} min — "
                 "experiment was at risk of stalling"
             ),
+            category="maintenance",
         )
         return self.exit_maintenance(reason="auto_timeout")
 
@@ -833,9 +1178,9 @@ class ExperimentEngine:
         alert latches when levels are restored below their thresholds.
         Returns the updated media status."""
         with self._lock:
-            if not self._maintenance_active:
+            if self._status != ExperimentStatus.RUNNING:
                 raise InvalidExperimentStateError(
-                    "refill is only allowed during maintenance mode"
+                    "refill is only allowed while the experiment is RUNNING"
                 )
             if bottles:
                 for bid, remaining_ml in bottles.items():
@@ -854,10 +1199,11 @@ class ExperimentEngine:
                             f"exceeds initial volume ({initial})"
                         )
                     self._bottle_consumed_ml[bid] = initial - float(remaining_ml)
-                    # Clear the low-volume latch so the next genuine crossing
-                    # re-alerts (otherwise the alert would stay silent forever
-                    # after a refill).
+                    # Clear the low-volume and interlock-blocked latches so
+                    # the next genuine crossing re-alerts (otherwise the
+                    # alert would stay silent forever after a refill).
                     self._bottle_alerted_low[bid] = False
+                    self._bottle_alerted_blocked[bid] = False
             if waste_filled_ml is not None:
                 if self._waste_config is None:
                     raise ValueError("experiment has no waste container configured")
@@ -872,10 +1218,20 @@ class ExperimentEngine:
                     )
                 self._waste_filled_ml = float(waste_filled_ml)
                 self._waste_alerted_high = False
+                self._waste_alerted_blocked = False
             self._save_state_locked()
             media = self._media_status_locked()
         log.info("media refilled during maintenance: bottles=%s waste=%s",
                  bottles, waste_filled_ml)
+        # SPEC §20.2 lists refills among the events a run must record -- without
+        # this, a bottle change is invisible in the lab-notebook artefact even
+        # though it resets the consumption baseline.
+        self._broadcast_event({
+            "type": "refill",
+            "name": self._name,
+            "bottles": dict(bottles or {}),
+            "waste_filled_ml": waste_filled_ml,
+        })
         return {"media": media}
 
     def _maintenance_status_locked(self) -> dict:
@@ -885,21 +1241,32 @@ class ExperimentEngine:
         if not self._maintenance_active or self._maintenance_entered_at is None:
             return {
                 "active": False,
+                "reason": None,
                 "entered_at": None,
                 "auto_resume_at": None,
                 "auto_resume_in_seconds": None,
                 "queued_pump_count": 0,
             }
         entered = self._maintenance_entered_at
-        auto_at = entered.timestamp() + self._maintenance_timeout_seconds
-        remaining = auto_at - _now_utc().timestamp()
+        # Consumables-triggered maintenance has no auto-resume (SPEC §15
+        # sticky requirement) -- report no countdown rather than a
+        # misleading one that will never fire.
+        if self._maintenance_reason == "consumables":
+            auto_resume_at = None
+            auto_resume_in_seconds = None
+        else:
+            auto_at = entered.timestamp() + self._maintenance_timeout_seconds
+            remaining = auto_at - _now_utc().timestamp()
+            auto_resume_at = datetime.fromtimestamp(
+                auto_at, tz=timezone.utc
+            ).isoformat(timespec="seconds")
+            auto_resume_in_seconds = max(0.0, round(remaining, 1))
         return {
             "active": True,
+            "reason": self._maintenance_reason,
             "entered_at": entered.isoformat(timespec="seconds"),
-            "auto_resume_at": datetime.fromtimestamp(
-                auto_at, tz=timezone.utc
-            ).isoformat(timespec="seconds"),
-            "auto_resume_in_seconds": max(0.0, round(remaining, 1)),
+            "auto_resume_at": auto_resume_at,
+            "auto_resume_in_seconds": auto_resume_in_seconds,
             "queued_pump_count": len(self._pending_pump_actions),
         }
 
@@ -978,7 +1345,10 @@ class ExperimentEngine:
                             "calibration; continuing -- heater unaffected)"
                         )
                         log.warning(_msg)
-                        self._broadcast_alert(level="warning", message=_msg, vial=vial)
+                        self._broadcast_alert(
+                            level="warning", message=_msg, vial=vial,
+                            category="sensor",
+                        )
                 else:
                     self._od_range_streak[vial] = 0
 
@@ -998,28 +1368,48 @@ class ExperimentEngine:
                             "heater unaffected)"
                         )
                         log.warning(_msg)
-                        self._broadcast_alert(level="warning", message=_msg, vial=vial)
-                    continue
-                self._nan_streak[vial] = 0
+                        self._broadcast_alert(
+                            level="warning", message=_msg, vial=vial,
+                            category="sensor",
+                        )
+                else:
+                    self._nan_streak[vial] = 0
 
-                # (2) heater safety (temperature is valid here)
-                self._handle_heater_safety_locked(vial, float(temp_c))
-                if self._vial_faults.get(vial) is not None:
-                    continue
+                # (2) heater safety. Needs a real temperature, so it is
+                # skipped -- and only it is skipped -- on a dropped temp
+                # read. The Arduino closes the heater loop on its own
+                # thermistor regardless of whether the Pi got this sample.
+                if not temp_nan:
+                    self._handle_heater_safety_locked(vial, float(temp_c))
+                    if self._vial_faults.get(vial) is not None:
+                        continue
 
-                # (3) push OD, (4) decide. Skip OD control when OD is invalid
-                # (out-of-range with otherwise-valid temperature lands here).
-                if od_nan:
-                    continue
+                # (3) push OD, (4) decide.
+                #
+                # CONTROL_MODE_AUDIT.md C-2: the sensor-validity gate is
+                # SEPARATE from the control gate. This block used to
+                # `continue` out of the whole vial on any dropped read, which
+                # stopped an open-loop chemostat from diluting whenever OD was
+                # unavailable -- and the `out_of_range` case is the sharpest,
+                # because it means the culture is DENSER than the calibration
+                # covers, i.e. exactly when dilution must not stop. Measured
+                # cost: -29 % D at 30 % dropped samples, -100 % on a dead or
+                # saturated sensor. A mode declares its own dependency via
+                # `requires_od`; only modes that genuinely close the loop on
+                # OD are suspended.
                 controller = self._controllers.get(vial)
                 if controller is None:
                     continue
-                # MorbidostatController needs the timestamp for its
-                # growth-rate fit; others take only the OD.
-                if isinstance(controller, MorbidostatController):
-                    controller.push_od(now=now, od=float(od))
+                if od_nan:
+                    if getattr(controller, "requires_od", True):
+                        continue
                 else:
-                    controller.push_od(float(od))
+                    # MorbidostatController needs the timestamp for its
+                    # growth-rate fit; others take only the OD.
+                    if isinstance(controller, MorbidostatController):
+                        controller.push_od(now=now, od=float(od))
+                    else:
+                        controller.push_od(float(od))
                 action = controller.decide(now)
                 if action is not None:
                     # Engine-level hard cap (SPEC §10 confirmation rule,
@@ -1037,6 +1427,42 @@ class ExperimentEngine:
             # and reminder-due flags. Emitted as experiment_event + alert,
             # and logged to escalation_log.csv for provenance.
             self._broadcast_morbidostat_events_locked(now, timestamp_iso)
+
+            # (4a1) Drain one-shot controller events (chemostat start gate,
+            # bolus cap clipping). Controllers stay pure -- they record, the
+            # engine funnels. Per CLAUDE.md fact 3 everything goes through
+            # _broadcast_alert / _broadcast_event, never a bare emit.
+            self._broadcast_controller_events_locked()
+
+            # (4a2) Consumables safety interlock (SPEC §15). Runs BEFORE
+            # debit so a suppressed pump is never counted as consumed/wasted
+            # volume. A low-media bottle suppresses the WHOLE dilution event
+            # for its vials (influx + efflux together) -- suppressing influx
+            # alone while efflux keeps running would reproduce the exact
+            # vial-drain bug this gate exists to prevent. A full waste
+            # container suppresses every vial's pump action, since an influx
+            # without a matching efflux overflows the vial.
+            if self._media_bottles:
+                allowed: list[tuple[int, PumpAction]] = []
+                suppressed: list[tuple[int, PumpAction, str]] = []
+                for vial, action in pump_actions:
+                    reason = self._vial_consumables_blocked_locked(vial)
+                    if reason is None:
+                        allowed.append((vial, action))
+                    else:
+                        suppressed.append((vial, action, reason))
+                pump_actions = allowed
+                if suppressed:
+                    self._handle_suppressed_pumps_locked(suppressed)
+                if (
+                    not self._maintenance_active
+                    and self._vials
+                    and all(
+                        self._vial_consumables_blocked_locked(v) is not None
+                        for v in self._vials
+                    )
+                ):
+                    self._enter_maintenance_locked(reason="consumables")
 
             # (4b) debit media consumption + waste accumulation and
             # edge-trigger threshold alerts. Bookkeeping is optimistic
@@ -1108,12 +1534,29 @@ class ExperimentEngine:
                     avg = c.last_od
                     if c.last_bolus_time is not None:
                         age = now - c.last_bolus_time
+                # SPEC §20.3 DEGRADED: these streaks have been tracked since
+                # b9b135a but never surfaced, so a single failing sleeve was
+                # only visible by reading the journal.
+                nan_streak = self._nan_streak.get(vial, 0)
+                od_range_streak = self._od_range_streak.get(vial, 0)
+                if nan_streak >= self._sensor_failure_threshold:
+                    sensor_health = "degraded"
+                elif od_range_streak >= self._sensor_failure_threshold:
+                    sensor_health = "out_of_range"
+                elif nan_streak > 0:
+                    sensor_health = "lossy"
+                else:
+                    sensor_health = "ok"
                 per_vial[str(vial)] = {
                     "target": target,
                     "avg_od": avg,
                     "last_pump_age_s": (None if math.isinf(age) else age),
                     "fault": self._vial_faults.get(vial),
                     "setpoint_raw": self._setpoint_raw.get(vial, HEATER_OFF_SETPOINT),
+                    "consumables_blocked": self._vial_consumables_blocked_locked(vial),
+                    "nan_streak": nan_streak,
+                    "od_range_streak": od_range_streak,
+                    "sensor_health": sensor_health,
                 }
             return {
                 "name": self._name,
@@ -1162,6 +1605,19 @@ class ExperimentEngine:
         no media config is loaded."""
         if not self._media_bottles:
             return None
+        # SPEC §15 accuracy caveat: label the whole estimate calibrated/
+        # uncalibrated depending on whether this run's resolved flow rates
+        # are the hardcoded defaults or measured values. This is a stopgap
+        # until Session O1 builds real calibration provenance tracking.
+        flow_rates = self._resolve_flow_rates(
+            (self._config or {}).get("parameters", {}),
+            (self._config or {}).get("calibration", {}),
+        )
+        estimate_quality = (
+            "uncalibrated"
+            if flow_rates == _as_flow_rates_32(None)
+            else "calibrated"
+        )
         bottles: list[dict] = []
         for bid, b in self._media_bottles.items():
             initial = float(b["initial_volume_ml"])
@@ -1178,6 +1634,9 @@ class ExperimentEngine:
                 "remaining_pct": round(pct, 2),
                 "low_volume_alert_ml": b["low_volume_alert_ml"],
                 "alerted_low": bool(self._bottle_alerted_low.get(bid, False)),
+                "reserve_ml": round(_media_reserve_ml(initial), 3),
+                "blocked": self._bottle_blocked_locked(bid),
+                "estimate_quality": estimate_quality,
             })
         waste: Optional[dict] = None
         if self._waste_config is not None:
@@ -1193,6 +1652,9 @@ class ExperimentEngine:
                 "filled_pct": round(filled_pct, 2),
                 "high_fill_alert_ml": self._waste_config["high_fill_alert_ml"],
                 "alerted_high": bool(self._waste_alerted_high),
+                "reserve_ml": round(_waste_reserve_ml(cap), 3),
+                "blocked": self._waste_blocked_locked(),
+                "estimate_quality": estimate_quality,
             }
         return {
             "bottles": bottles,
@@ -1388,9 +1850,16 @@ class ExperimentEngine:
             controller = self._controllers.get(vial)
             if controller is None:
                 continue
-            flow_ml_s = controller.flow_rate_ml_s
-            influx_ml = action.pump_time * flow_ml_s
-            efflux_ml = (action.pump_time + action.efflux_extra_seconds) * flow_ml_s
+            influx_ml = action.pump_time * controller.flow_rate_influx_ml_s
+            # TODO(SPEC §16.2): waste accumulation still uses the influx rate.
+            # Deliberate: with efflux overrun engaged the physically correct
+            # model is `waste += influx_ml` (volume pinned by the straw), and
+            # without overrun no software model is right. Do NOT swap in the
+            # efflux rate here until the overrun decision is made.
+            efflux_ml = (
+                (action.pump_time + action.efflux_extra_seconds)
+                * controller.flow_rate_influx_ml_s
+            )
             self._bottle_consumed_ml[bottle_id] = (
                 self._bottle_consumed_ml.get(bottle_id, 0.0) + influx_ml
             )
@@ -1398,6 +1867,82 @@ class ExperimentEngine:
 
             self._check_bottle_threshold_locked(bottle_id)
         self._check_waste_threshold_locked()
+
+    def record_manual_pump(self, vial: int, direction: str, delivered_ml: float) -> None:
+        """Debit media/waste for a manual (UI-fired) pump command, mirroring
+        `_debit_media_locked`'s accounting (SPEC §16). A no-op unless `vial`
+        has a bottle mapping from the loaded experiment's media config --
+        true for the common case of pumping a vial with no experiment at
+        all, and for vials belonging to a RUNNING experiment (which are
+        locked out of manual control before this is ever called -- see
+        `_experiment_locks_vial` in app.py). It IS reachable for a
+        STOPPED experiment's vials: media is loaded at start_experiment
+        (`_load_media_locked`) and `_vial_to_bottle` stays populated after
+        stop -- only the next create_experiment clears it.
+
+        Deliberately does not apply the Session K consumables interlock --
+        that gate runs in `run_cycle`'s automatic dispatch path only. A
+        manual pump on an empty bottle still fires; only the accounting is
+        handled here."""
+        with self._lock:
+            bottle_id = self._vial_to_bottle.get(vial)
+            if bottle_id is None:
+                return
+            if direction == "influx":
+                self._bottle_consumed_ml[bottle_id] = (
+                    self._bottle_consumed_ml.get(bottle_id, 0.0) + delivered_ml
+                )
+                self._check_bottle_threshold_locked(bottle_id)
+            else:
+                self._waste_filled_ml += delivered_ml
+                self._check_waste_threshold_locked()
+            self._save_state_locked()
+
+    def _broadcast_controller_events_locked(self) -> None:
+        """Surface the one-shot events any controller exposes via
+        ``pop_events()`` (currently the chemostat's start gate and its
+        duration-cap clipping). Unknown event types are logged rather than
+        dropped, so a new controller event can never go silently missing."""
+        for vial, controller in self._controllers.items():
+            pop = getattr(controller, "pop_events", None)
+            if pop is None:
+                continue
+            try:
+                events = pop()
+            except Exception:
+                log.exception("pop_events failed for vial %d", vial)
+                continue
+            for event in events:
+                etype = event.get("type")
+                if etype == "start_gate_released":
+                    msg = (
+                        f"Vial {vial}: chemostat start gate released, dilution "
+                        f"begins ({event.get('reason')})"
+                    )
+                    level = "info"
+                    category = "lifecycle"
+                    dedup = None  # one-shot by construction
+                elif etype == "bolus_cap_clipped":
+                    msg = (
+                        f"Vial {vial}: chemostat bolus clipped from "
+                        f"{event.get('requested_seconds', 0.0):.1f} s to the "
+                        f"{event.get('capped_seconds', 0.0):.1f} s safety cap -- "
+                        "the requested dilution rate is not reachable with this "
+                        "bolus_interval and flow rate"
+                    )
+                    level = "warning"
+                    category = "pump"
+                    dedup = ("bolus_cap_clipped", vial)
+                else:
+                    log.warning(
+                        "unhandled controller event %r from vial %d", etype, vial
+                    )
+                    continue
+                self._broadcast_event({**event, "vial": vial})
+                self._broadcast_alert(
+                    level=level, message=msg, vial=vial, category=category,
+                    dedup_key=dedup,
+                )
 
     def _broadcast_morbidostat_events_locked(
         self, now: float, timestamp_iso: str,
@@ -1426,6 +1971,7 @@ class ExperimentEngine:
                         f"(growth {pending.growth_rate:.2f}/hr "
                         "exceeds threshold)"
                     ),
+                    category="escalation",
                 )
                 try:
                     self._data_logger.log_escalation_event(
@@ -1443,6 +1989,7 @@ class ExperimentEngine:
                     level="warning",
                     vial=vial,
                     message=f"Vial {vial} escalation still pending confirmation",
+                    category="escalation",
                 )
 
     def confirm_escalation(
@@ -1547,6 +2094,84 @@ class ExperimentEngine:
                     result.append(vial)
             return sorted(result)
 
+    # ------------------------------------------------------------------
+    # Consumables safety interlock (SPEC §15, must hold self._lock)
+    # ------------------------------------------------------------------
+
+    def _bottle_blocked_locked(self, bottle_id: str) -> bool:
+        b = self._media_bottles.get(bottle_id)
+        if b is None:
+            return False
+        initial = b["initial_volume_ml"]
+        consumed = self._bottle_consumed_ml.get(bottle_id, 0.0)
+        remaining = initial - consumed
+        return remaining <= _media_reserve_ml(initial)
+
+    def _waste_blocked_locked(self) -> bool:
+        if self._waste_config is None:
+            return False
+        cap = self._waste_config["capacity_ml"]
+        return self._waste_filled_ml >= cap - _waste_reserve_ml(cap)
+
+    def _vial_consumables_blocked_locked(self, vial: int) -> Optional[str]:
+        """None, or "waste_full" / "media_empty" -- the reason this vial's
+        pump actions are currently suppressed by the consumables interlock.
+        Stateless by design: it is recomputed from already-persisted volume
+        totals every call, so the block is sticky for free -- nothing but
+        refill_media changes those totals once pumping is suppressed."""
+        if self._waste_blocked_locked():
+            return "waste_full"
+        bottle_id = self._vial_to_bottle.get(vial)
+        if bottle_id is not None and self._bottle_blocked_locked(bottle_id):
+            return "media_empty"
+        return None
+
+    def _handle_suppressed_pumps_locked(
+        self, suppressed: list[tuple[int, PumpAction, str]]
+    ) -> None:
+        """Alert + log the vials whose pump actions the interlock dropped
+        this cycle. Alerts are edge-triggered (one-shot per bottle, or once
+        for waste) so a persistently-blocked vial doesn't re-alert every
+        10 s cycle -- the latches are cleared by refill_media."""
+        if any(reason == "waste_full" for _v, _a, reason in suppressed):
+            if not self._waste_alerted_blocked:
+                self._waste_alerted_blocked = True
+                self._broadcast_alert(
+                    level="critical",
+                    message="Waste at capacity -- all pumping suppressed",
+                    category="waste",
+                )
+        blocked_bottles: set[str] = set()
+        for vial, _action, reason in suppressed:
+            if reason == "media_empty":
+                bottle_id = self._vial_to_bottle.get(vial)
+                if bottle_id is not None:
+                    blocked_bottles.add(bottle_id)
+        for bottle_id in blocked_bottles:
+            if self._bottle_alerted_blocked.get(bottle_id, False):
+                continue
+            self._bottle_alerted_blocked[bottle_id] = True
+            b = self._media_bottles.get(bottle_id, {})
+            self._broadcast_alert(
+                level="critical",
+                message=(
+                    f"Bottle '{b.get('name', bottle_id)}' at or below reserve "
+                    "-- pumping suppressed for its vials"
+                ),
+                category="media",
+            )
+        for vial, _action, reason in suppressed:
+            self._broadcast_event({
+                "type": "pump_suppressed",
+                "vial": vial,
+                "reason": reason,
+                "bottle_id": self._vial_to_bottle.get(vial),
+            })
+            log.warning(
+                "vial %d pump suppressed by consumables interlock (reason=%s)",
+                vial, reason,
+            )
+
     def _check_bottle_threshold_locked(self, bottle_id: str) -> None:
         b = self._media_bottles.get(bottle_id)
         if b is None or self._bottle_alerted_low.get(bottle_id, False):
@@ -1561,6 +2186,7 @@ class ExperimentEngine:
                     f"Bottle '{b['name']}' has {max(0.0, remaining):.0f} mL "
                     f"remaining (alert at {b['low_volume_alert_ml']:.0f} mL)"
                 ),
+                category="media",
             )
 
     def _check_waste_threshold_locked(self) -> None:
@@ -1572,6 +2198,7 @@ class ExperimentEngine:
             self._broadcast_alert(
                 level="warning",
                 message=f"Waste container at {pct:.0f}% capacity",
+                category="waste",
             )
 
     def _media_runtime_state_locked(self) -> Optional[dict]:
@@ -1584,12 +2211,14 @@ class ExperimentEngine:
                 bid: {
                     "consumed_ml": float(self._bottle_consumed_ml.get(bid, 0.0)),
                     "alerted_low": bool(self._bottle_alerted_low.get(bid, False)),
+                    "alerted_blocked": bool(self._bottle_alerted_blocked.get(bid, False)),
                 }
                 for bid in self._media_bottles
             },
             "waste": {
                 "filled_ml": float(self._waste_filled_ml),
                 "alerted_high": bool(self._waste_alerted_high),
+                "alerted_blocked": bool(self._waste_alerted_blocked),
             },
         }
 
@@ -1606,9 +2235,11 @@ class ExperimentEngine:
             if bid in self._bottle_consumed_ml:
                 self._bottle_consumed_ml[bid] = float(b.get("consumed_ml", 0.0))
                 self._bottle_alerted_low[bid] = bool(b.get("alerted_low", False))
+                self._bottle_alerted_blocked[bid] = bool(b.get("alerted_blocked", False))
         waste_state = media_state.get("waste") or {}
         self._waste_filled_ml = float(waste_state.get("filled_ml", 0.0))
         self._waste_alerted_high = bool(waste_state.get("alerted_high", False))
+        self._waste_alerted_blocked = bool(waste_state.get("alerted_blocked", False))
 
     # ------------------------------------------------------------------
     # Safety / fault helpers (must hold self._lock)
@@ -1678,6 +2309,7 @@ class ExperimentEngine:
             level=level,
             message=f"Vial {vial} latched fault: {kind}",
             vial=vial,
+            category="heater",
         )
 
     # ------------------------------------------------------------------
@@ -1837,16 +2469,40 @@ class ExperimentEngine:
         raise ValueError(f"no controller builder for mode {mode!r}")
 
     def _resolve_flow_rates(self, parameters: dict, calibration: dict) -> list[float]:
-        """Flow rates: prefer parameters['pump_flow_rates'], then
-        calibration['pump_flow_rates'], else defaults."""
+        """Flow rates in canonical flat-32 form (0..15 influx, 16..31 efflux):
+        prefer parameters['pump_flow_rates'], then
+        calibration['pump_flow_rates'], else defaults. Scalars and per-vial
+        length-16 lists broadcast per :func:`_as_flow_rates_32`."""
         flow_rates_raw = (
             parameters.get("pump_flow_rates")
             or calibration.get("pump_flow_rates")
-            or list(DEFAULT_FLOW_RATES_ML_PER_SEC)
+            or None
         )
-        return _as_list_of_16(
-            flow_rates_raw, default=1.0, name="pump_flow_rates",
-        )
+        return _as_flow_rates_32(flow_rates_raw)
+
+    def flow_rate_ml_s(self, vial: int, direction: str = "influx") -> float:
+        """Per-pump flow rate for mL <-> seconds conversion (SPEC §16).
+
+        Uses the loaded experiment's resolved flow rate when `vial` belongs
+        to it -- this works in CREATED and STOPPED too, not just RUNNING,
+        since a stopped experiment's calibration is still the right one for
+        its vials. Falls back to the hardcoded default for vials with no
+        loaded experiment. ``direction`` selects the influx or efflux pump
+        (canonical index vial / vial+16); they are physically separate pumps
+        and carry independent rates once a Tier 2 pump calibration exists."""
+        if direction not in ("influx", "efflux"):
+            raise ValueError(
+                f"direction must be 'influx' or 'efflux', got {direction!r}"
+            )
+        idx = vial if direction == "influx" else vial + N_VIALS
+        with self._lock:
+            if self._config is not None and vial in self._vials:
+                rates = self._resolve_flow_rates(
+                    self._config.get("parameters", {}),
+                    self._config.get("calibration", {}),
+                )
+                return rates[idx]
+        return DEFAULT_FLOW_RATES_ML_PER_SEC[vial]
 
     def _build_turbidostat_controllers(
         self,
@@ -1887,7 +2543,8 @@ class ExperimentEngine:
                 od_lower=od_lower[vial],
                 od_upper=od_upper[vial],
                 pump_wait_seconds=pump_wait_seconds,
-                flow_rate_ml_s=flow_rates[vial],
+                flow_rate_influx_ml_s=flow_rates[vial],
+                flow_rate_efflux_ml_s=flow_rates[vial + N_VIALS],
                 volume_ml=volume_ml,
                 efflux_extra_seconds=efflux_extra,
                 history_window=history_window,
@@ -1910,6 +2567,10 @@ class ExperimentEngine:
         efflux_extra = float(
             parameters.get("efflux_extra_seconds", DEFAULT_EFFLUX_EXTRA_SECONDS)
         )
+        # Optional start gate (SPEC §9 / CONTROL_MODE_AUDIT.md C-5). Absent
+        # both, dilution begins at inoculation density as it always has.
+        start_od = parameters.get("start_od")
+        start_after_seconds = parameters.get("start_after_seconds")
         flow_rates = self._resolve_flow_rates(parameters, calibration)
 
         controllers: dict[int, ControllerType] = {}
@@ -1919,9 +2580,15 @@ class ExperimentEngine:
                 dilution_rate_per_hour=dilution_rate,
                 bolus_interval_seconds=bolus_interval,
                 volume_ml=volume_ml,
-                flow_rate_ml_s=flow_rates[vial],
+                flow_rate_influx_ml_s=flow_rates[vial],
+                flow_rate_efflux_ml_s=flow_rates[vial + N_VIALS],
                 efflux_extra_seconds=efflux_extra,
                 pump_duration_cap_seconds=20.0,
+                start_od=None if start_od is None else float(start_od),
+                start_after_seconds=(
+                    None if start_after_seconds is None
+                    else float(start_after_seconds)
+                ),
             )
         return controllers
 
@@ -1977,7 +2644,8 @@ class ExperimentEngine:
                 target_od=target_od[vial],
                 od_lower=od_lower[vial],
                 pump_wait_seconds=pump_wait_seconds,
-                flow_rate_ml_s=flow_rates[vial],
+                flow_rate_influx_ml_s=flow_rates[vial],
+                flow_rate_efflux_ml_s=flow_rates[vial + N_VIALS],
                 volume_ml=volume_ml,
                 efflux_extra_seconds=efflux_extra,
                 history_window=history_window,
@@ -2026,6 +2694,7 @@ class ExperimentEngine:
             "media_state": self._media_runtime_state_locked(),
             "maintenance": {
                 "active": self._maintenance_active,
+                "reason": self._maintenance_reason,
                 "entered_at": (
                     self._maintenance_entered_at.isoformat(timespec="seconds")
                     if self._maintenance_entered_at else None
@@ -2145,10 +2814,16 @@ class ExperimentEngine:
                 self._vials,
             )
             saved_controllers = state.get("controllers") or {}
+            # `now` lets each controller re-baseline a timestamp that was
+            # persisted ahead of wall time (CONTROL_MODE_AUDIT.md X-2). The
+            # RPi has no RTC, so a stale boot clock would otherwise make
+            # every `now - last_x` gate negative and block dilution silently
+            # until wall time caught up.
+            resume_now = self._clock()
             for vial in self._vials:
                 cstate = saved_controllers.get(str(vial))
                 if cstate is not None:
-                    self._controllers[vial].restore_state(cstate)
+                    self._controllers[vial].restore_state(cstate, now=resume_now)
 
             # Restore media tracking from the persisted snapshot (no-op when
             # the experiment was created without media config).
@@ -2166,10 +2841,11 @@ class ExperimentEngine:
                 if entered is not None:
                     self._maintenance_active = True
                     self._maintenance_entered_at = entered
+                    self._maintenance_reason = maint.get("reason", "manual")
                     self._pending_pump_actions = {}
                     log.info(
-                        "resumed in maintenance mode (entered at %s)",
-                        entered.isoformat(timespec="seconds"),
+                        "resumed in maintenance mode (entered at %s, reason=%s)",
+                        entered.isoformat(timespec="seconds"), self._maintenance_reason,
                     )
 
             # Re-activate the data logger with the original start timestamp so
@@ -2216,11 +2892,14 @@ class ExperimentEngine:
         self._vial_to_bottle = {}
         self._bottle_consumed_ml = {}
         self._bottle_alerted_low = {}
+        self._bottle_alerted_blocked = {}
         self._waste_config = None
         self._waste_filled_ml = 0.0
         self._waste_alerted_high = False
+        self._waste_alerted_blocked = False
         self._maintenance_active = False
         self._maintenance_entered_at = None
+        self._maintenance_reason = None
         self._pending_pump_actions = {}
 
     def _load_media_locked(self, media_config: Optional[dict]) -> None:
@@ -2231,9 +2910,11 @@ class ExperimentEngine:
             self._vial_to_bottle = {}
             self._bottle_consumed_ml = {}
             self._bottle_alerted_low = {}
+            self._bottle_alerted_blocked = {}
             self._waste_config = None
             self._waste_filled_ml = 0.0
             self._waste_alerted_high = False
+            self._waste_alerted_blocked = False
             return
         self._media_bottles = {b["id"]: dict(b) for b in media_config["bottles"]}
         self._vial_to_bottle = {
@@ -2241,9 +2922,11 @@ class ExperimentEngine:
         }
         self._bottle_consumed_ml = {bid: 0.0 for bid in self._media_bottles}
         self._bottle_alerted_low = {bid: False for bid in self._media_bottles}
+        self._bottle_alerted_blocked = {bid: False for bid in self._media_bottles}
         self._waste_config = dict(media_config["waste"])
         self._waste_filled_ml = 0.0
         self._waste_alerted_high = False
+        self._waste_alerted_blocked = False
 
     def _assert_status(self, *allowed: str) -> None:
         if self._status not in allowed:
@@ -2262,13 +2945,39 @@ class ExperimentEngine:
         except Exception:
             log.exception("on_event callback failed")
 
-    def _broadcast_alert(self, *, level: str, message: str, vial: Optional[int] = None) -> None:
+    def _broadcast_alert(
+        self,
+        *,
+        level: str,
+        message: str,
+        vial: Optional[int] = None,
+        category: str = "system",
+        dedup_key: Any = None,
+    ) -> None:
+        """Raise an operator-facing alert (SPEC §20.4).
+
+        ``category`` is passed explicitly by every call site rather than being
+        inferred from the message text -- string-matching prose would rot the
+        first time a message is reworded.
+
+        ``dedup_key`` is for faults that repeat every cycle: without a stable
+        key the ring buffer's rate limiter falls back to
+        ``(category, level, message)``, which never collapses a message whose
+        text carries changing numbers.
+        """
         if self._on_alert is None:
             return
         try:
-            payload = {"level": level, "message": message, "timestamp": _iso_now()}
+            payload = {
+                "level": level,
+                "message": message,
+                "category": category,
+                "timestamp": _iso_now(),
+            }
             if vial is not None:
                 payload["vial"] = vial
+            if dedup_key is not None:
+                payload["dedup_key"] = dedup_key
             self._on_alert(payload)
         except Exception:
             log.exception("on_alert callback failed")

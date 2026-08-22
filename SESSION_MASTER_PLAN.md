@@ -20,7 +20,7 @@
 > | D — Contamination & Stall Detection | **Not built** | Rescoped: rule-based tier → `ROADMAP.md` Session V; statistical tier deferred, see `ROADMAP.md` §6 |
 > | E — Visual Experiment Designer | **Not built** | → `ROADMAP.md` Session Z (P2). The linear-phase-list recommendation below still stands |
 > | F — Media Replacement Mode | **Built** | `enter_maintenance` / `exit_maintenance` / `refill_media`, 30 min failsafe |
-> | G — Data Management & Export | **Built (partially)** | ZIP export, plots, disk monitoring done; unified event log **not** done → `ROADMAP.md` Session M |
+> | G — Data Management & Export | **Built** | ZIP export, plots, disk monitoring; unified event log shipped 2026-08-20 (`ROADMAP.md` Session M, `server/event_log.py`) |
 > | H — PID Temperature Control | **Not built** | **Premise below is factually wrong — see the correction in that section.** Deferred to P3 |
 > | I — Documentation & Troubleshooting | **Not built** | Still worth doing; schedule after the P0 block in `ROADMAP.md` |
 > | J — WiFi Independence & Security | **Not built** | → `ROADMAP.md` Session AE (P2). Tailscale is deployed (`deploy/ts-keepalive/`), which covers part of the access need |

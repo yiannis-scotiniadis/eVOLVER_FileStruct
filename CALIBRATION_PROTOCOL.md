@@ -1,7 +1,12 @@
 # CALIBRATION_PROTOCOL.md — eVOLVER calibration and verification
 
-**Status:** draft for review. Bench procedures are ready to run; Part II is the
-implementation brief for `ROADMAP.md` Session O.
+**Status:** bench procedures ready to run. **Part II is IMPLEMENTED (2026-08-20,
+`ROADMAP.md` Session O)** — the provenance store, per-run OD blank, pump gravimetric
+wizard, reconciliation, guards and staleness all exist in `server/calibration_service.py`
++ `/api/calibration/*` + the GUI's Calibration tab; only the Tier 3 wizards (§8) and the
+dedicated Tier 0 / §5.1–§5.3 screens are still pending (Session AA; run sheet meanwhile).
+No Tier 1 or Tier 2 procedure has yet been **run on the bench** — the audit findings in §1
+remain live until one is.
 **Applies to:** the 2016 BU/EDF eVOLVER, 16 sleeves, driven by the Flask server in `server/`.
 **Companion documents:** `SPEC.md` §19 and §25, `ROADMAP.md` Session O / AA / AC, `CLAUDE.md` §Calibration.
 
@@ -386,9 +391,17 @@ biases the first method and not the second.
 be resumable: record per-pump results as you go, and note which pumps remain. The software
 wizard (Part II) makes this explicit.
 
-**Output:** a new versioned `calibration/pump/…json`, and the engine picks the rates up via
+**Output:** a new versioned `calibration/pump/…json`, and the engine reads the rates from
 `config["calibration"]["pump_flow_rates"]` (see `experiment_engine._resolve_flow_rates`, which
 prefers `parameters` → `calibration` → hardcoded defaults).
+
+> **✅ Resolved 2026-08-20:** the engine now consumes 32 values. `_resolve_flow_rates`
+> resolves through `_as_flow_rates_32` (scalar → 32, length-16 → both directions,
+> length-32 → as-is), the three controllers carry per-direction rates, and a complete
+> pump calibration's rates are written into each new experiment's
+> `config["calibration"]["pump_flow_rates"]` at creation. Ordering is the canonical pump
+> index in `CLAUDE.md`: `0..15` influx, `16..31` efflux. A partial (spot-check) session
+> merges over the previous version's rates; only a complete 32 feeds the engine.
 
 ---
 
@@ -649,13 +662,38 @@ Retain every previous version — they are small.
 }
 ```
 
-`experiment_engine._resolve_flow_rates` already reads `calibration["pump_flow_rates"]`, so
-populating this block is all that is needed to wire Tier 2 into the engine.
+`pump_flow_rates` is a **flat 32-element array** ordered by the canonical pump index defined
+in `CLAUDE.md` ("Pump command format"): indices `0..15` are the influx pumps for vials 0–15,
+indices `16..31` are the efflux pumps for the same vials. Array index equals the exponent in
+the hardware binary address, so the software index and the wire address cannot diverge.
+
+> **✅ Correction resolved 2026-08-20.** This section previously flagged that
+> `_resolve_flow_rates` coerced through `_as_list_of_16` and would reject 32 values.
+> Session O3a landed the plumbing: `_resolve_flow_rates` is 32-aware, the three
+> controllers carry per-direction rates (`flow_rate_influx_ml_s` /
+> `flow_rate_efflux_ml_s`, dilution timing on influx only), and the 32/16/scalar cases
+> are covered by tests. Populating this block IS now the integration, and the server
+> populates it automatically at experiment creation when a complete pump calibration is
+> current.
+>
+> The 16 hardcoded defaults are still applied to **both** directions until Tier 2 runs on
+> the bench, so the system continues to assume influx and efflux move identical volumes
+> per second. They are separate pumps and generally do not. Establishing the
+> per-direction difference is one of the things this Tier 2 calibration exists to
+> measure — see `SPEC.md` §16.1–§16.2 for what follows from it, including why the answer
+> is *not* to compute a balancing efflux duration in software.
 
 ## 12. Endpoints
 
 All under `/api/calibration/*`. All reject with **409** while an experiment is RUNNING, except
 the read-only ones. These are the **only** routes permitted to reach raw actuator paths.
+
+> **Implementation status (2026-08-20):** everything below is built except the Tier 3
+> blocks (`temperature/*`, `od/series/*`, `stir/*` — Session AA). As built: the blank
+> routes operate on the loaded CREATED experiment (no experiment name in the body); QC
+> refusals return **422** carrying the qc block and are overridable by re-posting with an
+> `override_reason`; `GET /api/calibration/pump/session` reports `{"active": false}`
+> rather than 404 when idle.
 
 ```
 GET  /api/calibration/                      index: per subsystem — current version, age,
@@ -708,10 +746,10 @@ POST /api/calibration/raw/temperature       {setpoints: [...16]}   (wraps set_te
 POST /api/calibration/raw/od_led            {power: 0..2200}       (needs building)
 ```
 
-`POST /api/actuators/temperature/raw` currently exists on the normal actuator surface
-(`app.py` ~line 578, "escape hatch for calibration wizard and low-level debugging"). Move it
-behind `/api/calibration/raw/*` so ordinary operation cannot reach a raw heater setpoint —
-this matters more than usual given the inverted convention.
+`POST /api/actuators/temperature/raw` used to sit on the normal actuator surface; it has
+been **moved** to `POST /api/calibration/raw/temperature` (and `raw/od_led` built), so
+ordinary operation cannot reach a raw heater setpoint — this matters more than usual given
+the inverted convention. Both raw routes 409 while an experiment is RUNNING.
 
 ## 13. Guards
 
@@ -748,6 +786,13 @@ One screen per SOP step. The screen shows the SOP text for that step, so the ope
 need the printed document in hand — but the run sheet stays, because a signed paper record is
 worth something a database row is not.
 
+> **Implementation status (2026-08-20):** the §5.4 OD blank, §7 pump grid (which also
+> serves the §5.2 spot-check by selecting the four due lines), §6 reconciliation, and the
+> staleness banner are built in the GUI's Calibration tab. The dedicated Tier 0
+> checklist, §5.1 prime, §5.2 rotation state, and §5.3 temperature-verification screens
+> were deliberately deferred — those steps stay on the printed run sheet, driven by the
+> existing manual controls. Tier 3 screens are Session AA.
+
 | SOP step | Screen | Endpoint(s) | Writes |
 |---|---|---|---|
 | §4 Tier 0 | Pre-flight checklist — live status for 0.1–0.4, manual tick for 0.5–0.8 | `GET /api/calibration/`, existing sensor routes | run sheet entry |
@@ -769,49 +814,55 @@ unnoticed for a decade.
 
 ## 15. Verification checklist
 
-Extends the checklist in `ROADMAP.md` Session O.
+Extends the checklist in `ROADMAP.md` Session O. Ticked items are verified by the test
+suite (`test_calibration_service.py`, `test_calibration_api.py`,
+`test_experiment_engine.py`, `test_serial_manager.py`) as of 2026-08-20; unticked items
+are bench work or Tier 3 software.
 
 **Correctness**
 
-- [ ] `reanchor_od_calibration` yields `OD(blank) == 0.0` for all 16 vials
-- [ ] Rows 0, 1, 3 bitwise unchanged by a blank commit; only row 2 differs
-- [ ] `OD_new(S) − OD_old(S)` is constant in `S` per vial (shape preservation)
-- [ ] Blank commit rejected when any `B[v]` falls outside `(a[v], b[v])`
-- [ ] A blank taken at a different LED power or stir PWM than the run is rejected
-- [ ] Pump wizard writes per-pump mL/s; engine consumes them via `calibration.pump_flow_rates`
-- [ ] Measured flow reproduces within 15 % on a repeat run *(bench)*
-- [ ] Thermistor fit reproduces an intermediate reference temperature within 0.5 °C *(bench)*
-- [ ] Thermistor fit flags vial 0 as an outlier if it remains one
+- [x] `reanchor_od_calibration` yields `OD(blank) == 0.0` for all 16 vials
+- [x] Rows 0, 1, 3 bitwise unchanged by a blank commit; only row 2 differs
+- [x] `OD_new(S) − OD_old(S)` is constant in `S` per vial (shape preservation)
+- [x] Blank commit rejected when any `B[v]` falls outside `(a[v], b[v])`
+- [x] A blank taken at a different LED power or stir PWM than the run is rejected
+- [x] Pump wizard writes per-pump mL/s; engine consumes them via `calibration.pump_flow_rates`
+- [ ] Measured flow reproduces within 15 % on a repeat run *(bench — Tier 2 not yet run)*
+- [ ] Thermistor fit reproduces an intermediate reference temperature within 0.5 °C *(bench, Tier 3)*
+- [ ] Thermistor fit flags vial 0 as an outlier if it remains one *(Tier 3; the legacy
+      import already carries vial 0's 5-sigma flag in its qc warnings)*
 
 **Provenance and safety**
 
-- [ ] No calibration write ever overwrites an existing version file
-- [ ] `.txt` legacy views regenerate correctly from `current.json` and load in `SerialManager`
-- [ ] Experiment `config.json` records a version for every subsystem in use
-- [ ] All mutating calibration routes return 409 during a RUNNING experiment
-- [ ] Raw temperature and raw LED routes are unreachable from the normal actuator surface
-- [ ] Enabling `dark_subtract` against a curve without the sidecar is a hard error, not a warning
-- [ ] Bottle levels drop the "uncalibrated estimate" label only once a real pump calibration exists
-- [ ] Pump-seconds accumulate per line and drive the staleness warning
-- [ ] A stale calibration produces a visible dashboard banner, not just an API field
+- [x] No calibration write ever overwrites an existing version file
+- [x] `.txt` legacy views regenerate correctly from `current.json` and load in `SerialManager`
+- [x] Experiment `config.json` records a version for every subsystem in use
+- [x] All mutating calibration routes return 409 during a RUNNING experiment
+- [x] Raw temperature and raw LED routes are unreachable from the normal actuator surface
+- [x] Enabling `dark_subtract` against a curve without the sidecar is a hard error, not a warning
+- [x] Bottle levels drop the "uncalibrated estimate" label only once a real pump calibration exists
+- [x] Pump-seconds accumulate per line and drive the staleness warning
+- [x] A stale calibration produces a visible dashboard banner, not just an API field
 
 **Resumability**
 
-- [ ] Pump session survives a server restart mid-calibration and resumes with the right pumps pending
-- [ ] Aborting any wizard leaves no partial file in `calibration/`
+- [x] Pump session survives a server restart mid-calibration and resumes with the right pumps pending
+- [x] Aborting any wizard leaves no partial file in `calibration/`
 
 ## 16. Suggested build order
 
-1. **Envelope, versioning, `current.json`, legacy `.txt` regeneration, provenance in `config.json`.**
+Items 1–5 shipped 2026-08-20 (ROADMAP Session O); item 6 remains (Session AA).
+
+1. ✅ **Envelope, versioning, `current.json`, legacy `.txt` regeneration, provenance in `config.json`.**
    Nothing else is safe to build first — it is the part that makes every later calibration
    reconstructable.
-2. **Per-run OD blank** (§5.4 / §10.1). Highest accuracy return per line of code: it removes a
+2. ✅ **Per-run OD blank** (§5.4 / §10.1). Highest accuracy return per line of code: it removes a
    0.12–0.44 OD error that is present in every reading today.
-3. **Pump gravimetric wizard** (§7). Unblocks the consumables interlock, volume-based pumping,
+3. ✅ **Pump gravimetric wizard** (§7). Unblocks the consumables interlock, volume-based pumping,
    and the dilution-rate growth estimator.
-4. **Post-run reconciliation** (§6). Small, and it is the only thing that will tell you when
+4. ✅ **Post-run reconciliation** (§6). Small, and it is the only thing that will tell you when
    step 3 has gone stale.
-5. **Staleness surfacing** (§13).
+5. ✅ **Staleness surfacing** (§13).
 6. **Tier 3 wizards** — after prerequisite P2 is resolved.
 
 ---

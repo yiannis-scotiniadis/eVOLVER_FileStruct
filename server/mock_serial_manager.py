@@ -46,7 +46,9 @@ from serial_manager import (
     OD_AGG_DEFAULT,
     OD_DEFAULT_N_DARK,
     OD_DEFAULT_N_SAMPLES,
+    OD_LED_MAX,
     ODReading,
+    SerialManager,
 )
 
 
@@ -167,6 +169,14 @@ class MockSerialManager:
 
         self.temp_cal: Optional[np.ndarray] = None
         self.od_cal: Optional[np.ndarray] = None
+        self._od_cal_base: Optional[np.ndarray] = None
+        self._od_cal_dark_subtracted = False
+        # Synthetic ADC model for collect_od_raw (the sim has no real ADC):
+        # dark floor + read noise, in counts.
+        self.mock_dark_counts = 1200.0
+        self.mock_dark_noise_sd = 30.0
+        self.mock_signal_noise_sd = 150.0
+        self.mock_uncal_signal_counts = 58000.0
 
         self.sim_time = 0.0
 
@@ -189,9 +199,37 @@ class MockSerialManager:
             raise ValueError(
                 f"OD calibration shape {od_cal.shape}, expected (4, {N_VIALS})"
             )
+        dark_subtracted = SerialManager._read_cal_dark_subtracted(od_cal_path)
         with self._lock:
             self.temp_cal = temp_cal
             self.od_cal = od_cal
+            self._od_cal_base = od_cal.copy()
+            self._od_cal_dark_subtracted = dark_subtracted
+
+    @property
+    def od_cal_dark_subtracted(self) -> bool:
+        """Parity with SerialManager.od_cal_dark_subtracted."""
+        return self._od_cal_dark_subtracted
+
+    def apply_od_blank(self, c_run_by_vial: dict) -> None:
+        """Parity with SerialManager.apply_od_blank. The mock's calibrated
+        reads come from the simulation's OD state directly, so this only
+        affects the stored calibration (raw inversion), not read values."""
+        with self._lock:
+            if self.od_cal is None:
+                raise RuntimeError("apply_od_blank requires a loaded OD calibration")
+            od_cal = self.od_cal.copy()
+            for vial, c_run in c_run_by_vial.items():
+                v = int(vial)
+                if not (0 <= v < N_VIALS):
+                    raise ValueError(f"vial must be in 0..{N_VIALS - 1}, got {v}")
+                od_cal[2, v] = float(c_run)
+            self.od_cal = od_cal
+
+    def clear_od_blank(self) -> None:
+        with self._lock:
+            if self._od_cal_base is not None:
+                self.od_cal = self._od_cal_base.copy()
 
     # Calibration helpers retained for the round-trip test and any
     # external utility that wants to convert between physical units and
@@ -270,6 +308,32 @@ class MockSerialManager:
             self._advance()
             return self.od_abs.tolist()
 
+    def collect_od_raw(self, led_power: int, n_samples: int = 5) -> dict:
+        """Parity with SerialManager.collect_od_raw — the calibration-wizard
+        read primitive. The sim has no real ADC, so raw counts are
+        synthesized: LED 0 returns a dark floor + read noise; LED > 0 inverts
+        the loaded calibration from the current simulated OD (falling back to
+        a plausible constant when uncalibrated) + read noise."""
+        led = int(np.clip(led_power, 0, OD_LED_MAX))
+        n = max(1, int(n_samples))
+        with self._lock:
+            self._advance()
+            if led == 0:
+                base = np.full(N_VIALS, self.mock_dark_counts)
+                noise_sd = self.mock_dark_noise_sd
+            elif self.od_cal is not None:
+                base = self._od_abs_to_raw(np.asarray(self.od_abs, dtype=float))
+                noise_sd = self.mock_signal_noise_sd
+            else:
+                base = np.full(N_VIALS, self.mock_uncal_signal_counts)
+                noise_sd = self.mock_signal_noise_sd
+            samples = base[None, :] + self._rng.normal(0.0, noise_sd, (n, N_VIALS))
+        return {
+            "median": np.median(samples, axis=0).tolist(),
+            "sd": np.std(samples, axis=0).tolist(),
+            "n_valid": [n] * N_VIALS,
+        }
+
     def read_od_enhanced(
         self,
         led_power: int = 2125,
@@ -288,6 +352,15 @@ class MockSerialManager:
         dark-subtracted signal recovered by inverting the calibration (NaN when
         uncalibrated); the per-vial range guard mirrors the real reader so the
         ``out_of_range`` path stays exercisable against a calibration."""
+        if dark_subtract and self.od_cal is not None \
+                and not self._od_cal_dark_subtracted:
+            # Parity with SerialManager: dark subtraction against a curve fit
+            # on non-dark-subtracted signal is a hard error (SPEC §19.2).
+            raise ValueError(
+                "dark_subtract=True requires an OD calibration marked "
+                "dark_subtracted in OD_cal.meta.json; the loaded "
+                "calibration is not"
+            )
         with self._lock:
             self._advance()
             n = max(1, int(n_samples))

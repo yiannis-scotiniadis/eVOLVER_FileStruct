@@ -19,7 +19,7 @@ import math
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
-from .turbidostat import PumpAction, TurbidostatController
+from .turbidostat import PumpAction, TurbidostatController, _rebaseline_future
 
 
 @dataclass(frozen=True)
@@ -68,6 +68,10 @@ def estimate_growth_rate(
 
 
 class MorbidostatController:
+    # Dilution is delegated to an inner turbidostat, so this mode is just as
+    # closed-loop on OD as that one (CONTROL_MODE_AUDIT.md C-2).
+    requires_od = True
+
     def __init__(
         self,
         vial: int,
@@ -76,7 +80,9 @@ class MorbidostatController:
         target_od: float,
         od_lower: float,
         pump_wait_seconds: float,
-        flow_rate_ml_s: float,
+        flow_rate_ml_s: Optional[float] = None,
+        flow_rate_influx_ml_s: Optional[float] = None,
+        flow_rate_efflux_ml_s: Optional[float] = None,
         volume_ml: float,
         efflux_extra_seconds: float = 0.0,
         history_window: int = 5,
@@ -130,6 +136,8 @@ class MorbidostatController:
             od_upper=target_od,
             pump_wait_seconds=pump_wait_seconds,
             flow_rate_ml_s=flow_rate_ml_s,
+            flow_rate_influx_ml_s=flow_rate_influx_ml_s,
+            flow_rate_efflux_ml_s=flow_rate_efflux_ml_s,
             volume_ml=volume_ml,
             efflux_extra_seconds=efflux_extra_seconds,
             history_window=history_window,
@@ -166,8 +174,17 @@ class MorbidostatController:
     @property
     def flow_rate_ml_s(self) -> float:
         """Forwarded from the inner turbidostat — used by the engine's
-        media-debit pass which expects ``controller.flow_rate_ml_s``."""
+        media-debit pass which expects ``controller.flow_rate_ml_s``.
+        Deprecated single-rate alias for the influx rate."""
         return self._inner.flow_rate_ml_s
+
+    @property
+    def flow_rate_influx_ml_s(self) -> float:
+        return self._inner.flow_rate_influx_ml_s
+
+    @property
+    def flow_rate_efflux_ml_s(self) -> float:
+        return self._inner.flow_rate_efflux_ml_s
 
     @property
     def proposed_new_drug_conc(self) -> Optional[float]:
@@ -317,12 +334,21 @@ class MorbidostatController:
             "inner": self._inner.to_state(),
         }
 
-    def restore_state(self, state: dict) -> None:
+    def restore_state(self, state: dict, now: Optional[float] = None) -> None:
+        """Restore mutable state. ``now``, when supplied, re-baselines any
+        timestamp restored from the future — see
+        :func:`turbidostat._rebaseline_future` (X-2). The escalation clock
+        needs it as much as the dilution clock: a future
+        ``last_escalation_time`` freezes the cooldown."""
         if "drug_conc" in state and state["drug_conc"] is not None:
             self.drug_conc = float(state["drug_conc"])
         if "last_escalation_time" in state:
             v = state["last_escalation_time"]
             self.last_escalation_time = None if v is None else float(v)
+            self.last_escalation_time = _rebaseline_future(
+                self.last_escalation_time, now,
+                f"vial {self.vial} last_escalation_time",
+            )
         if "awaiting_escalation_confirm" in state:
             self.awaiting_escalation_confirm = bool(
                 state["awaiting_escalation_confirm"]
@@ -330,6 +356,10 @@ class MorbidostatController:
         if "last_reminder_time" in state:
             v = state["last_reminder_time"]
             self.last_reminder_time = None if v is None else float(v)
+            self.last_reminder_time = _rebaseline_future(
+                self.last_reminder_time, now,
+                f"vial {self.vial} last_reminder_time",
+            )
         if "escalation_log" in state and state["escalation_log"] is not None:
             self.escalation_log = [dict(e) for e in state["escalation_log"]]
         if "timestamped_od_history" in state and state["timestamped_od_history"] is not None:
@@ -337,6 +367,6 @@ class MorbidostatController:
                 (float(t), float(od)) for t, od in state["timestamped_od_history"]
             ]
         if "inner" in state and state["inner"] is not None:
-            self._inner.restore_state(state["inner"])
+            self._inner.restore_state(state["inner"], now=now)
         # _pending_escalation is NOT persisted; re-evaluation happens on next decide().
         self._pending_escalation = None

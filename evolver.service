@@ -10,8 +10,12 @@ EnvironmentFile=/etc/evolver/secret.env
 ExecStart=/home/pi/evolver-gui/.venv/bin/python /home/pi/evolver-gui/server/app.py
 Restart=on-failure
 RestartSec=5
-StandardOutput=append:/var/log/evolver/app.log
-StandardError=append:/var/log/evolver/app.log
+# Logs go to the journal here and to the rotating handlers the server installs
+# itself (logs/evolver.log + logs/errors.log, SPEC §20.1). The previous
+# `append:/var/log/evolver/app.log` was never rotated, so it grew without bound
+# on the SD card the experiment data also lives on.
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target

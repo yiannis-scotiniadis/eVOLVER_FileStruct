@@ -307,7 +307,9 @@ After the pilot, restore `WATCHDOG_TIMEOUT_MINUTES = 30` in `server/app.py:66`.
 
 ## Operations
 
-- **Logs:** the server logs to `/var/log/evolver/app.log` (persistent) — tail it with `tail -f /var/log/evolver/app.log`. `sudo journalctl -u evolver -f` shows only systemd lifecycle events (start/stop), *not* the sensor-loop output, because the unit redirects stdout to the file.
+- **Logs:** two sinks, both live. `sudo journalctl -u evolver -f` is the full stream (the unit no longer redirects stdout to a file). The server also writes rotating logs under `/home/pi/evolver-gui/logs/`: `evolver.log` (10 MB × 5) and `errors.log` (WARNING and above, 5 MB × 5) — tail with `tail -f /home/pi/evolver-gui/logs/evolver.log`. Both suspend themselves below a 128 MB free-space floor so logging can never fill the card the experiment data is on; `curl -s localhost:5000/api/health` reports `file_logging.suspended` if that happens.
+- **Event log:** every discrete occurrence (pump fires and *suppressed* attempts, alerts, maintenance, refills, sensor and serial faults) lands in `experiments/{name}/events.csv` and ships inside every export ZIP. The last 500 events are also served from memory at `GET /api/events/recent`, which is what the dashboard's Alerts drawer reads — so alerts survive a page reload and a second browser.
+- **Upgrading from a pre-Session-M deploy:** the unit changed from `StandardOutput=append:/var/log/evolver/app.log` to `journal`. Run `sudo systemctl daemon-reload && sudo systemctl restart evolver` after copying the new unit, then delete the stale `/var/log/evolver/app.log` — nothing rotates it and nothing writes to it any more.
 - **Clean shutdown / restart:** `sudo systemctl stop` (or `restart`) `evolver` fires the SIGTERM handler, which calls `stop_experiment(reason="shutdown")` — this **ends** any running experiment (marks it STOPPED; it cannot be re-`start`ed), zeros stir, parks heaters at 4095, and stops pumps. **A clean restart does NOT resume the experiment.**
 - **Crash recovery:** `resume_on_startup()` fires *only* after an **unclean** exit (power loss / crash that left `state.json` at RUNNING). On the next boot it rebuilds and resumes that experiment. A deliberate stop is never resumed.
 - **Source of truth for a running experiment:** `experiments/<name>/state.json`. Back this up before any risky operation.
@@ -349,7 +351,7 @@ git checkout <new-tag>
 # 4. Restart and verify.
 sudo systemctl start evolver
 systemctl status evolver --no-pager               # active (running)?
-tail -n 40 /var/log/evolver/app.log               # "loaded calibration", clean sensor cycles?
+tail -n 40 logs/evolver.log                       # "loaded calibration", clean sensor cycles?
 curl -s localhost:5000/api/sensors/all | head -c 200; echo
 # Hard-refresh the dashboard; spot-check one manual control.
 ```

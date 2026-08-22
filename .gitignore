@@ -16,6 +16,28 @@ __pycache__/
 experiments/*
 !experiments/.gitkeep
 
+# Rotating server logs (SPEC §20.1). The bare *.log rule above misses the
+# rotated siblings (evolver.log.1, .2, ...), so ignore the directory.
+logs/
+
 # Generated export bundles (data_export.py) — regenerated on demand, not git
 exports/*
 !exports/.gitkeep
+
+# Calibration runtime state (SPEC §19). Versioned calibration envelopes and
+# current.json ARE tracked (they are provenance); only the in-progress wizard
+# session and the machine-local reconciliation trend log are per-rig state.
+calibration/_sessions/
+calibration/reconciliation_log.json
+
+# Browser scratch dumps from frontend debugging (rendered copies of
+# frontend/templates/index.html, not source). Regenerate by dumping the page.
+/dom.html
+/harness.html
+/page_raw.html
+
+# Browser scratch dumps from frontend debugging (rendered copies of
+# frontend/templates/index.html, not source). Regenerate by dumping the page.
+/dom.html
+/harness.html
+/page_raw.html

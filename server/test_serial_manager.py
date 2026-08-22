@@ -76,6 +76,23 @@ def fresh(calibrated: bool = True) -> tuple[SerialManager, FakeSerial]:
     return sm, fake
 
 
+def fresh_dark_marked(tmp: Path) -> tuple[SerialManager, FakeSerial]:
+    """Like fresh(calibrated=True) but the OD calibration carries an
+    OD_cal.meta.json sidecar with dark_subtracted=true, so dark subtraction
+    is permitted (SPEC §19.2 coherence guard)."""
+    import json as _json
+    import shutil as _shutil
+    od_copy = tmp / "OD_cal.txt"
+    _shutil.copy(OD_CAL, od_copy)
+    (tmp / "OD_cal.meta.json").write_text(
+        _json.dumps({"dark_subtracted": True}), encoding="utf-8"
+    )
+    fake = FakeSerial()
+    sm = SerialManager(ser=fake)
+    sm.load_calibration(TEMP_CAL, str(od_copy))
+    return sm, fake
+
+
 def _temp_response(values: list[int]) -> bytes:
     return ("temp" + ",".join(str(v) for v in values) + ",end\n").encode("ascii")
 
@@ -449,24 +466,84 @@ def test_od_enhanced_dropped_samples() -> None:
     print("PASS  enhanced OD: partial drop lowers n_valid; all-drop -> 'dropped'+NaN")
 
 
-def test_od_enhanced_dark_subtraction() -> None:
-    """corrected = median(light) - median(dark) is what feeds the calibration."""
+def test_od_enhanced_dark_subtraction_requires_sidecar() -> None:
+    """Provenance guard is a HARD ERROR (SPEC §19.2): the bundled OD_cal.txt
+    has no dark-subtracted marker (no OD_cal.meta.json), so requesting dark
+    subtraction against it must raise, not warn."""
     sm, fake = fresh(calibrated=True)
-    # Dark phase first (n_dark reads), then light phase (n_samples reads).
+    try:
+        sm.read_od_enhanced(2125, n_samples=5, dark_subtract=True, n_dark=3)
+    except ValueError as exc:
+        assert "dark_subtracted" in str(exc), exc
+    else:
+        raise AssertionError("dark_subtract against a non-sidecar cal did not raise")
+    # No calibration loaded -> raw passthrough, dark subtraction is harmless
+    # arithmetic on raw counts and stays allowed.
+    sm2, fake2 = fresh(calibrated=False)
+    for _ in range(2):
+        fake2.read_queue.append(_od_response([2000] * N_VIALS))
     for _ in range(3):
-        fake.read_queue.append(_od_response([2000] * N_VIALS))
-    for _ in range(5):
-        fake.read_queue.append(_od_response([60000] * N_VIALS))
-    r = sm.read_od_enhanced(2125, n_samples=5, dark_subtract=True, n_dark=3)
-    assert math.isclose(r.dark[0], 2000.0, abs_tol=1e-6), r.dark[0]
+        fake2.read_queue.append(_od_response([60000] * N_VIALS))
+    r = sm2.read_od_enhanced(2125, n_samples=3, dark_subtract=True, n_dark=2)
     assert math.isclose(r.raw[0], 58000.0, abs_tol=1e-6), r.raw[0]
-    assert math.isclose(r.calibrated[0], _od_logistic(58000.0, 0), abs_tol=1e-6), \
-        r.calibrated[0]
-    assert r.flags[0] == "ok"
-    # Provenance guard: the bundled OD_cal.txt has no dark-subtracted marker
-    # (no OD_cal.meta.json), so requesting dark subtraction must warn once.
-    assert sm._dark_subtract_warned is True, "provenance guard did not engage"
+    print("PASS  dark subtraction without sidecar raises; uncalibrated stays allowed")
+
+
+def test_od_enhanced_dark_subtraction() -> None:
+    """corrected = median(light) - median(dark) is what feeds the calibration
+    (with a sidecar-marked calibration, per the coherence guard)."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        sm, fake = fresh_dark_marked(Path(tmp))
+        assert sm.od_cal_dark_subtracted is True
+        # Dark phase first (n_dark reads), then light phase (n_samples reads).
+        for _ in range(3):
+            fake.read_queue.append(_od_response([2000] * N_VIALS))
+        for _ in range(5):
+            fake.read_queue.append(_od_response([60000] * N_VIALS))
+        r = sm.read_od_enhanced(2125, n_samples=5, dark_subtract=True, n_dark=3)
+        assert math.isclose(r.dark[0], 2000.0, abs_tol=1e-6), r.dark[0]
+        assert math.isclose(r.raw[0], 58000.0, abs_tol=1e-6), r.raw[0]
+        assert math.isclose(r.calibrated[0], _od_logistic(58000.0, 0), abs_tol=1e-6), \
+            r.calibrated[0]
+        assert r.flags[0] == "ok"
     print("PASS  enhanced OD dark subtraction (60000 - 2000 -> OD via calibration)")
+
+
+def test_collect_od_raw_stats() -> None:
+    """collect_od_raw returns NaN-aware per-vial median/sd/n_valid of raw
+    counts — the calibration wizard's dark/blank read primitive."""
+    sm, fake = fresh(calibrated=True)
+    for val in (57000, 58000, 59000):
+        fake.read_queue.append(_od_response([val] * N_VIALS))
+    fake.read_queue.append(b"")  # one timeout -> drops out of the stats
+    stats = sm.collect_od_raw(2125, n_samples=4)
+    assert stats["n_valid"][0] == 3, stats["n_valid"][0]
+    assert math.isclose(stats["median"][0], 58000.0, abs_tol=1e-6), stats["median"][0]
+    expected_sd = float(np.std([57000.0, 58000.0, 59000.0]))
+    assert math.isclose(stats["sd"][0], expected_sd, abs_tol=1e-6), stats["sd"][0]
+    # LED power is clamped and sent as the `we` payload (0 = dark read).
+    fake.read_queue.append(_od_response([1200] * N_VIALS))
+    sm.collect_od_raw(0, n_samples=1)
+    assert fake.write_log[-1].startswith(b"we0,"), fake.write_log[-1]
+    print("PASS  collect_od_raw per-vial median/sd/n_valid + LED-0 dark read")
+
+
+def test_apply_od_blank_row2_only() -> None:
+    """apply_od_blank changes ONLY row 2 for the named vials; clear_od_blank
+    restores the pristine curve (rows 0/1/3 bitwise unchanged throughout)."""
+    sm, _fake = fresh(calibrated=True)
+    before = sm.od_cal.copy()
+    sm.apply_od_blank({0: -1.234, 5: 0.5})
+    after = sm.od_cal
+    assert after[2, 0] == -1.234 and after[2, 5] == 0.5
+    for row in (0, 1, 3):
+        assert np.array_equal(after[row], before[row]), f"row {row} changed"
+    untouched = [v for v in range(N_VIALS) if v not in (0, 5)]
+    assert np.array_equal(after[2, untouched], before[2, untouched])
+    sm.clear_od_blank()
+    assert np.array_equal(sm.od_cal, before), "clear_od_blank did not restore"
+    print("PASS  apply_od_blank re-anchors row 2 only; clear restores pristine")
 
 
 def test_od_enhanced_out_of_range() -> None:
@@ -487,7 +564,9 @@ def test_od_enhanced_out_of_range() -> None:
 def test_od_enhanced_inter_command_delay() -> None:
     """The 50 ms inter-command floor is honored across every extra read in a
     cycle (dark + light), not just the first."""
-    sm, fake = fresh(calibrated=True)
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        sm, fake = fresh_dark_marked(Path(tmp))
     for _ in range(2):  # n_dark
         fake.read_queue.append(_od_response([2000] * N_VIALS))
     for _ in range(3):  # n_samples
@@ -532,7 +611,10 @@ def main() -> int:
     test_uncalibrated_returns_raw()
     test_od_enhanced_median_rejects_outlier()
     test_od_enhanced_dropped_samples()
+    test_od_enhanced_dark_subtraction_requires_sidecar()
     test_od_enhanced_dark_subtraction()
+    test_collect_od_raw_stats()
+    test_apply_od_blank_row2_only()
     test_od_enhanced_out_of_range()
     test_od_enhanced_inter_command_delay()
     print("\nAll tests passed.")

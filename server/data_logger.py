@@ -65,6 +65,21 @@ ESCALATION_HEADER = (
     "bottle_contents_after",
 )
 
+# SPEC §20.2 — the unified per-experiment event log. One row per discrete
+# occurrence: lifecycle, pump fires AND suppressed pump attempts, alerts,
+# maintenance transitions, refills, escalations, sensor and serial faults.
+# `vial` is blank for machine-wide events; `data_json` carries the structured
+# detail the message summarises.
+EVENT_HEADER = (
+    "timestamp",
+    "elapsed_hours",
+    "level",
+    "category",
+    "vial",
+    "message",
+    "data_json",
+)
+
 # Constrained to keep filesystem paths sane and to avoid path traversal.
 _VALID_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_\-]{0,63}$")
 
@@ -96,6 +111,17 @@ def _format_int(x) -> str:
     if x is None or _is_nan(x):
         return ""
     return str(int(round(float(x))))
+
+
+def _one_line(text) -> str:
+    """Collapse newlines to spaces.
+
+    events.csv is read back line-by-line (data_export._read_csv_lines,
+    filter_rows_by_hours), so an embedded newline -- easy to get from an
+    exception string -- would split one event across two rows and corrupt every
+    downstream reader. Quoting alone would not save them.
+    """
+    return " ".join(str(text).split())
 
 
 def _deep_merge(base: dict, overlay: dict) -> dict:
@@ -243,6 +269,10 @@ class DataLogger:
             self._init_csv(exp_dir / f"vial{v:02d}_OD.csv", OD_HEADER)
             self._init_csv(exp_dir / f"vial{v:02d}_temp.csv", TEMP_HEADER)
             self._init_csv(exp_dir / f"vial{v:02d}_pump_log.csv", PUMP_HEADER)
+        # events.csv is machine-wide, not per-vial, so it lives beside them
+        # rather than being one file per vial. Pre-created (rather than lazily
+        # created on first write) so an export always finds it.
+        self._init_csv(exp_dir / "events.csv", EVENT_HEADER)
 
         log.info(
             "experiment '%s' created in %s (vials=%s)",
@@ -511,6 +541,55 @@ class DataLogger:
                     bottle_contents_after or "",
                 ],
             )
+
+    def log_event(
+        self,
+        timestamp_iso: str,
+        level: str,
+        category: str,
+        message: str,
+        vial: Optional[int] = None,
+        data: Optional[dict] = None,
+    ) -> bool:
+        """Append one row to ``events.csv`` for the active experiment (SPEC §20.2).
+
+        Returns True if a row was written, False if skipped (no experiment
+        running). Unlike :meth:`log_escalation_event` this does NOT filter on
+        experiment vial membership — machine-wide events carry ``vial=None``,
+        and an event about a vial outside the run (a manual pump, a serial
+        fault) is still part of that run's story.
+
+        ``data`` is serialised to the ``data_json`` column; an unserialisable
+        value degrades to its ``repr`` rather than losing the whole row.
+        """
+        with self._lock:
+            if self._active_name is None:
+                return False
+            exp_dir = self._active_dir
+            elapsed_h = self._elapsed_hours_locked(timestamp_iso)
+            path = exp_dir / "events.csv"
+            if not path.exists():
+                self._init_csv(path, EVENT_HEADER)
+            if data:
+                try:
+                    data_json = json.dumps(data, sort_keys=True, default=str)
+                except (TypeError, ValueError):
+                    data_json = json.dumps({"repr": repr(data)})
+            else:
+                data_json = ""
+            self._append_row(
+                path,
+                [
+                    timestamp_iso,
+                    f"{elapsed_h:.4f}",
+                    str(level),
+                    str(category),
+                    "" if vial is None else int(vial),
+                    _one_line(message),
+                    data_json,
+                ],
+            )
+            return True
 
     def update_experiment_config(self, name: str, partial: dict) -> dict:
         """Deep-merge ``partial`` into the experiment's ``config.json``

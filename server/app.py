@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import functools
 import io
 import json
 import logging
@@ -45,12 +46,20 @@ from flask_socketio import SocketIO
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import data_export as dx  # noqa: E402
+import event_log as evlog  # noqa: E402
+from calibration_service import (  # noqa: E402
+    CalibrationConflict,
+    CalibrationService,
+    QCRefusal,
+    SUBSYSTEMS as CAL_SUBSYSTEMS,
+)
 from data_logger import DataLogger  # noqa: E402
 from experiment_engine import (  # noqa: E402
     ConflictError,
     ExperimentEngine,
     ExperimentStatus,
     InvalidExperimentStateError,
+    compute_pump_quantization,
 )
 from mock_serial_manager import MockSerialManager  # noqa: E402
 from serial_manager import HEATER_OFF_SETPOINT, MAX_SAFE_TEMP_C  # noqa: E402
@@ -75,6 +84,9 @@ EXPERIMENTS_DIR = PROJECT_ROOT / "experiments"
 # Server-side export bundles live OUTSIDE experiments/ so they don't get swept
 # up as bogus experiments by ExperimentEngine.list_experiments().
 EXPORTS_DIR = PROJECT_ROOT / "exports"
+# Rotating file logs (SPEC §20.1). Same filesystem as experiments/ on purpose:
+# the disk floor that protects the data is the one that must protect the logs.
+LOGS_DIR = PROJECT_ROOT / "logs"
 
 SENSOR_LOOP_INTERVAL_SECONDS = 10.0
 OD_LED_POWER = 2125  # CLAUDE.md: standard LED power for OD reads
@@ -186,12 +198,20 @@ class AppState:
         self.data_logger: DataLogger = data_logger
         self.watchdog: Watchdog | None = None  # set after socketio is created
         self.engine: ExperimentEngine | None = None  # set after socketio is created
+        self.cal_service: CalibrationService | None = None  # set in create_app
         self.sensor_thread_stop = threading.Event()
         self.shutdown_done = threading.Event()
         # Low-disk monitor state (sensor loop): throttle counter + edge latches.
         self.disk_check_counter = 0
         self.disk_warned = False
         self.disk_critical = False
+        # Observability (SPEC §20). The ring buffer is populated whether or not
+        # an experiment is running; bus/vial health are derived from the sensor
+        # arrays the loop already reads, so they work while idle too.
+        self.event_log = evlog.EventLog(data_logger)
+        self.bus_health = evlog.BusHealth()
+        self.vial_health = evlog.VialHealth(N_VIALS)
+        self.log_writes_suspended = False
 
 
 def _read_temperature_pair(state: AppState) -> dict:
@@ -290,6 +310,69 @@ def _disk_alert_decision(
             return "warning", True, False
         return None, True, False
     return None, False, False
+
+
+def _event_message(kind: str, payload: dict) -> str:
+    """One-line human summary for an experiment event (SPEC §20.2).
+
+    The structured detail still goes to the ``data_json`` column; this is the
+    line a researcher reads in the drawer or scanning events.csv six months
+    later, so it names the thing that happened rather than the event type.
+    """
+    vial = payload.get("vial")
+    name = payload.get("name") or ""
+    if kind == "pump":
+        return (
+            f"Pump {payload.get('direction', '?')} vial {vial} for "
+            f"{payload.get('duration_seconds', 0):.1f}s"
+        )
+    if kind == "pump_suppressed":
+        return (
+            f"Pump suppressed for vial {vial}: "
+            f"{payload.get('reason', 'unknown reason')}"
+        )
+    if kind in ("created", "started", "resumed"):
+        return f"Experiment '{name}' {kind}"
+    if kind == "stopped":
+        return f"Experiment '{name}' stopped ({payload.get('reason', 'manual')})"
+    if kind == "renamed":
+        return f"Experiment renamed: '{payload.get('old')}' -> '{payload.get('new')}'"
+    if kind == "metadata_updated":
+        return f"Experiment '{name}' metadata updated"
+    if kind == "maintenance_entered":
+        return f"Maintenance mode entered ({payload.get('reason', 'manual')})"
+    if kind == "maintenance_exited":
+        return (
+            f"Maintenance mode exited ({payload.get('reason', 'manual')}); "
+            f"{payload.get('queued_actions', 0)} queued pump action(s)"
+        )
+    if kind == "refill":
+        return f"Media/waste levels updated: {payload.get('bottles') or 'waste only'}"
+    if kind == "escalation_proposed":
+        return (
+            f"Vial {vial} escalation proposed: "
+            f"{payload.get('old_drug_conc')} -> {payload.get('new_drug_conc')}"
+        )
+    if kind == "escalation_confirmed":
+        return f"Vial {vial} escalation confirmed: {payload.get('new_drug_conc')}"
+    if kind == "od_blank_committed":
+        return (
+            f"Per-run OD blank committed for '{name}' "
+            f"({payload.get('n_vials', '?')} vials, offset up to "
+            f"{payload.get('max_offset_removed', '?')} OD removed)"
+        )
+    if kind == "calibration_installed":
+        return (
+            f"Calibration installed: {payload.get('subsystem', '?')} "
+            f"version {payload.get('version', '?')}"
+        )
+    if kind == "reconciliation":
+        ok = payload.get("within_tolerance")
+        return (
+            f"Mass reconciliation for '{name}': "
+            f"{'within' if ok else 'OUTSIDE'} ±10 %"
+        )
+    return kind.replace("_", " ")
 
 
 def _experiment_vials(name: str) -> list[int] | None:
@@ -399,10 +482,102 @@ def create_app(use_mock: bool):
     # sensor loop dies or stalls for >30 min, the watchdog zeros actuators
     # and broadcasts a critical alert to every connected browser.
 
+    # ------------------ Observability funnels (SPEC §20) ---------------------
+    # Every alert and every experiment event goes through exactly one of these
+    # two functions. They record to the ring buffer + events.csv and only then
+    # emit to the browser, so nothing can reach a browser without also being
+    # captured, and a repeating fault collapses into one entry with a count.
+
+    # experiment_event "type" -> (level, category). Anything unmapped is
+    # recorded as info/experiment rather than dropped.
+    _EVENT_KINDS = {
+        "created": (evlog.LEVEL_INFO, evlog.CATEGORY_LIFECYCLE),
+        "started": (evlog.LEVEL_INFO, evlog.CATEGORY_LIFECYCLE),
+        "stopped": (evlog.LEVEL_INFO, evlog.CATEGORY_LIFECYCLE),
+        "resumed": (evlog.LEVEL_INFO, evlog.CATEGORY_LIFECYCLE),
+        "renamed": (evlog.LEVEL_INFO, evlog.CATEGORY_LIFECYCLE),
+        "metadata_updated": (evlog.LEVEL_INFO, evlog.CATEGORY_LIFECYCLE),
+        "pump": (evlog.LEVEL_INFO, evlog.CATEGORY_PUMP),
+        "pump_suppressed": (evlog.LEVEL_WARNING, evlog.CATEGORY_PUMP),
+        "maintenance_entered": (evlog.LEVEL_INFO, evlog.CATEGORY_MAINTENANCE),
+        "maintenance_exited": (evlog.LEVEL_INFO, evlog.CATEGORY_MAINTENANCE),
+        "refill": (evlog.LEVEL_INFO, evlog.CATEGORY_MEDIA),
+        "escalation_proposed": (evlog.LEVEL_INFO, evlog.CATEGORY_ESCALATION),
+        "escalation_confirmed": (evlog.LEVEL_INFO, evlog.CATEGORY_ESCALATION),
+        "od_blank_committed": (evlog.LEVEL_INFO, evlog.CATEGORY_CALIBRATION),
+        "calibration_installed": (evlog.LEVEL_INFO, evlog.CATEGORY_CALIBRATION),
+        "reconciliation": (evlog.LEVEL_INFO, evlog.CATEGORY_CALIBRATION),
+    }
+
+    def _emit_alert(
+        level: str,
+        message: str,
+        *,
+        category: str = evlog.CATEGORY_SYSTEM,
+        vial=None,
+        data=None,
+        dedup_key=None,
+        timestamp=None,
+    ) -> None:
+        """Record an alert, then emit it unless the rate limiter suppressed
+        this occurrence as a repeat."""
+        entry = state.event_log.record(
+            level=level,
+            category=category,
+            message=message,
+            vial=vial,
+            data=data,
+            dedup_key=dedup_key,
+            timestamp=timestamp,
+        )
+        if entry is not None:
+            socketio.emit("alert", entry)
+
+    def _emit_alert_payload(payload: dict) -> None:
+        """Adapter for engine/watchdog callbacks that already build a payload."""
+        entry = state.event_log.record_alert(payload)
+        if entry is not None:
+            socketio.emit("alert", entry)
+
+    def _emit_event(payload: dict) -> None:
+        """Record an experiment event and mirror it to the browser.
+
+        The socket payload is the caller's original shape -- the dashboard
+        already keys off `type`, `vial`, `direction` -- so this stays additive.
+        """
+        payload = dict(payload or {})
+        payload.setdefault("timestamp", _now_iso())
+        kind = payload.get("type", "event")
+        level, category = _EVENT_KINDS.get(
+            kind, (evlog.LEVEL_INFO, "experiment")
+        )
+        detail = {k: v for k, v in payload.items()
+                  if k not in ("type", "timestamp", "vial")}
+        state.event_log.record(
+            level=level,
+            category=category,
+            message=_event_message(kind, payload),
+            vial=payload.get("vial"),
+            data=detail or None,
+            timestamp=payload.get("timestamp"),
+        )
+        if kind == "stopped":
+            # A per-run OD blank belongs to one run (SPEC §19.2): restore the
+            # pristine calibration so idle reads stop carrying its re-anchor.
+            try:
+                clear = getattr(state.manager, "clear_od_blank", None)
+                if clear is not None:
+                    clear()
+                    if getattr(state.manager, "od_cal", None) is not None:
+                        state.od_cal = np.asarray(state.manager.od_cal)
+            except Exception:
+                log.exception("clearing per-run OD blank on stop failed")
+        socketio.emit("experiment_event", payload)
+
     def _on_watchdog_trigger(reason: str) -> None:
-        socketio.emit(
-            "alert",
-            {"level": "critical", "message": reason, "timestamp": _now_iso()},
+        _emit_alert(
+            "critical", reason,
+            category=evlog.CATEGORY_SYSTEM, dedup_key="watchdog",
         )
 
     watchdog = Watchdog(
@@ -422,11 +597,50 @@ def create_app(use_mock: bool):
         serial_manager=manager,
         data_logger=data_logger,
         experiments_root=EXPERIMENTS_DIR,
-        on_event=lambda evt: socketio.emit("experiment_event", evt),
-        on_alert=lambda evt: socketio.emit("alert", evt),
+        on_event=_emit_event,
+        on_alert=_emit_alert_payload,
         temp_cal=temp_cal,
     )
     state.engine = engine
+
+    # ------------------- Calibration service (SPEC §19) ----------------------
+    # Versioned provenance store + the O2/O3/O4 wizard sessions. Bootstrap
+    # imports the inherited 2016 .txt files as versioned envelopes on first
+    # run (a no-op once calibration/current.json exists) and resumes any
+    # in-flight pump calibration session from _sessions/pump.json.
+
+    cal_service = CalibrationService(CAL_DIR, EXPERIMENTS_DIR, manager)
+    state.cal_service = cal_service
+    try:
+        imported = cal_service.bootstrap()
+        if imported:
+            log.info("calibration store: imported legacy files for %s", imported)
+    except Exception:
+        log.exception("calibration store bootstrap failed")
+
+    def _sync_od_cal_from_manager() -> None:
+        """Keep AppState's od_cal copy (used to invert calibrated OD back to
+        raw for API responses) in step with the manager's, which is the one a
+        per-run blank re-anchors."""
+        if getattr(state.manager, "od_cal", None) is not None:
+            state.od_cal = np.asarray(state.manager.od_cal)
+
+    def _apply_experiment_blank(name: str) -> None:
+        """Re-apply a committed per-run blank to the live manager (used on
+        commit and on crash-resume, so a restart keeps the re-anchored OD)."""
+        blank = cal_service.load_experiment_blank(name)
+        if blank is None:
+            return
+        c_run = blank.get("fit", {}).get("c_run") or {}
+        try:
+            state.manager.apply_od_blank(
+                {int(k): float(v) for k, v in c_run.items()}
+            )
+            _sync_od_cal_from_manager()
+            log.info("re-applied per-run OD blank for '%s' (%d vials)",
+                     name, len(c_run))
+        except Exception:
+            log.exception("failed to apply per-run OD blank for '%s'", name)
 
     # ------------------------------ HTTP routes ------------------------------
 
@@ -520,7 +734,7 @@ def create_app(use_mock: bool):
         the calibration math).
 
         Raw setpoint integers are NOT accepted here — use
-        ``/api/actuators/temperature/raw`` (calibration wizard / debug)."""
+        ``/api/calibration/raw/temperature`` (calibration-only escape hatch)."""
         body = request.get_json(silent=True) or {}
         values_c = body.get("values_c")
         err = _validate_float_array(
@@ -561,6 +775,12 @@ def create_app(use_mock: bool):
             )
         except Exception as exc:
             log.exception("set_temperature_celsius failed")
+            _emit_alert(
+                "critical",
+                f"Setting heater temperature failed: {exc}",
+                category=evlog.CATEGORY_HEATER,
+                dedup_key="set_temperature_failed",
+            )
             return jsonify(error=f"set_temperature_celsius failed: {exc}"), 500
         # Echo back the raw setpoints we actually sent — useful for the
         # frontend to confirm and for tests.
@@ -573,51 +793,11 @@ def create_app(use_mock: bool):
             temperature_setpoint_raw=[int(v) for v in current_raw],
         )
 
-    @flask_app.route("/api/actuators/temperature/raw", methods=["POST"])
-    def api_set_temperature_raw():
-        """Escape hatch for calibration wizard and low-level debugging.
-
-        Body: ``{"setpoints": [<int>, ...]}`` — 16 raw `xr` setpoint
-        integers. The convention is INVERTED — lower value = hotter
-        target. ``HEATER_OFF_SETPOINT`` (4095) is "off"; ``0`` requests
-        ~82 °C (drives heater to max).
-
-        SerialManager enforces a per-vial floor on the integer derived
-        from MAX_SAFE_TEMP_C, so even via this endpoint you cannot ask
-        for a target hotter than the software cap."""
-        body = request.get_json(silent=True) or {}
-        setpoints = body.get("setpoints")
-        err = _validate_int_array(setpoints, N_VIALS, 0, HEATER_OFF_SETPOINT, "setpoints")
-        if err is not None:
-            return jsonify(error=err), 400
-        if state.engine is not None and state.engine.is_running:
-            locked = state.engine.loaded_vials
-            current_raw = np.asarray(
-                getattr(state.manager, "temp_setpoint_raw", np.full(N_VIALS, HEATER_OFF_SETPOINT))
-            )
-            for v in locked:
-                if int(setpoints[v]) != int(current_raw[v]):
-                    return jsonify(
-                        error=(
-                            f"vial {v} is controlled by experiment "
-                            f"'{state.engine.loaded_experiment}'"
-                        )
-                    ), 409
-        try:
-            current = state.manager.set_temperature_raw(
-                [int(v) for v in setpoints]
-            )
-        except Exception as exc:
-            log.exception("set_temperature_raw failed")
-            return jsonify(error=f"set_temperature_raw failed: {exc}"), 500
-        current_raw = np.asarray(
-            getattr(state.manager, "temp_setpoint_raw", np.full(N_VIALS, HEATER_OFF_SETPOINT))
-        ).tolist()
-        return jsonify(
-            status="ok",
-            current_temp_c=list(current),
-            temperature_setpoint_raw=[int(v) for v in current_raw],
-        )
+    # NOTE: the raw temperature escape hatch used to live at
+    # /api/actuators/temperature/raw. It moved behind /api/calibration/raw/*
+    # (SPEC §19.6): calibration is the only permitted consumer of raw actuator
+    # paths, and given the inverted `xr` convention a raw heater setpoint on
+    # the ordinary actuator surface was an accident waiting to happen.
 
     @flask_app.route("/api/actuators/stir", methods=["POST"])
     def api_set_stir():
@@ -643,33 +823,144 @@ def create_app(use_mock: bool):
             state.manager.set_stir([int(v) for v in values])
         except Exception as exc:
             log.exception("set_stir failed")
+            _emit_alert(
+                "warning",
+                f"Setting stir rate failed: {exc}",
+                category=evlog.CATEGORY_ACTUATOR,
+                dedup_key="set_stir_failed",
+            )
             return jsonify(error=f"set_stir failed: {exc}"), 500
         return jsonify(status="ok")
 
-    @flask_app.route("/api/actuators/pump", methods=["POST"])
-    def api_pump():
+    def _resolve_vial_flow_rate(vial: int, direction: str = "influx") -> float:
+        """Best-effort per-pump flow rate for mL<->seconds conversion.
+        Direction-aware since Session O3a: influx and efflux are separate
+        pumps with independent rates. Falls back to 1.0 mL/s only if the
+        engine somehow isn't constructed yet."""
+        if state.engine is None:
+            return 1.0
+        return state.engine.flow_rate_ml_s(vial, direction)
+
+    @flask_app.route("/api/actuators/pump/preview", methods=["POST"])
+    def api_pump_preview():
+        """SPEC §16: quantisation preview, no side effects. Shown by the
+        frontend before firing a mL-mode manual pump so the operator sees
+        the achievable volume, not just the requested one."""
         body = request.get_json(silent=True) or {}
         vial = body.get("vial")
         direction = body.get("direction")
-        seconds = body.get("seconds")
+        volume_ml = body.get("volume_ml")
         if not isinstance(vial, int) or not (0 <= vial < N_VIALS):
             return jsonify(error=f"'vial' must be an integer in 0..{N_VIALS - 1}"), 400
         if direction not in ("influx", "efflux"):
             return jsonify(error="'direction' must be 'influx' or 'efflux'"), 400
-        if not isinstance(seconds, (int, float)) or isinstance(seconds, bool):
-            return jsonify(error="'seconds' must be a number"), 400
-        if not (0 < seconds <= PUMP_MAX_SECONDS):
-            return jsonify(error=f"'seconds' must be in (0, {PUMP_MAX_SECONDS}]"), 400
+        if not isinstance(volume_ml, (int, float)) or isinstance(volume_ml, bool) or volume_ml <= 0:
+            return jsonify(error="'volume_ml' must be a positive number"), 400
+        flow_rate = _resolve_vial_flow_rate(int(vial), direction)
+        q = compute_pump_quantization(float(volume_ml), flow_rate)
+        return jsonify(
+            deliverable_ml=round(q["deliverable_ml"], 4),
+            seconds=q["seconds"],
+            min_ml=round(q["min_ml"], 4),
+            quantised=q["quantised"],
+        )
+
+    @flask_app.route("/api/actuators/pump", methods=["POST"])
+    def api_pump():
+        """Fire a single manual pump. Accepts either `seconds` (legacy,
+        unchanged) or `volume_ml` (SPEC §16) -- exactly one of the two.
+
+        `volume_ml` is converted to a whole-second duration via the vial's
+        resolved flow rate (`ExperimentEngine.flow_rate_ml_s`); requests
+        that would quantise to 0 s are rejected rather than silently
+        truncated (the legacy `%d` bug, SPEC §9).
+
+        Either mode debits the vial's mapped media bottle / credits waste
+        if one is loaded (`ExperimentEngine.record_manual_pump`) -- this
+        fixes a pre-existing gap where manual pumps never touched media
+        accounting at all."""
+        body = request.get_json(silent=True) or {}
+        vial = body.get("vial")
+        direction = body.get("direction")
+        seconds_in = body.get("seconds")
+        volume_ml_in = body.get("volume_ml")
+        if not isinstance(vial, int) or not (0 <= vial < N_VIALS):
+            return jsonify(error=f"'vial' must be an integer in 0..{N_VIALS - 1}"), 400
+        if direction not in ("influx", "efflux"):
+            return jsonify(error="'direction' must be 'influx' or 'efflux'"), 400
+        if (seconds_in is None) == (volume_ml_in is None):
+            return jsonify(error="specify exactly one of 'seconds' or 'volume_ml'"), 400
+
         lock = _experiment_locks_vial(int(vial))
         if lock is not None:
             return jsonify(
                 error=f"vial {lock[0]} is controlled by experiment '{lock[1]}'"
             ), 409
+
+        requested_ml = None
+        delivered_ml = None
+        flow_rate = None
+        if volume_ml_in is not None:
+            if not isinstance(volume_ml_in, (int, float)) or isinstance(volume_ml_in, bool):
+                return jsonify(error="'volume_ml' must be a number"), 400
+            if volume_ml_in <= 0:
+                return jsonify(error="'volume_ml' must be > 0"), 400
+            flow_rate = _resolve_vial_flow_rate(int(vial), direction)
+            q = compute_pump_quantization(float(volume_ml_in), flow_rate)
+            if q["seconds"] < 1:
+                return jsonify(error=(
+                    f"'volume_ml'={volume_ml_in} is below the minimum "
+                    f"deliverable dose for vial {vial} {direction} "
+                    f"({q['min_ml']:.2f} mL at {flow_rate:.3f} mL/s) -- "
+                    "request at least that much, or use 'seconds' directly"
+                )), 400
+            if q["seconds"] > PUMP_MAX_SECONDS:
+                return jsonify(error=(
+                    f"'volume_ml'={volume_ml_in} would require {q['seconds']}s, "
+                    f"over the {PUMP_MAX_SECONDS:.0f}s manual pump ceiling"
+                )), 400
+            seconds = float(q["seconds"])
+            requested_ml = float(volume_ml_in)
+            delivered_ml = q["deliverable_ml"]
+        else:
+            if not isinstance(seconds_in, (int, float)) or isinstance(seconds_in, bool):
+                return jsonify(error="'seconds' must be a number"), 400
+            if not (0 < seconds_in <= PUMP_MAX_SECONDS):
+                return jsonify(error=f"'seconds' must be in (0, {PUMP_MAX_SECONDS}]"), 400
+            seconds = float(seconds_in)
+
         try:
-            state.manager.pump_command(int(vial), direction, float(seconds))
+            state.manager.pump_command(int(vial), direction, seconds)
         except Exception as exc:
             log.exception("pump_command failed")
+            _emit_alert(
+                "critical",
+                f"Manual pump failed (vial {vial}, {direction}): {exc}",
+                category=evlog.CATEGORY_PUMP, vial=int(vial),
+                dedup_key=("pump_command_failed", int(vial), direction),
+            )
             return jsonify(error=f"pump_command failed: {exc}"), 500
+
+        if state.engine is not None:
+            try:
+                actual_flow_rate = (
+                    flow_rate if flow_rate is not None
+                    else _resolve_vial_flow_rate(int(vial), direction)
+                )
+                actual_delivered_ml = (
+                    delivered_ml if delivered_ml is not None else seconds * actual_flow_rate
+                )
+                state.engine.record_manual_pump(int(vial), direction, actual_delivered_ml)
+            except Exception:
+                log.exception("record_manual_pump failed")
+                _emit_alert(
+                    "warning",
+                    f"Manual pump on vial {vial} was not recorded in controller "
+                    "state -- media totals and dilution timing may now be wrong",
+                    category=evlog.CATEGORY_PUMP, vial=int(vial),
+                    dedup_key="record_manual_pump_failed",
+                )
+
         timestamp = _now_iso()
         # No-op if no experiment is running or `vial` is not part of it.
         try:
@@ -680,18 +971,28 @@ def create_app(use_mock: bool):
                 duration_seconds=float(seconds),
             )
         except Exception:
+            # Silent data loss: the pump fired but the CSV never got the row.
             log.exception("data_logger.log_pump_event failed")
-        socketio.emit(
-            "experiment_event",
-            {
-                "type": "pump",
-                "vial": int(vial),
-                "direction": direction,
-                "duration_seconds": float(seconds),
-                "timestamp": timestamp,
-            },
-        )
-        return jsonify(status="ok")
+            _emit_alert(
+                "critical",
+                f"Pump fired but was NOT logged to CSV (vial {vial}, {direction}) "
+                "-- the run record is now incomplete",
+                category=evlog.CATEGORY_PUMP, vial=int(vial),
+                dedup_key="log_pump_event_failed",
+            )
+        _emit_event({
+            "type": "pump",
+            "vial": int(vial),
+            "direction": direction,
+            "duration_seconds": float(seconds),
+            "timestamp": timestamp,
+        })
+        response = {"status": "ok"}
+        if requested_ml is not None:
+            response["requested_ml"] = requested_ml
+            response["delivered_ml"] = round(delivered_ml, 4)
+            response["seconds"] = int(seconds)
+        return jsonify(**response)
 
     @flask_app.route("/api/actuators/emergency_stop", methods=["POST"])
     def api_emergency_stop():
@@ -707,13 +1008,10 @@ def create_app(use_mock: bool):
             return jsonify(error=f"emergency_shutdown failed: {exc}"), 500
         # Notify every connected browser so a stop from one tab is visible
         # in all the others (SPEC §7 alert event).
-        socketio.emit(
-            "alert",
-            {
-                "level": "critical",
-                "message": "Emergency stop — all actuators zeroed",
-                "timestamp": timestamp,
-            },
+        _emit_alert(
+            "critical", "Emergency stop — all actuators zeroed",
+            category=evlog.CATEGORY_ACTUATOR, timestamp=timestamp,
+            dedup_key="emergency_stop",
         )
         if state.engine is not None:
             try:
@@ -733,13 +1031,29 @@ def create_app(use_mock: bool):
     @flask_app.route("/api/experiments/create", methods=["POST"])
     def api_experiments_create():
         body = request.get_json(silent=True) or {}
+        # SPEC §19.1 provenance: record the calibration versions this run
+        # will use, plus the measured 32-pump flow rates when a complete pump
+        # calibration exists. Caller-supplied values win (deep-merged last).
+        calibration_body = dict(body.get("calibration") or {})
+        try:
+            versions = cal_service.store.current_versions()
+            provenance = {
+                sub: versions.get(sub) for sub in CAL_SUBSYSTEMS
+            }
+            provenance["vial_map"] = versions.get("vial_map")
+            rates = cal_service.store.current_pump_rates()
+            if rates is not None and "pump_flow_rates" not in calibration_body:
+                provenance["pump_flow_rates"] = rates
+            calibration_body = {**provenance, **calibration_body}
+        except Exception:
+            log.exception("calibration provenance enrichment failed")
         try:
             config = state.engine.create_experiment(
                 name=body.get("name"),
                 mode=body.get("mode", "turbidostat"),
                 vials=body.get("vials"),
                 parameters=body.get("params") or body.get("parameters") or {},
-                calibration=body.get("calibration") or {},
+                calibration=calibration_body,
                 notes=body.get("notes", ""),
                 media=body.get("media"),
             )
@@ -751,10 +1065,35 @@ def create_app(use_mock: bool):
             return jsonify(error=str(exc)), 409
         except RuntimeError as exc:
             return jsonify(error=str(exc)), 409
-        return jsonify(status="created", name=config["name"])
+        # Control-parameter warnings (SPEC §9 / CONTROL_MODE_AUDIT.md C-3):
+        # configurations that will run but not deliver what was asked for --
+        # a clipped chemostat bolus, a band whose whole-second truncation
+        # eats a large share of each dilution. Hard errors already 400'd
+        # above; these are for the wizard's review step to show.
+        return jsonify(
+            status="created",
+            name=config["name"],
+            warnings=config.get("warnings") or [],
+        )
 
     @flask_app.route("/api/experiments/<name>/start", methods=["POST"])
     def api_experiments_start(name):
+        body = request.get_json(silent=True) or {}
+        # Per-run OD blank hard block (CALIBRATION_PROTOCOL §13: "hard block,
+        # not a warning"). Without a blank the machine reports OD 0.12-0.44
+        # for sterile medium, vial-dependent. Overridable only explicitly,
+        # and the override is recorded through the alert funnel.
+        blank_missing = not (EXPERIMENTS_DIR / name / "od_blank.json").is_file()
+        if blank_missing and not body.get("allow_missing_od_blank"):
+            return jsonify(
+                error=(
+                    f"no per-run OD blank has been taken for '{name}' — run "
+                    "the OD blank wizard (Calibration tab) immediately before "
+                    "starting, or pass allow_missing_od_blank=true to start "
+                    "anyway (recorded)"
+                ),
+                code="missing_od_blank",
+            ), 409
         try:
             state.engine.start_experiment(name)
         except InvalidExperimentStateError as exc:
@@ -763,6 +1102,19 @@ def create_app(use_mock: bool):
             return jsonify(error=str(exc)), 400
         except RuntimeError as exc:
             return jsonify(error=str(exc)), 500
+        if blank_missing:
+            _emit_alert(
+                "warning",
+                f"Experiment '{name}' started WITHOUT a per-run OD blank — "
+                "reported OD carries a vial-specific offset of up to ~0.44 "
+                "(CALIBRATION_PROTOCOL §1.1)",
+                category=evlog.CATEGORY_CALIBRATION,
+                dedup_key=("blank_override", name),
+            )
+        else:
+            # Belt and braces: make sure the committed blank is live on the
+            # manager (commit already applied it in this process lifetime).
+            _apply_experiment_blank(name)
         return jsonify(status="running", name=name)
 
     @flask_app.route("/api/experiments/<name>/stop", methods=["POST"])
@@ -927,6 +1279,72 @@ def create_app(use_mock: bool):
         EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
         return send_from_directory(EXPORTS_DIR, filename, as_attachment=True)
 
+    @flask_app.route("/api/events/recent", methods=["GET"])
+    def api_events_recent():
+        """Server-side event ring buffer (SPEC §20.4).
+
+        Populated whether or not an experiment is running, so the browser can
+        rebuild its alert drawer after a reload -- or on a second machine --
+        without a per-experiment events.csv to read from.
+
+        ``level`` is a MINIMUM severity: level=warning returns warnings and
+        criticals, which is what an operator filtering for problems expects.
+        """
+        level = request.args.get("level") or None
+        if level is not None and level not in evlog.LEVELS:
+            return jsonify(
+                error=f"'level' must be one of {list(evlog.LEVELS)}"
+            ), 400
+        category = request.args.get("category") or None
+        vial_arg = request.args.get("vial")
+        vial = None
+        if vial_arg not in (None, ""):
+            try:
+                vial = int(vial_arg)
+            except ValueError:
+                return jsonify(error="'vial' must be an integer"), 400
+            if not (0 <= vial < N_VIALS):
+                return jsonify(error=f"'vial' must be in 0..{N_VIALS - 1}"), 400
+        try:
+            limit = int(request.args.get("limit", 100))
+        except ValueError:
+            return jsonify(error="'limit' must be an integer"), 400
+        limit = max(1, min(limit, evlog.DEFAULT_RING_SIZE))
+        unacked = str(request.args.get("unacked_only", "")).lower() in ("1", "true", "yes")
+        return jsonify(
+            events=state.event_log.recent(
+                level=level, category=category, vial=vial,
+                limit=limit, unacked_only=unacked,
+            ),
+            counts=state.event_log.counts(),
+        )
+
+    @flask_app.route("/api/events/<int:event_id>/ack", methods=["POST"])
+    def api_events_ack(event_id):
+        """Acknowledge one event. Criticals persist in the drawer until this is
+        called; the acknowledgement is itself recorded as an event (SPEC §20.4)."""
+        body = request.get_json(silent=True) or {}
+        by = str(body.get("by") or "operator")[:64]
+        entry = state.event_log.acknowledge(event_id, by=by)
+        if entry is None:
+            return jsonify(error=f"event {event_id} not found"), 404
+        return jsonify(status="acknowledged", event=entry)
+
+    @flask_app.route("/api/health", methods=["GET"])
+    def api_health():
+        """RS485 bus health, per-vial sleeve health, and file-logging state.
+
+        Distinct from the socket.io connection the browser already tracks: Flask
+        can be perfectly reachable while the serial link is dead, which is
+        exactly the case that used to show 'connected' beside stale readings.
+        """
+        return jsonify(
+            bus=state.bus_health.snapshot(),
+            vials=state.vial_health.snapshot(),
+            file_logging=evlog.file_log_status(),
+            events=state.event_log.counts(),
+        )
+
     @flask_app.route("/api/storage", methods=["GET"])
     def api_storage():
         return jsonify(dx.storage_report(EXPERIMENTS_DIR, EXPORTS_DIR))
@@ -1013,8 +1431,15 @@ def create_app(use_mock: bool):
         try:
             if queued:
                 _execute_queued_pump_actions(queued)
-        except Exception:
+        except Exception as exc:
             log.exception("execute queued pump actions failed on exit")
+            _emit_alert(
+                "critical",
+                "Dilutions queued during maintenance were NOT delivered on "
+                f"resume: {exc}",
+                category=evlog.CATEGORY_PUMP,
+                dedup_key="queued_pump_exit_failed",
+            )
         return jsonify(
             status="resumed",
             fired=len(queued),
@@ -1072,6 +1497,319 @@ def create_app(use_mock: bool):
             return jsonify(error=str(exc)), 400
         return jsonify(status="confirmed", **result)
 
+    # ---------------------- Calibration routes (SPEC §19) --------------------
+    # The wizard surface for CALIBRATION_PROTOCOL.md Part II. Every mutating
+    # route rejects with 409 while an experiment is RUNNING, and these are the
+    # ONLY routes permitted to reach the raw actuator paths (§19.6).
+
+    def _cal_route(mutating: bool = True):
+        """Decorator: RUNNING-experiment guard + exception -> HTTP mapping
+        (ValueError 400, CalibrationConflict 409, QCRefusal 422 with the qc
+        block, FileNotFoundError 404)."""
+        def decorate(fn):
+            @functools.wraps(fn)
+            def wrapper(*args, **kwargs):
+                if mutating and state.engine is not None and state.engine.is_running:
+                    return jsonify(
+                        error=(
+                            "calibration is unavailable while an experiment "
+                            "is RUNNING (SPEC §19.6) — stop it first"
+                        ),
+                        code="experiment_running",
+                    ), 409
+                try:
+                    return fn(*args, **kwargs)
+                except QCRefusal as exc:
+                    return jsonify(error=str(exc), code="qc_refused",
+                                   qc=exc.qc), 422
+                except CalibrationConflict as exc:
+                    return jsonify(error=str(exc), code="conflict"), 409
+                except FileNotFoundError as exc:
+                    return jsonify(error=str(exc)), 404
+                except ValueError as exc:
+                    return jsonify(error=str(exc)), 400
+            return wrapper
+        return decorate
+
+    def _loaded_experiment_info() -> tuple[str | None, str | None]:
+        if state.engine is None:
+            return None, None
+        return state.engine.loaded_experiment, state.engine.status_string
+
+    @flask_app.route("/api/calibration/", methods=["GET"])
+    @_cal_route(mutating=False)
+    def api_calibration_index():
+        name, status = _loaded_experiment_info()
+        return jsonify(cal_service.index(
+            loaded_experiment=name, loaded_status=status,
+        ))
+
+    @flask_app.route("/api/calibration/history", methods=["GET"])
+    @_cal_route(mutating=False)
+    def api_calibration_history():
+        return jsonify(cal_service.store.history())
+
+    @flask_app.route("/api/calibration/staleness", methods=["GET"])
+    @_cal_route(mutating=False)
+    def api_calibration_staleness():
+        name, status = _loaded_experiment_info()
+        return jsonify(cal_service.store.staleness(
+            loaded_experiment=name, loaded_status=status,
+        ))
+
+    @flask_app.route("/api/calibration/<subsystem>", methods=["GET"])
+    @_cal_route(mutating=False)
+    def api_calibration_subsystem(subsystem):
+        return jsonify(cal_service.subsystem(subsystem))
+
+    # --- per-run OD blank (§19.2 / CALIBRATION_PROTOCOL §5.4) ----------------
+
+    @flask_app.route("/api/calibration/od/blank/start", methods=["POST"])
+    @_cal_route()
+    def api_blank_start():
+        body = request.get_json(silent=True) or {}
+        name, status = _loaded_experiment_info()
+        if name is None:
+            return jsonify(
+                error="no experiment is loaded — create one first; the blank "
+                      "is taken against a CREATED experiment immediately "
+                      "before start",
+                code="conflict",
+            ), 409
+        config_path = EXPERIMENTS_DIR / name / "config.json"
+        try:
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+        except Exception:
+            return jsonify(error=f"failed to read {config_path}"), 500
+        params = config.get("parameters", {})
+        stir_pwm = body.get("stir_pwm", params.get("stir_rate", 10))
+        led_power = body.get("led_power", OD_LED_POWER)
+        return jsonify(cal_service.blank_start(
+            experiment=name,
+            config=config,
+            engine_status=status,
+            led_power=int(led_power),
+            stir_pwm=int(stir_pwm),
+            expected_led_power=OD_LED_POWER,
+            n_samples=int(body.get("n_samples", 5)),
+        ))
+
+    @flask_app.route("/api/calibration/od/blank/dark", methods=["POST"])
+    @_cal_route()
+    def api_blank_dark():
+        body = request.get_json(silent=True) or {}
+        return jsonify(cal_service.blank_dark(body.get("session", "")))
+
+    @flask_app.route("/api/calibration/od/blank/measure", methods=["POST"])
+    @_cal_route()
+    def api_blank_measure():
+        body = request.get_json(silent=True) or {}
+        return jsonify(cal_service.blank_measure(body.get("session", "")))
+
+    @flask_app.route("/api/calibration/od/blank/commit", methods=["POST"])
+    @_cal_route()
+    def api_blank_commit():
+        body = request.get_json(silent=True) or {}
+        name, _status = _loaded_experiment_info()
+        result = cal_service.blank_commit(
+            body.get("session", ""),
+            exclude_vials=body.get("exclude_vials"),
+            override_reason=body.get("override_reason"),
+            operator=str(body.get("operator", "unknown")),
+        )
+        # Apply the re-anchor to the live manager so every read from now on
+        # (including CREATED-state idle reads) uses the blanked curve.
+        try:
+            state.manager.apply_od_blank(
+                {int(k): float(v) for k, v in result["c_run"].items()}
+            )
+            _sync_od_cal_from_manager()
+        except Exception:
+            log.exception("apply_od_blank after commit failed")
+        # Provenance: the run must record which blank it used (§19.1).
+        if name is not None:
+            try:
+                state.engine.record_calibration_provenance(name, {
+                    "od_blank": f"experiments/{name}/od_blank.json",
+                    "od": result.get("parent_od_cal"),
+                })
+            except Exception:
+                log.exception("recording blank provenance failed")
+        offsets = [abs(v) for v in result["od_offset_removed"].values()]
+        _emit_event({
+            "type": "od_blank_committed",
+            "name": name,
+            "n_vials": len(result["c_run"]),
+            "max_offset_removed": round(max(offsets), 3) if offsets else None,
+            "qc_passed": result["qc"]["passed"],
+        })
+        return jsonify(result)
+
+    @flask_app.route("/api/calibration/od/blank/abort", methods=["POST"])
+    @_cal_route()
+    def api_blank_abort():
+        body = request.get_json(silent=True) or {}
+        return jsonify(cal_service.blank_abort(body.get("session", "")))
+
+    # --- pump gravimetric (§19.3 / CALIBRATION_PROTOCOL §7) ------------------
+
+    @flask_app.route("/api/calibration/pump/start", methods=["POST"])
+    @_cal_route()
+    def api_pump_cal_start():
+        body = request.get_json(silent=True) or {}
+        return jsonify(cal_service.pump_start(body))
+
+    @flask_app.route("/api/calibration/pump/fire", methods=["POST"])
+    @_cal_route()
+    def api_pump_cal_fire():
+        body = request.get_json(silent=True) or {}
+        pump_id = body.get("pump_id")
+        if not isinstance(pump_id, int) or isinstance(pump_id, bool):
+            return jsonify(error="'pump_id' must be an integer 0..31"), 400
+        return jsonify(cal_service.pump_fire(pump_id))
+
+    @flask_app.route("/api/calibration/pump/record", methods=["POST"])
+    @_cal_route()
+    def api_pump_cal_record():
+        body = request.get_json(silent=True) or {}
+        pump_id = body.get("pump_id")
+        replicate = body.get("replicate")
+        if not isinstance(pump_id, int) or isinstance(pump_id, bool):
+            return jsonify(error="'pump_id' must be an integer 0..31"), 400
+        if not isinstance(replicate, int) or isinstance(replicate, bool):
+            return jsonify(error="'replicate' must be an integer"), 400
+        return jsonify(cal_service.pump_record(
+            pump_id, replicate, body.get("mass_g"),
+        ))
+
+    @flask_app.route("/api/calibration/pump/session", methods=["GET"])
+    @_cal_route(mutating=False)
+    def api_pump_cal_session():
+        return jsonify(cal_service.pump_session())
+
+    @flask_app.route("/api/calibration/pump/finish", methods=["POST"])
+    @_cal_route()
+    def api_pump_cal_finish():
+        body = request.get_json(silent=True) or {}
+        result = cal_service.pump_finish(
+            override_reason=body.get("override_reason"),
+            operator=body.get("operator"),
+        )
+        _emit_event({
+            "type": "calibration_installed",
+            "subsystem": "pump",
+            "version": result["version"],
+            "complete": result["flow_rates_complete"],
+        })
+        return jsonify(result)
+
+    @flask_app.route("/api/calibration/pump/abort", methods=["POST"])
+    @_cal_route()
+    def api_pump_cal_abort():
+        return jsonify(cal_service.pump_abort())
+
+    # --- raw escape hatches, calibration-only (§19.6) ------------------------
+
+    @flask_app.route("/api/calibration/raw/temperature", methods=["POST"])
+    @_cal_route()
+    def api_cal_raw_temperature():
+        """Raw `xr` setpoints for the calibration wizard / low-level debug.
+
+        The convention is INVERTED — lower value = hotter target;
+        HEATER_OFF_SETPOINT (4095) is "off"; 0 requests ~82 °C.
+        SerialManager still enforces the MAX_SAFE_TEMP_C-derived floor, so
+        even here you cannot request hotter than the software cap."""
+        body = request.get_json(silent=True) or {}
+        setpoints = body.get("setpoints")
+        err = _validate_int_array(
+            setpoints, N_VIALS, 0, HEATER_OFF_SETPOINT, "setpoints"
+        )
+        if err is not None:
+            return jsonify(error=err), 400
+        try:
+            current = state.manager.set_temperature_raw(
+                [int(v) for v in setpoints]
+            )
+        except Exception as exc:
+            log.exception("set_temperature_raw failed")
+            return jsonify(error=f"set_temperature_raw failed: {exc}"), 500
+        current_raw = np.asarray(
+            getattr(state.manager, "temp_setpoint_raw",
+                    np.full(N_VIALS, HEATER_OFF_SETPOINT))
+        ).tolist()
+        return jsonify(
+            status="ok",
+            current_temp_c=list(current),
+            temperature_setpoint_raw=[int(v) for v in current_raw],
+        )
+
+    @flask_app.route("/api/calibration/raw/od_led", methods=["POST"])
+    @_cal_route()
+    def api_cal_raw_od_led():
+        """Raw OD read at an arbitrary LED power (0 = dark read). Returns
+        per-vial median/sd/n_valid of the raw counts — the same primitive
+        the blank wizard uses."""
+        body = request.get_json(silent=True) or {}
+        power = body.get("power")
+        if not isinstance(power, (int, float)) or isinstance(power, bool) \
+                or not (0 <= power <= 2200):
+            return jsonify(error="'power' must be a number in 0..2200"), 400
+        n_samples = body.get("n_samples", 5)
+        if not isinstance(n_samples, int) or isinstance(n_samples, bool) \
+                or not (1 <= n_samples <= 25):
+            return jsonify(error="'n_samples' must be an integer in 1..25"), 400
+        return jsonify(state.manager.collect_od_raw(int(power), n_samples))
+
+    # --- post-run mass reconciliation (§19.4) --------------------------------
+
+    @flask_app.route("/api/experiments/<name>/reconcile", methods=["POST"])
+    def api_experiment_reconcile(name):
+        """O4: compare measured start/end masses against the software's
+        accumulated duration x flow_rate volumes. The only check that
+        validates the whole open-loop volume chain end to end."""
+        if (
+            state.engine is not None
+            and state.engine.loaded_experiment == name
+            and state.engine.is_running
+        ):
+            return jsonify(
+                error="stop the experiment before reconciling — the masses "
+                      "are end-of-run measurements",
+                code="conflict",
+            ), 409
+        state_path = EXPERIMENTS_DIR / name / "state.json"
+        exp_state: dict = {}
+        if state_path.is_file():
+            try:
+                exp_state = json.loads(state_path.read_text(encoding="utf-8"))
+            except Exception:
+                log.exception("failed to read %s", state_path)
+        body = request.get_json(silent=True) or {}
+        try:
+            record = cal_service.reconcile(name, exp_state, body)
+        except FileNotFoundError as exc:
+            return jsonify(error=str(exc)), 404
+        except ValueError as exc:
+            return jsonify(error=str(exc)), 400
+        _emit_event({
+            "type": "reconciliation",
+            "name": name,
+            "within_tolerance": record["within_tolerance"],
+            "media": record["media"],
+            "waste": record["waste"],
+        })
+        if not record["within_tolerance"]:
+            _emit_alert(
+                "warning",
+                f"Mass reconciliation for '{name}' is outside ±10 % — the "
+                "flow-rate array is stale, a line is occluded, or a pump is "
+                "slipping; the pump calibration is now flagged stale "
+                "(CALIBRATION_PROTOCOL §6)",
+                category=evlog.CATEGORY_CALIBRATION,
+                dedup_key=("reconcile_failed", name),
+            )
+        return jsonify(record)
+
     # --------------------- WebSocket sensor broadcast loop -------------------
 
     def _experiment_summary() -> dict | None:
@@ -1125,8 +1863,14 @@ def create_app(use_mock: bool):
             try:
                 state.manager.pump_command(int(vial), "influx", pump_time)
                 state.manager.pump_command(int(vial), "efflux", efflux_time)
-            except Exception:
+            except Exception as exc:
                 log.exception("pump firing failed for vial %d", vial)
+                _emit_alert(
+                    "critical",
+                    f"Automatic dilution failed for vial {vial}: {exc}",
+                    category=evlog.CATEGORY_PUMP, vial=int(vial),
+                    dedup_key=("pump_fire_failed", int(vial)),
+                )
                 continue
             for direction, seconds in (("influx", pump_time), ("efflux", efflux_time)):
                 try:
@@ -1141,17 +1885,21 @@ def create_app(use_mock: bool):
                     log.exception(
                         "log_pump_event %s failed (vial=%d)", direction, vial
                     )
-                socketio.emit(
-                    "experiment_event",
-                    {
-                        "type": "pump",
-                        "vial": int(vial),
-                        "direction": direction,
-                        "duration_seconds": float(seconds),
-                        "average_od": action.average_od,
-                        "timestamp": ts_iso,
-                    },
-                )
+                    _emit_alert(
+                        "critical",
+                        f"Dilution fired but was NOT logged to CSV (vial {vial}, "
+                        f"{direction}) -- the run record is now incomplete",
+                        category=evlog.CATEGORY_PUMP, vial=int(vial),
+                        dedup_key="log_pump_event_failed",
+                    )
+                _emit_event({
+                    "type": "pump",
+                    "vial": int(vial),
+                    "direction": direction,
+                    "duration_seconds": float(seconds),
+                    "average_od": action.average_od,
+                    "timestamp": ts_iso,
+                })
 
     def _execute_queued_pump_actions(queued) -> None:
         """Variant of _execute_pump_actions for actions returned by
@@ -1163,6 +1911,43 @@ def create_app(use_mock: bool):
         # but call once per entry so each uses its own captured timestamp.
         for vial, action, captured_ts in queued:
             _execute_pump_actions([(vial, action)], captured_ts)
+
+    def _classify_bus_reads(t: dict, o: dict) -> None:
+        """Feed one cycle's reads into the health trackers and alert on the
+        transitions that matter (SPEC §20.3).
+
+        TRANSIENT is deliberately silent: the RS485 bus drops frames by design
+        and commit b9b135a already tolerates it. Only a bus that has gone quiet
+        for `failure_threshold` consecutive cycles is worth waking someone for.
+        """
+        transitions = evlog.classify_cycle(
+            state.bus_health,
+            state.vial_health,
+            temperature=t.get("calibrated"),
+            od_calibrated=o.get("calibrated"),
+            od_flags=o.get("flags"),
+            od_n_valid=o.get("n_valid"),
+        )
+        for subsystem, outcome in transitions:
+            if outcome == evlog.ErrorClass.PERSISTENT:
+                _emit_alert(
+                    "critical",
+                    f"RS485 bus silent: no valid {subsystem} response for "
+                    f"{state.bus_health.failure_threshold} consecutive cycles",
+                    category=evlog.CATEGORY_SERIAL,
+                    dedup_key=("bus_down", subsystem),
+                )
+            elif outcome == evlog.ErrorClass.RECOVERED:
+                _emit_alert(
+                    "info",
+                    f"RS485 {subsystem} reads recovered",
+                    category=evlog.CATEGORY_SERIAL,
+                    dedup_key=("bus_recovered", subsystem),
+                )
+
+    # Exposed on AppState so the shutdown path and the tests can drive one
+    # classification cycle without standing up the sensor thread.
+    state.classify_bus_reads = _classify_bus_reads
 
     def _check_disk_space() -> None:
         """Edge-triggered low-disk alert; band/hysteresis logic lives in the
@@ -1186,9 +1971,22 @@ def create_app(use_mock: bool):
             )
         else:
             msg = f"Disk getting low: {free_mb:.0f} MB free ({free_pct:.1f}%)"
-        socketio.emit(
-            "alert", {"level": level, "message": msg, "timestamp": _now_iso()}
+        _emit_alert(
+            level, msg, category=evlog.CATEGORY_STORAGE, dedup_key="disk_space",
+            data={"free_bytes": usage.free, "free_pct": round(free_pct, 2)},
         )
+        # SPEC §20.1: file logging suspends itself below its own (lower) floor.
+        # Report the transition once so "the logs just stop" is never a mystery.
+        suspended = evlog.file_log_status().get("suspended", False)
+        if suspended != state.log_writes_suspended:
+            state.log_writes_suspended = suspended
+            _emit_alert(
+                "critical" if suspended else "info",
+                "File logging suspended -- free space below the log floor"
+                if suspended else "File logging resumed",
+                category=evlog.CATEGORY_STORAGE,
+                dedup_key="log_suspension",
+            )
 
     def sensor_loop():
         log.info("sensor loop started (interval=%.1fs)", SENSOR_LOOP_INTERVAL_SECONDS)
@@ -1198,6 +1996,15 @@ def create_app(use_mock: bool):
                 ts_iso = _now_iso()
                 t = _read_temperature_pair(state)
                 o = _read_od_pair(state)
+
+                # Feed the calibration thermal-settling tracker (SPEC §19.2's
+                # "held >=10 min" guard is enforced from what this loop saw).
+                cal_service.note_temperatures(t["calibrated"])
+
+                # SPEC §20.3 classification. Done here rather than inside
+                # SerialManager because this is where both subsystems' results
+                # are visible in one place, and it works while idle too.
+                _classify_bus_reads(t, o)
 
                 # log_sensor_cycle is a no-op when no experiment is running;
                 # we still call it every tick so the active-vs-idle decision
@@ -1215,6 +2022,13 @@ def create_app(use_mock: bool):
                     )
                 except Exception:
                     log.exception("data_logger.log_sensor_cycle failed")
+                    _emit_alert(
+                        "critical",
+                        "Sensor data is NOT being written to disk "
+                        "(log_sensor_cycle failed)",
+                        category=evlog.CATEGORY_STORAGE,
+                        dedup_key="log_sensor_cycle_failed",
+                    )
 
                 # Run the experiment control loop (returns [] when not RUNNING).
                 pump_actions: list = []
@@ -1223,15 +2037,27 @@ def create_app(use_mock: bool):
                         ts_iso, t["calibrated"], o["calibrated"],
                         od_flags=o.get("flags"),
                     )
-                except Exception:
+                except Exception as exc:
                     log.exception("engine.run_cycle failed")
+                    _emit_alert(
+                        "critical",
+                        f"Control loop cycle failed: {exc}",
+                        category=evlog.CATEGORY_SYSTEM,
+                        dedup_key="run_cycle_failed",
+                    )
 
                 # Execute returned pump actions via SerialManager + DataLogger.
                 if pump_actions:
                     try:
                         _execute_pump_actions(pump_actions, ts_iso)
-                    except Exception:
+                    except Exception as exc:
                         log.exception("execute pump actions failed")
+                        _emit_alert(
+                            "critical",
+                            f"Executing dilutions failed: {exc}",
+                            category=evlog.CATEGORY_PUMP,
+                            dedup_key="execute_pump_actions_failed",
+                        )
 
                 # Maintenance-mode failsafe: if the user left maintenance
                 # active for >30 min, the engine auto-exits and hands us the
@@ -1268,14 +2094,27 @@ def create_app(use_mock: bool):
                             "flags": o.get("flags"),
                         },
                         "experiment": _experiment_summary(),
+                        # RS485 bus + per-vial sleeve health, so the dashboard
+                        # indicators refresh at the sensor cadence rather than
+                        # polling (SPEC §20.4).
+                        "health": {
+                            "bus": state.bus_health.snapshot(),
+                            "vials": state.vial_health.snapshot(),
+                        },
                     },
                 )
 
                 # Only pet on a successful sensor read — if the bus is stuck
                 # we want the watchdog to actually fire.
                 state.watchdog.pet()
-            except Exception:
+            except Exception as exc:
                 log.exception("sensor loop tick failed")
+                _emit_alert(
+                    "critical",
+                    f"Sensor loop tick failed: {exc}",
+                    category=evlog.CATEGORY_SYSTEM,
+                    dedup_key="sensor_tick_failed",
+                )
             elapsed = time.monotonic() - tick_start
             state.sensor_thread_stop.wait(
                 timeout=max(0.0, SENSOR_LOOP_INTERVAL_SECONDS - elapsed)
@@ -1294,6 +2133,9 @@ def create_app(use_mock: bool):
         resumed = state.engine.resume_on_startup()
         if resumed:
             log.info("resumed experiment '%s' from previous server run", resumed)
+            # The blank re-anchor lives in memory; a restart must re-apply it
+            # or the resumed run's OD silently reverts to the offset curve.
+            _apply_experiment_blank(resumed)
     except Exception:
         log.exception("resume_on_startup failed")
 
@@ -1365,6 +2207,15 @@ def main(argv: list[str] | None = None) -> int:
         level=args.log_level.upper(),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    # SPEC §20.1 -- rotating, disk-aware file logs alongside the stdout stream
+    # systemd captures. Failure here must not stop the server booting: stdout
+    # still works, and a server that refuses to start over its logs is worse
+    # than one that logs to one sink instead of three.
+    try:
+        evlog.setup_file_logging(LOGS_DIR, level=args.log_level.upper())
+        log.info("file logging -> %s", LOGS_DIR)
+    except Exception:
+        log.exception("could not set up file logging in %s", LOGS_DIR)
 
     flask_app, socketio = create_app(use_mock=args.mock)
     socketio.run(

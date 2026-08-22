@@ -257,6 +257,31 @@ def _row_count(csv_text: str) -> int:
     return max(0, csv_text.count("\n") - 1)
 
 
+def events_csv(exp_dir: Path, hours: Optional[float] = None) -> Optional[str]:
+    """The experiment's ``events.csv`` (SPEC §20.2), optionally windowed to the
+    last ``hours`` of data. Returns None when the experiment predates the event
+    log or has not written one yet.
+
+    Not a member of ``EXPORT_PARAMETERS``: od/temp/pump are per-vial data
+    selections, whereas the event log is provenance that ships with every
+    bundle regardless of what was selected.
+    """
+    header, data_rows = _read_csv_lines(exp_dir / "events.csv")
+    if not header:
+        return None
+    try:
+        elapsed_col = header.index("elapsed_hours")
+    except ValueError:
+        elapsed_col = 1
+    data_rows = filter_rows_by_hours(data_rows, elapsed_col, hours)
+    out = io.StringIO()
+    w = csv.writer(out)
+    w.writerow(header)
+    for line in data_rows:
+        w.writerow(next(csv.reader([line])))
+    return out.getvalue()
+
+
 def build_bundle(
     exp_dir: Path,
     *,
@@ -295,6 +320,8 @@ def build_bundle(
         fname, text = next(iter(files.items()))
         return fname, text.encode("utf-8")
 
+    events_text = events_csv(exp_dir, hours)
+
     manifest = {
         "experiment": name,
         "generated_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -305,6 +332,8 @@ def build_bundle(
         },
         "files": {fn: {"data_rows": _row_count(text)} for fn, text in files.items()},
     }
+    if events_text is not None:
+        manifest["files"]["events.csv"] = {"data_rows": _row_count(events_text)}
 
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -313,6 +342,8 @@ def build_bundle(
         config_path = exp_dir / "config.json"
         if config_path.is_file():
             zf.writestr("config.json", config_path.read_text(encoding="utf-8"))
+        if events_text is not None:
+            zf.writestr("events.csv", events_text)
         zf.writestr("export_manifest.json", json.dumps(manifest, indent=2))
     return f"{name}_export.zip", buf.getvalue()
 

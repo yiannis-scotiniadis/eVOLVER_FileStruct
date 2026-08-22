@@ -24,10 +24,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from data_logger import DataLogger  # noqa: E402
 from experiment_engine import (  # noqa: E402
     ConflictError,
+    DEFAULT_FLOW_RATES_ML_PER_SEC,
     ExperimentEngine,
     ExperimentStatus,
     InvalidExperimentStateError,
     N_VIALS,
+    compute_pump_quantization,
 )
 from control_modes.morbidostat import MorbidostatController  # noqa: E402
 from mock_serial_manager import MockSerialManager  # noqa: E402
@@ -841,16 +843,120 @@ def test_run_cycle_debits_correct_bottle_and_waste() -> None:
     print("PASS  run_cycle debits correct bottle and waste per pump action")
 
 
+# ---------------------------------------------------------------------
+# Session L — volume-based fluidics (SPEC §16, ROADMAP.md Session L)
+# ---------------------------------------------------------------------
+
+def test_flow_rate_ml_s_default_when_idle() -> None:
+    """No experiment loaded -> every vial resolves to the hardcoded default."""
+    with TmpRoot() as root:
+        engine, *_ = _fresh(root)
+        for v in (0, 5, 15):
+            assert engine.flow_rate_ml_s(v) == DEFAULT_FLOW_RATES_ML_PER_SEC[v]
+    print("PASS  flow_rate_ml_s falls back to defaults when idle")
+
+
+def test_flow_rate_ml_s_uses_experiment_rate_or_default() -> None:
+    """A vial inside the loaded experiment gets its resolved (custom) rate;
+    a vial outside it still gets the hardcoded default."""
+    with TmpRoot() as root:
+        engine, *_ = _fresh(root)
+        custom_rates = [0.5] * 16
+        custom_rates[3] = 2.25
+        engine.create_experiment(
+            name="m1", mode="turbidostat",
+            vials=[3],
+            parameters={"temperature_c": 37, "stir_rate": 10,
+                        "pump_wait_minutes": 1, "pump_flow_rates": custom_rates},
+        )
+        assert engine.flow_rate_ml_s(3) == 2.25
+        # Vial 7 isn't part of this experiment -> falls back to the default,
+        # NOT the loaded experiment's rate for vial 7.
+        assert engine.flow_rate_ml_s(7) == DEFAULT_FLOW_RATES_ML_PER_SEC[7]
+    print("PASS  flow_rate_ml_s prefers the loaded experiment's resolved rate")
+
+
+def test_compute_pump_quantization_exact_and_truncated() -> None:
+    exact = compute_pump_quantization(5.0, 1.0)
+    assert exact == {"seconds": 5, "deliverable_ml": 5.0, "min_ml": 1.0, "quantised": False}
+
+    truncated = compute_pump_quantization(2.5, 1.0)
+    assert truncated["seconds"] == 2
+    assert abs(truncated["deliverable_ml"] - 2.0) < 1e-9
+    assert truncated["min_ml"] == 1.0
+    assert truncated["quantised"] is True
+
+    below_min = compute_pump_quantization(0.5, 1.0)
+    assert below_min["seconds"] == 0
+    assert below_min["deliverable_ml"] == 0.0
+
+    try:
+        compute_pump_quantization(1.0, 0.0)
+        assert False, "expected ValueError for non-positive flow rate"
+    except ValueError:
+        pass
+    print("PASS  compute_pump_quantization matches the whole-second firmware floor")
+
+
+def test_record_manual_pump_debits_bottle_and_waste() -> None:
+    """A manual pump on a STOPPED experiment's vial still debits the mapped
+    bottle / credits waste -- media is loaded at start_experiment and stays
+    loaded after stop_experiment (only the next create_experiment clears
+    it), so this is a real reachable path: `_experiment_locks_vial` in
+    app.py only blocks manual control while RUNNING."""
+    with TmpRoot() as root:
+        engine, *_ = _fresh(root)
+        media = _basic_media(0, 1)
+        engine.create_experiment(
+            name="m1", mode="turbidostat",
+            parameters={"temperature_c": 37, "stir_rate": 10, "pump_wait_minutes": 1},
+            media=media,
+        )
+        engine.start_experiment("m1")
+        engine.stop_experiment()
+        assert engine.status_string == ExperimentStatus.STOPPED
+
+        engine.record_manual_pump(0, "influx", 12.5)
+        engine.record_manual_pump(0, "efflux", 3.0)
+        assert abs(engine._bottle_consumed_ml["bottle_a"] - 12.5) < 1e-9
+        assert abs(engine._waste_filled_ml - 3.0) < 1e-9
+        # Vial 1 (bottle_b) untouched.
+        assert engine._bottle_consumed_ml.get("bottle_b", 0.0) == 0.0
+    print("PASS  record_manual_pump debits bottle and waste for a STOPPED experiment's vial")
+
+
+def test_record_manual_pump_noop_without_bottle_mapping() -> None:
+    """No experiment loaded (or vial not part of one) -> no-op, no exception."""
+    with TmpRoot() as root:
+        engine, *_ = _fresh(root)
+        engine.record_manual_pump(0, "influx", 12.5)  # nothing loaded at all
+        assert engine._bottle_consumed_ml == {}
+        assert engine._waste_filled_ml == 0.0
+
+        media = _basic_media(0)  # only vial 0 mapped
+        engine.create_experiment(
+            name="m1", mode="turbidostat",
+            parameters={"temperature_c": 37, "stir_rate": 10, "pump_wait_minutes": 1},
+            media=media,
+        )
+        engine.start_experiment("m1")
+        engine.record_manual_pump(5, "influx", 12.5)  # vial 5 has no bottle
+        assert engine._bottle_consumed_ml["bottle_a"] == 0.0
+    print("PASS  record_manual_pump is a no-op without a bottle mapping")
+
+
 def test_low_volume_alert_is_edge_triggered() -> None:
     """Alert fires exactly once on threshold crossing, even with repeated cycles."""
     with TmpRoot() as root:
         engine, *_, alerts = _fresh(root)
         clock_state = engine._clock.state
-        # 20 mL bottle, alert at 5 mL remaining. First 20-s pump consumes the
-        # whole thing in one shot, crossing the threshold.
+        # 300 mL bottle, alert at 290 mL remaining -- crossed by the first
+        # 20-s (20 mL) pump, but well clear of the consumables-interlock
+        # reserve floor (50 mL, SPEC §15) so this test stays isolated to the
+        # low-volume WARNING latch, not the separate block/critical path.
         media = {
-            "bottles": [{"id": "small_a", "name": "Small", "initial_volume_ml": 20.0,
-                         "low_volume_alert_ml": 5.0}],
+            "bottles": [{"id": "small_a", "name": "Small", "initial_volume_ml": 300.0,
+                         "low_volume_alert_ml": 290.0}],
             "vial_to_bottle": {"0": "small_a"},
             "waste": {"name": "W", "capacity_ml": 1000.0, "high_fill_alert_ml": 900.0},
         }
@@ -879,11 +985,15 @@ def test_waste_alert_fires_on_threshold() -> None:
     with TmpRoot() as root:
         engine, *_, alerts = _fresh(root)
         clock_state = engine._clock.state
+        # 1000 mL waste container, alert at 30 mL filled -- crossed by the
+        # second 20-s (20 mL) efflux, but well clear of the consumables-
+        # interlock reserve floor (100 mL, SPEC §15) so this test stays
+        # isolated to the high-fill WARNING latch, not the block/critical path.
         media = {
             "bottles": [{"id": "x", "name": "X", "initial_volume_ml": 10000.0,
                          "low_volume_alert_ml": 100.0}],
             "vial_to_bottle": {"0": "x"},
-            "waste": {"name": "Tiny", "capacity_ml": 50.0, "high_fill_alert_ml": 30.0},
+            "waste": {"name": "Tiny", "capacity_ml": 1000.0, "high_fill_alert_ml": 30.0},
         }
         engine.create_experiment(
             name="w1", mode="turbidostat",
@@ -1072,9 +1182,13 @@ def test_maintenance_refill_resets_alert_latch() -> None:
     with TmpRoot() as root:
         engine, *_, alerts = _fresh(root)
         clock_state = engine._clock.state
+        # 300 mL bottle, alert at 290 mL remaining -- see
+        # test_low_volume_alert_is_edge_triggered for why (crossed by the
+        # first pump, stays clear of the SPEC §15 reserve floor across the
+        # cycle counts this test drives).
         media = {
-            "bottles": [{"id": "small_a", "name": "Small", "initial_volume_ml": 20.0,
-                         "low_volume_alert_ml": 5.0}],
+            "bottles": [{"id": "small_a", "name": "Small", "initial_volume_ml": 300.0,
+                         "low_volume_alert_ml": 290.0}],
             "vial_to_bottle": {"0": "small_a"},
             "waste": {"name": "W", "capacity_ml": 1000.0, "high_fill_alert_ml": 900.0},
         }
@@ -1094,13 +1208,13 @@ def test_maintenance_refill_resets_alert_latch() -> None:
             clock_state["t"] += 10.0
         assert engine._bottle_alerted_low["small_a"] is True
 
-        # Reject refill outside maintenance.
-        try:
-            engine.refill_media(bottles={"small_a": 20.0})
-        except InvalidExperimentStateError:
-            pass
-        else:
-            raise AssertionError("refill outside maintenance should be rejected")
+        # refill_media is allowed any time the experiment is RUNNING, not
+        # only during maintenance (SPEC §15 -- a single blocked vial must be
+        # clearable without pausing the whole experiment). Reject only when
+        # not RUNNING at all.
+        engine.refill_media(bottles={"small_a": 300.0})
+        assert abs(engine._bottle_consumed_ml["small_a"]) < 1e-9
+        assert engine._bottle_alerted_low["small_a"] is False
 
         engine.enter_maintenance()
         # Reject unknown bottle id.
@@ -1118,13 +1232,312 @@ def test_maintenance_refill_resets_alert_latch() -> None:
         else:
             raise AssertionError("expected ValueError for over-capacity refill")
 
-        # Refill clears consumption + alert latch.
-        engine.refill_media(bottles={"small_a": 20.0}, waste_filled_ml=0.0)
+        # Consume again during maintenance (decisions still coalesce into
+        # _pending_pump_actions; bookkeeping still debits -- see run_cycle
+        # step 4b), then refill clears consumption + alert latch here too.
+        for tick in range(5, 10):
+            temps, ods = _make_sensor_arrays(temp_c=37.0, od=0.5)
+            engine.run_cycle(f"2026-05-15T10:00:{tick:02d}+00:00", temps, ods)
+            clock_state["t"] += 10.0
+        engine.refill_media(bottles={"small_a": 300.0}, waste_filled_ml=0.0)
         assert abs(engine._bottle_consumed_ml["small_a"]) < 1e-9
         assert engine._bottle_alerted_low["small_a"] is False
         assert engine._waste_filled_ml == 0.0
         engine.exit_maintenance()
-    print("PASS  refill_media resets consumption + alert latches during maintenance")
+    print("PASS  refill_media resets consumption + alert latches, while RUNNING and during maintenance")
+
+
+# ----------------------------------------------------------------------
+# Consumables safety interlock (SPEC §15 / ROADMAP Session K)
+# ----------------------------------------------------------------------
+
+def test_consumables_interlock_blocks_bottle_at_reserve() -> None:
+    """A bottle at/below its reserve floor suppresses the WHOLE pump action
+    (influx + efflux together) for its vials, leaves other bottles' vials
+    unaffected, never debits the suppressed action, and alerts exactly
+    once even across repeated blocked cycles."""
+    with TmpRoot() as root:
+        engine, *_, events, alerts = _fresh(root)
+        clock_state = engine._clock.state
+        media = _basic_media(0, 1)  # vial 0 -> bottle_a (1000 mL), vial 1 -> bottle_b (500 mL)
+        engine.create_experiment(
+            name="m1", mode="turbidostat",
+            parameters={"temperature_c": 37, "stir_rate": 10,
+                        "od_lower_thresh": 0.2, "od_upper_thresh": 0.4, "min_samples_before_action": 1,
+                        "pump_wait_minutes": 0.05, "volume_ml": 25,
+                        "pump_flow_rates": [1.0] * 16},
+            media=media,
+        )
+        engine.start_experiment("m1")
+        # Drive bottle_a exactly to its reserve floor: max(50, 5%*1000) = 50 mL remaining.
+        engine._bottle_consumed_ml["bottle_a"] = 1000.0 - 50.0
+        bottle_b_before = engine._bottle_consumed_ml["bottle_b"]
+        waste_before = engine._waste_filled_ml
+
+        temps, ods = _make_sensor_arrays(temp_c=37.0, od=0.5)
+        actions = engine.run_cycle("2026-05-15T10:00:00+00:00", temps, ods)
+
+        fired_vials = {v for v, _a in actions}
+        assert fired_vials == {1}, f"expected only vial 1 (bottle_b) to fire, got {fired_vials}"
+        # Suppressed action must not be debited -- bottle_a stays exactly at 950.
+        assert engine._bottle_consumed_ml["bottle_a"] == 950.0
+        assert engine._bottle_consumed_ml["bottle_b"] > bottle_b_before
+        assert engine._waste_filled_ml > waste_before
+
+        suppressed_events = [e for e in events if e.get("type") == "pump_suppressed"]
+        assert len(suppressed_events) == 1
+        assert suppressed_events[0]["vial"] == 0
+        assert suppressed_events[0]["reason"] == "media_empty"
+        assert suppressed_events[0]["bottle_id"] == "bottle_a"
+        crit = [a for a in alerts if a.get("level") == "critical" and "reserve" in a.get("message", "")]
+        assert len(crit) == 1, crit
+
+        # A second blocked cycle: event fires again (audit trail), alert does not.
+        clock_state["t"] += 10.0
+        temps, ods = _make_sensor_arrays(temp_c=37.0, od=0.5)
+        engine.run_cycle("2026-05-15T10:00:10+00:00", temps, ods)
+        crit_again = [a for a in alerts if a.get("level") == "critical" and "reserve" in a.get("message", "")]
+        assert len(crit_again) == 1, "critical alert should be edge-triggered, not re-fired"
+
+        s = engine.status()
+        assert s["per_vial"]["0"]["consumables_blocked"] == "media_empty"
+        assert s["per_vial"]["1"]["consumables_blocked"] is None
+    print("PASS  consumables interlock blocks only the exhausted bottle's vial, alert fires once")
+
+
+def test_consumables_interlock_blocks_all_pumps_on_waste_full() -> None:
+    """A full waste container suppresses every vial's pump action, even a
+    vial whose own bottle still has plenty of media -- an influx without a
+    matching efflux would overflow the vial."""
+    with TmpRoot() as root:
+        engine, *_, events, alerts = _fresh(root)
+        media = _basic_media(0, 1)
+        engine.create_experiment(
+            name="m1", mode="turbidostat",
+            parameters={"temperature_c": 37, "stir_rate": 10,
+                        "od_lower_thresh": 0.2, "od_upper_thresh": 0.4, "min_samples_before_action": 1,
+                        "pump_wait_minutes": 0.05, "volume_ml": 25,
+                        "pump_flow_rates": [1.0] * 16},
+            media=media,
+        )
+        engine.start_experiment("m1")
+        # Waste reserve = max(100, 5%*4000) = 200 mL; drive filled to the floor.
+        engine._waste_filled_ml = 4000.0 - 200.0
+        bottle_a_before = engine._bottle_consumed_ml["bottle_a"]
+        bottle_b_before = engine._bottle_consumed_ml["bottle_b"]
+
+        temps, ods = _make_sensor_arrays(temp_c=37.0, od=0.5)
+        actions = engine.run_cycle("2026-05-15T10:00:00+00:00", temps, ods)
+        assert actions == [], f"expected all vials suppressed, got {actions}"
+        assert engine._bottle_consumed_ml["bottle_a"] == bottle_a_before
+        assert engine._bottle_consumed_ml["bottle_b"] == bottle_b_before
+        assert engine._waste_filled_ml == 3800.0, "waste level itself is untouched by the gate"
+
+        suppressed = {e["vial"] for e in events if e.get("type") == "pump_suppressed"}
+        assert suppressed == {0, 1}
+        assert all(
+            e["reason"] == "waste_full"
+            for e in events if e.get("type") == "pump_suppressed"
+        )
+        crit = [a for a in alerts if a.get("level") == "critical" and "Waste" in a.get("message", "")]
+        assert len(crit) == 1, crit
+    print("PASS  consumables interlock blocks every vial when waste is full")
+
+
+def test_consumables_interlock_auto_enters_maintenance_when_all_blocked() -> None:
+    with TmpRoot() as root:
+        engine, *_, events, alerts = _fresh(root)
+        media = _basic_media(0, 1)
+        engine.create_experiment(
+            name="m1", mode="turbidostat",
+            parameters={"temperature_c": 37, "stir_rate": 10,
+                        "od_lower_thresh": 0.2, "od_upper_thresh": 0.4, "min_samples_before_action": 1,
+                        "pump_wait_minutes": 0.05, "volume_ml": 25,
+                        "pump_flow_rates": [1.0] * 16},
+            media=media,
+        )
+        engine.start_experiment("m1")
+        assert engine.is_maintenance_active is False
+        engine._bottle_consumed_ml["bottle_a"] = 1000.0 - 50.0
+        engine._bottle_consumed_ml["bottle_b"] = 500.0 - 50.0
+
+        temps, ods = _make_sensor_arrays(temp_c=37.0, od=0.5)
+        actions = engine.run_cycle("2026-05-15T10:00:00+00:00", temps, ods)
+        assert actions == []
+        assert engine.is_maintenance_active is True
+        assert engine._maintenance_reason == "consumables"
+        maint_events = [e for e in events if e.get("type") == "maintenance_entered"]
+        assert len(maint_events) == 1
+        assert maint_events[0]["reason"] == "consumables"
+
+        status_maint = engine.status()["maintenance"]
+        assert status_maint["reason"] == "consumables"
+        assert status_maint["auto_resume_at"] is None
+        assert status_maint["auto_resume_in_seconds"] is None
+    print("PASS  every vial blocked auto-enters consumables-reason maintenance")
+
+
+def test_consumables_maintenance_exempt_from_auto_timeout() -> None:
+    """Consumables-reason maintenance must not auto-resume on the 30 min
+    failsafe -- auto-resuming into a still-empty bottle would defeat the
+    SPEC §15 'clears only on refill_media' requirement."""
+    with TmpRoot() as root:
+        engine, *_, alerts = _fresh(root)
+        engine._maintenance_timeout_seconds = 0.6  # tiny; would normally trip fast
+        media = _basic_media(0)
+        engine.create_experiment(
+            name="m1", mode="turbidostat",
+            parameters={"temperature_c": 37, "stir_rate": 10,
+                        "od_lower_thresh": 0.2, "od_upper_thresh": 0.4, "min_samples_before_action": 1,
+                        "pump_wait_minutes": 0.05, "volume_ml": 25,
+                        "pump_flow_rates": [1.0] * 16},
+            media=media,
+        )
+        engine.start_experiment("m1")
+        engine._bottle_consumed_ml["bottle_a"] = 1000.0 - 50.0
+        temps, ods = _make_sensor_arrays(temp_c=37.0, od=0.5)
+        engine.run_cycle("2026-05-15T10:00:00+00:00", temps, ods)
+        assert engine.is_maintenance_active is True
+        assert engine._maintenance_reason == "consumables"
+
+        import time as _t
+        _t.sleep(0.8)  # real wall clock -- entered_at uses now(), well past the 0.6 s timeout
+        result = engine.check_maintenance_timeout()
+        assert result is None, "consumables-reason maintenance must not auto-resume"
+        assert engine.is_maintenance_active is True
+        auto_resume_alerts = [a for a in alerts if "auto-resumed" in a.get("message", "")]
+        assert auto_resume_alerts == []
+    print("PASS  consumables-reason maintenance is exempt from the 30 min auto-resume failsafe")
+
+
+def test_refill_clears_partial_block_without_maintenance() -> None:
+    """A single blocked bottle does not escalate to full maintenance while
+    other vials are still runnable; refill_media alone clears it on the
+    very next cycle -- no exit_maintenance needed."""
+    with TmpRoot() as root:
+        engine, *_, events, alerts = _fresh(root)
+        clock_state = engine._clock.state
+        media = _basic_media(0, 1)
+        engine.create_experiment(
+            name="m1", mode="turbidostat",
+            parameters={"temperature_c": 37, "stir_rate": 10,
+                        "od_lower_thresh": 0.2, "od_upper_thresh": 0.4, "min_samples_before_action": 1,
+                        "pump_wait_minutes": 0.05, "volume_ml": 25,
+                        "pump_flow_rates": [1.0] * 16},
+            media=media,
+        )
+        engine.start_experiment("m1")
+        engine._bottle_consumed_ml["bottle_a"] = 1000.0 - 50.0  # vial 0 blocked only
+
+        temps, ods = _make_sensor_arrays(temp_c=37.0, od=0.5)
+        actions = engine.run_cycle("2026-05-15T10:00:00+00:00", temps, ods)
+        assert {v for v, _a in actions} == {1}
+        assert engine.is_maintenance_active is False, "partial block must not escalate to maintenance"
+
+        engine.refill_media(bottles={"bottle_a": 1000.0})
+        assert engine.status()["media"]["bottles"][0]["blocked"] is False
+
+        clock_state["t"] += 10.0  # past pump_wait so vial 0's controller can fire again
+        temps, ods = _make_sensor_arrays(temp_c=37.0, od=0.5)
+        actions2 = engine.run_cycle("2026-05-15T10:00:10+00:00", temps, ods)
+        assert {v for v, _a in actions2} == {0, 1}, "vial 0 should resume without exit_maintenance"
+    print("PASS  refill_media alone clears a partial block; no maintenance escalation needed")
+
+
+def test_refill_during_full_maintenance_requires_explicit_exit() -> None:
+    """When every vial is blocked and consumables-maintenance auto-enters,
+    refill_media clears the underlying block condition but the experiment
+    stays paused until the user explicitly exits maintenance."""
+    with TmpRoot() as root:
+        engine, *_ = _fresh(root)
+        media = _basic_media(0)
+        engine.create_experiment(
+            name="m1", mode="turbidostat",
+            parameters={"temperature_c": 37, "stir_rate": 10,
+                        "od_lower_thresh": 0.2, "od_upper_thresh": 0.4, "min_samples_before_action": 1,
+                        "pump_wait_minutes": 0.05, "volume_ml": 25,
+                        "pump_flow_rates": [1.0] * 16},
+            media=media,
+        )
+        engine.start_experiment("m1")
+        engine._bottle_consumed_ml["bottle_a"] = 1000.0 - 50.0
+        temps, ods = _make_sensor_arrays(temp_c=37.0, od=0.5)
+        engine.run_cycle("2026-05-15T10:00:00+00:00", temps, ods)
+        assert engine.is_maintenance_active is True
+        assert engine._maintenance_reason == "consumables"
+
+        engine.refill_media(bottles={"bottle_a": 1000.0})
+        assert engine.status()["media"]["bottles"][0]["blocked"] is False
+        assert engine.is_maintenance_active is True, "refill alone must not exit full maintenance"
+
+        engine.exit_maintenance(reason="manual")
+        assert engine.is_maintenance_active is False
+    print("PASS  refill clears the block condition; full maintenance still needs explicit exit")
+
+
+def test_refill_media_requires_running() -> None:
+    """refill_media is allowed any time the experiment is RUNNING (not only
+    during maintenance -- SPEC §15), but rejected outside RUNNING entirely."""
+    with TmpRoot() as root:
+        engine, *_ = _fresh(root)
+        media = _basic_media(0)
+        engine.create_experiment(
+            name="m1", mode="turbidostat",
+            parameters={"temperature_c": 37, "stir_rate": 10},
+            media=media,
+        )
+        try:
+            engine.refill_media(bottles={"bottle_a": 500.0})
+        except InvalidExperimentStateError:
+            pass
+        else:
+            raise AssertionError("expected InvalidExperimentStateError before RUNNING")
+        engine.start_experiment("m1")
+        engine.refill_media(bottles={"bottle_a": 500.0})  # RUNNING, no maintenance -- now allowed
+        engine.stop_experiment(reason="test_cleanup")
+        try:
+            engine.refill_media(bottles={"bottle_a": 500.0})
+        except InvalidExperimentStateError:
+            pass
+        else:
+            raise AssertionError("expected InvalidExperimentStateError after STOPPED")
+    print("PASS  refill_media requires RUNNING (any time while running, not only maintenance)")
+
+
+def test_media_status_reports_reserve_blocked_and_estimate_quality() -> None:
+    with TmpRoot() as root:
+        engine, *_ = _fresh(root)
+        media = _basic_media(0, 1)
+        engine.create_experiment(
+            name="m1", mode="turbidostat",
+            parameters={"temperature_c": 37, "stir_rate": 10,
+                        "pump_wait_minutes": 15.0, "volume_ml": 25},
+            media=media,  # no pump_flow_rates -> resolves to the hardcoded defaults
+        )
+        engine.start_experiment("m1")
+        s = engine.status()["media"]
+        bottle_a = next(b for b in s["bottles"] if b["id"] == "bottle_a")
+        assert bottle_a["reserve_ml"] == 50.0  # max(50, 5%*1000)
+        assert bottle_a["blocked"] is False
+        assert bottle_a["estimate_quality"] == "uncalibrated"
+        assert s["waste"]["reserve_ml"] == 200.0  # max(100, 5%*4000)
+        assert s["waste"]["estimate_quality"] == "uncalibrated"
+
+    with TmpRoot() as root:
+        engine, *_ = _fresh(root)
+        media = _basic_media(0, 1)
+        engine.create_experiment(
+            name="m2", mode="turbidostat",
+            parameters={"temperature_c": 37, "stir_rate": 10,
+                        "pump_wait_minutes": 15.0, "volume_ml": 25,
+                        "pump_flow_rates": [0.9] * 16},  # differs from the defaults
+            media=media,
+        )
+        engine.start_experiment("m2")
+        s = engine.status()["media"]
+        assert s["bottles"][0]["estimate_quality"] == "calibrated"
+        assert s["waste"]["estimate_quality"] == "calibrated"
+    print("PASS  media status reports reserve_ml/blocked/estimate_quality correctly")
 
 
 def test_maintenance_persists_across_resume() -> None:
@@ -1447,10 +1860,433 @@ def test_persistence_roundtrip_morbidostat() -> None:
     print("PASS  morbidostat state persists and resumes (drug_conc, log preserved)")
 
 
+def test_flow_rates_32_resolution_and_broadcast() -> None:
+    """Session O3a: pump_flow_rates resolves to the canonical flat-32 form.
+    A scalar broadcasts to all 32; a length-16 list broadcasts each vial's
+    rate to both its influx and efflux pump; length-32 is used as-is;
+    anything else raises at experiment creation."""
+    with TmpRoot() as root:
+        engine, manager, *_ = _fresh(root)
+        base = {"temperature_c": 37, "stir_rate": 10, "od_lower_thresh": 0.2,
+                "od_upper_thresh": 0.4, "min_samples_before_action": 1,
+                "pump_wait_minutes": 1}
+
+        # length-32: used as-is, per-direction rates reach the controller.
+        rates32 = [1.0 + 0.01 * i for i in range(32)]
+        engine.create_experiment(
+            name="r32", mode="turbidostat", vials=[0, 3],
+            parameters={**base, "pump_flow_rates": rates32},
+        )
+        engine.start_experiment("r32")
+        c3 = engine._controllers[3]
+        assert c3.flow_rate_influx_ml_s == rates32[3]
+        assert c3.flow_rate_efflux_ml_s == rates32[3 + 16]
+        assert c3.flow_rate_ml_s == rates32[3]  # deprecated alias = influx
+        assert engine.flow_rate_ml_s(3) == rates32[3]
+        assert engine.flow_rate_ml_s(3, "efflux") == rates32[19]
+        engine.stop_experiment(reason="cleanup")
+
+        # length-16: broadcast to both directions (pre-O3 behaviour).
+        rates16 = [2.0 + 0.1 * i for i in range(16)]
+        engine.create_experiment(
+            name="r16", mode="turbidostat", vials=[5],
+            parameters={**base, "pump_flow_rates": rates16},
+        )
+        engine.start_experiment("r16")
+        c5 = engine._controllers[5]
+        assert c5.flow_rate_influx_ml_s == rates16[5]
+        assert c5.flow_rate_efflux_ml_s == rates16[5]
+        assert engine.flow_rate_ml_s(5, "efflux") == rates16[5]
+        engine.stop_experiment(reason="cleanup")
+
+        # scalar: broadcast to all 32.
+        engine.create_experiment(
+            name="rs", mode="turbidostat", vials=[7],
+            parameters={**base, "pump_flow_rates": 1.5},
+        )
+        engine.start_experiment("rs")
+        c7 = engine._controllers[7]
+        assert c7.flow_rate_influx_ml_s == 1.5 == c7.flow_rate_efflux_ml_s
+        engine.stop_experiment(reason="cleanup")
+
+        # wrong length: rejected AT CREATION (the documented pre-O3a gap was
+        # that even a valid 32-list raised here; now only invalid lengths do).
+        try:
+            engine.create_experiment(
+                name="rbad", mode="turbidostat", vials=[0],
+                parameters={**base, "pump_flow_rates": [1.0] * 20},
+            )
+        except ValueError as exc:
+            assert "pump_flow_rates" in str(exc), exc
+        else:
+            raise AssertionError("length-20 pump_flow_rates did not raise")
+    print("PASS  flow rates resolve to flat-32 (scalar/16/32 accepted, others rejected)")
+
+
+def test_flow_rates_calibration_block_and_estimate_quality() -> None:
+    """A 32-element array in config['calibration']['pump_flow_rates'] is
+    consumed by the engine (the exact integration the docs previously
+    mis-described), and flips media estimate_quality to 'calibrated'."""
+    with TmpRoot() as root:
+        engine, *_ = _fresh(root)
+        rates32 = [0.9] * 16 + [1.1] * 16  # influx != efflux
+        media = {
+            "bottles": [{"id": "b1", "name": "LB", "initial_volume_ml": 1000.0}],
+            "vial_to_bottle": {"0": "b1"},
+            "waste": {"capacity_ml": 2000.0},
+        }
+        engine.create_experiment(
+            name="cal32", mode="turbidostat",
+            parameters={"temperature_c": 37, "stir_rate": 10,
+                        "od_lower_thresh": 0.2, "od_upper_thresh": 0.4,
+                        "min_samples_before_action": 1, "pump_wait_minutes": 1},
+            calibration={"pump_flow_rates": rates32},
+            media=media,
+        )
+        engine.start_experiment("cal32")
+        c0 = engine._controllers[0]
+        assert c0.flow_rate_influx_ml_s == 0.9
+        assert c0.flow_rate_efflux_ml_s == 1.1
+        status = engine.status()
+        assert status["media"]["bottles"][0]["estimate_quality"] == "calibrated"
+        engine.stop_experiment(reason="cleanup")
+
+        # Without any supplied rates the label stays 'uncalibrated'.
+        engine.create_experiment(
+            name="uncal", mode="turbidostat",
+            parameters={"temperature_c": 37, "stir_rate": 10,
+                        "od_lower_thresh": 0.2, "od_upper_thresh": 0.4,
+                        "min_samples_before_action": 1, "pump_wait_minutes": 1},
+            media=media,
+        )
+        engine.start_experiment("uncal")
+        status = engine.status()
+        assert status["media"]["bottles"][0]["estimate_quality"] == "uncalibrated"
+        engine.stop_experiment(reason="cleanup")
+    print("PASS  calibration.pump_flow_rates (32) consumed; estimate_quality flips")
+
+
+def test_create_rejects_dark_subtract_without_sidecar() -> None:
+    """SPEC §19.2 coherence guard at creation: dark_subtract=True against a
+    calibration not marked dark-subtracted is a hard error (HTTP 400 at the
+    API layer), not a runtime warning."""
+    with TmpRoot() as root:
+        engine, *_ = _fresh(root)  # mock loads the repo cal (no sidecar)
+        try:
+            engine.create_experiment(
+                name="ds", mode="turbidostat", vials=[0],
+                parameters={"temperature_c": 37, "stir_rate": 10,
+                            "od_lower_thresh": 0.2, "od_upper_thresh": 0.4,
+                            "od_acquisition": {"dark_subtract": True}},
+            )
+        except ValueError as exc:
+            assert "dark_subtract" in str(exc), exc
+        else:
+            raise AssertionError("dark_subtract without sidecar did not raise")
+        assert engine.status_string == ExperimentStatus.IDLE
+    print("PASS  create_experiment rejects dark_subtract without the sidecar")
+
+
+def test_record_calibration_provenance_merges_config() -> None:
+    """record_calibration_provenance deep-merges into config.json's
+    calibration block and refreshes the loaded in-memory config."""
+    with TmpRoot() as root:
+        engine, *_ = _fresh(root)
+        engine.create_experiment(
+            name="prov", mode="turbidostat", vials=[0],
+            parameters={"temperature_c": 37, "stir_rate": 10,
+                        "od_lower_thresh": 0.2, "od_upper_thresh": 0.4},
+            calibration={"od": "2026-01-01T000000Z"},
+        )
+        engine.record_calibration_provenance(
+            "prov", {"od_blank": "experiments/prov/od_blank.json"}
+        )
+        on_disk = json.loads((root / "prov" / "config.json").read_text())
+        assert on_disk["calibration"]["od"] == "2026-01-01T000000Z"
+        assert on_disk["calibration"]["od_blank"] == "experiments/prov/od_blank.json"
+        # In-memory config refreshed too (visible to start_experiment).
+        assert engine._config["calibration"]["od_blank"] == \
+            "experiments/prov/od_blank.json"
+        try:
+            engine.record_calibration_provenance("prov", {})
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("empty provenance partial did not raise")
+    print("PASS  record_calibration_provenance merges + refreshes loaded config")
+
+
+
+# ----------------------------------------------------------------------
+# CONTROL_MODE_AUDIT.md C-2 / C-3 / X-1: the sensor gate is separate from
+# the control gate, and control parameters are validated at creation.
+# ----------------------------------------------------------------------
+
+def _audit_chemostat_params(**overrides) -> dict:
+    params = {
+        "temperature_c": 37, "stir_rate": 10,
+        "dilution_rate_per_hour": 30.0,     # fast enough that every bolus fires
+        "bolus_interval_seconds": 60.0,
+        "volume_ml": 25,
+        "pump_flow_rates": [1.0] * 16,
+    }
+    params.update(overrides)
+    return params
+
+
+def test_chemostat_dilutes_through_dropped_od_reads() -> None:
+    """C-2 (critical). A chemostat is open-loop, so gating it on OD validity
+    stops dilution when the sensor drops -- and the out_of_range case means
+    the culture is DENSER than the calibration covers, i.e. exactly when
+    dilution must not stop. Measured cost before the fix: -100% D."""
+    with TmpRoot() as root:
+        engine, *_ = _fresh(root)
+        clock_state = engine._clock.state
+        engine.create_experiment(
+            name="chemo", mode="chemostat", vials=[0],
+            parameters=_audit_chemostat_params(),
+        )
+        engine.start_experiment("chemo")
+
+        nan = float("nan")
+        actions = []
+        for tick in range(4):
+            temps, _ = _make_sensor_arrays(temp_c=37.0)
+            ods = [nan] * N_VIALS
+            # Alternate the two ways OD can be unusable: a lossy-bus drop and
+            # a reading past the calibrated domain.
+            flags = ["dropped" if tick % 2 else "out_of_range"] * N_VIALS
+            actions.extend(engine.run_cycle(
+                f"2026-05-14T10:0{tick}:00+00:00", temps, ods, od_flags=flags,
+            ))
+            clock_state["t"] += 60.0
+
+        assert len(actions) >= 3, (
+            f"chemostat stopped diluting with no usable OD: {len(actions)} "
+            "boli across 4 cycles"
+        )
+    print("PASS  chemostat keeps diluting through dropped and out-of-range OD")
+
+
+def test_turbidostat_still_suspends_on_dropped_od() -> None:
+    """The other half of C-2: a mode that genuinely closes the loop on OD
+    must still stand down when it has no OD to close on."""
+    with TmpRoot() as root:
+        engine, *_ = _fresh(root)
+        clock_state = engine._clock.state
+        engine.create_experiment(
+            name="turbo", mode="turbidostat", vials=[0],
+            parameters={
+                "temperature_c": 37, "stir_rate": 10,
+                "od_lower_thresh": 0.2, "od_upper_thresh": 0.4,
+                "min_samples_before_action": 1, "pump_wait_minutes": 0.0,
+                "volume_ml": 25, "pump_flow_rates": [1.0] * 16,
+            },
+        )
+        engine.start_experiment("turbo")
+        nan = float("nan")
+        actions = []
+        for tick in range(4):
+            temps, _ = _make_sensor_arrays(temp_c=37.0)
+            actions.extend(engine.run_cycle(
+                f"2026-05-14T10:0{tick}:00+00:00", temps, [nan] * N_VIALS,
+                od_flags=["out_of_range"] * N_VIALS,
+            ))
+            clock_state["t"] += 60.0
+        assert actions == [], (
+            f"turbidostat fired {len(actions)} dilutions with no valid OD"
+        )
+    print("PASS  turbidostat still stands down when OD is unusable")
+
+
+def test_dropped_temperature_does_not_suspend_dilution() -> None:
+    """Same defect class as C-2 on the other sensor. Pumping does not depend
+    on temperature, and the Arduino regulates the heater from its own
+    thermistor whether or not the Pi got this sample -- so a dropped temp
+    read must skip heater safety and nothing else."""
+    with TmpRoot() as root:
+        engine, _manager, _dl, _events, alerts = _fresh(root)
+        clock_state = engine._clock.state
+        engine.create_experiment(
+            name="turbo", mode="turbidostat", vials=[0],
+            parameters={
+                "temperature_c": 37, "stir_rate": 10,
+                "od_lower_thresh": 0.2, "od_upper_thresh": 0.4,
+                "min_samples_before_action": 1, "pump_wait_minutes": 0.0,
+                "volume_ml": 25, "pump_flow_rates": [1.0] * 16,
+            },
+        )
+        engine.start_experiment("turbo")
+        nan = float("nan")
+        actions = []
+        for tick in range(3):
+            _, ods = _make_sensor_arrays(od=0.5)
+            actions.extend(engine.run_cycle(
+                f"2026-05-14T10:0{tick}:00+00:00", [nan] * N_VIALS, ods,
+            ))
+            clock_state["t"] += 60.0
+        assert actions, "dilution suspended by a dropped temperature read"
+        # The dropped read is still counted and still warned about.
+        assert engine._nan_streak[0] == 3, engine._nan_streak
+        assert any("dropped sensor reads" in a["message"] for a in alerts), alerts
+    print("PASS  a dropped temperature read skips heater safety only")
+
+
+def test_chemostat_start_gate_holds_then_releases() -> None:
+    """C-5: dilution begins at inoculation density unless a start gate says
+    otherwise; at D above the culture's mu that washes the culture out."""
+    with TmpRoot() as root:
+        engine, _manager, _dl, events, alerts = _fresh(root)
+        clock_state = engine._clock.state
+        engine.create_experiment(
+            name="chemo", mode="chemostat", vials=[0],
+            parameters=_audit_chemostat_params(start_od=0.3),
+        )
+        engine.start_experiment("chemo")
+
+        actions = []
+        for tick in range(3):
+            temps, ods = _make_sensor_arrays(temp_c=37.0, od=0.10)
+            actions.extend(engine.run_cycle(
+                f"2026-05-14T10:0{tick}:00+00:00", temps, ods,
+            ))
+            clock_state["t"] += 60.0
+        assert actions == [], "start gate did not hold below start_od"
+
+        temps, ods = _make_sensor_arrays(temp_c=37.0, od=0.35)
+        actions = engine.run_cycle("2026-05-14T10:05:00+00:00", temps, ods)
+        assert actions, "start gate did not release at start_od"
+        assert any(e.get("type") == "start_gate_released" for e in events), events
+        assert any("start gate released" in a["message"] for a in alerts), alerts
+    print("PASS  chemostat start gate holds below start_od, then releases")
+
+
+def test_create_rejects_an_undilutable_od_band() -> None:
+    """C-3 / the T-3 precondition: a band too narrow to ever call for a whole
+    second of pumping must fail at creation rather than run for a week
+    delivering nothing."""
+    with TmpRoot() as root:
+        engine, *_ = _fresh(root)
+        try:
+            engine.create_experiment(
+                name="narrow", mode="turbidostat", vials=[0],
+                parameters={
+                    "od_lower_thresh": 0.200, "od_upper_thresh": 0.203,
+                    "volume_ml": 25, "pump_flow_rates": [1.0] * 16,
+                },
+            )
+        except ValueError as exc:
+            assert "too narrow" in str(exc), exc
+        else:
+            raise AssertionError("an undilutable OD band was accepted")
+    print("PASS  create_experiment rejects an OD band that can never dilute")
+
+
+def test_create_rejects_a_short_bolus_interval() -> None:
+    with TmpRoot() as root:
+        engine, *_ = _fresh(root)
+        try:
+            engine.create_experiment(
+                name="fast", mode="chemostat", vials=[0],
+                parameters=_audit_chemostat_params(bolus_interval_seconds=1.5),
+            )
+        except ValueError as exc:
+            assert "bolus_interval_seconds" in str(exc), exc
+        else:
+            raise AssertionError("a 1.5 s bolus interval was accepted")
+    print("PASS  create_experiment rejects a sub-2 s bolus interval")
+
+
+def test_create_warns_when_the_bolus_cap_binds() -> None:
+    """Runs, but cannot reach the requested D. The warning is what keeps the
+    run record honest about the difference."""
+    with TmpRoot() as root:
+        engine, _manager, _dl, _events, alerts = _fresh(root)
+        config = engine.create_experiment(
+            name="capped", mode="chemostat", vials=[0],
+            parameters=_audit_chemostat_params(
+                dilution_rate_per_hour=5.0, bolus_interval_seconds=600.0,
+                efflux_extra_seconds=5.0,
+            ),
+        )
+        assert any("clipped" in w for w in config["warnings"]), config["warnings"]
+        assert any("clipped" in a["message"] for a in alerts), alerts
+    print("PASS  create_experiment warns when the bolus duration cap binds")
+
+
+def test_start_warns_when_efflux_overrun_is_disabled() -> None:
+    """X-1: efflux_extra_seconds=0 disengages the only volume-regulation loop
+    the machine has, and no sensor can detect the resulting drift."""
+    with TmpRoot() as root:
+        engine, _manager, _dl, _events, alerts = _fresh(root)
+        engine.create_experiment(
+            name="turbo", mode="turbidostat", vials=[0],
+            parameters={
+                "temperature_c": 37, "stir_rate": 10,
+                "od_lower_thresh": 0.2, "od_upper_thresh": 0.4,
+                "volume_ml": 25, "pump_flow_rates": [1.0] * 16,
+                "efflux_extra_seconds": 0.0,
+            },
+        )
+        alerts.clear()
+        engine.start_experiment("turbo")
+        assert any("volume regulation is DISENGAGED" in a["message"]
+                   for a in alerts), alerts
+    print("PASS  start_experiment warns when efflux overrun is 0")
+
+
+def test_resume_rebaselines_a_future_controller_clock() -> None:
+    """X-2: the RPi has no RTC. After a power cut it can boot with a clock
+    behind the timestamps in state.json, and every `now - last_x` gate then
+    blocks dilution silently until wall time catches up."""
+    with TmpRoot() as root:
+        engine, *_ = _fresh(root)
+        clock_state = engine._clock.state
+        engine.create_experiment(
+            name="turbo", mode="turbidostat", vials=[0],
+            parameters={
+                "temperature_c": 37, "stir_rate": 10,
+                "od_lower_thresh": 0.2, "od_upper_thresh": 0.4,
+                "min_samples_before_action": 1, "pump_wait_minutes": 15.0,
+                "volume_ml": 25, "pump_flow_rates": [1.0] * 16,
+            },
+        )
+        engine.start_experiment("turbo")
+        for _ in range(3):
+            temps, ods = _make_sensor_arrays(temp_c=37.0, od=0.5)
+            engine.run_cycle("2026-05-14T10:00:00+00:00", temps, ods)
+
+        # Hand-edit state.json to put last_pump_time far in the future, the
+        # way a stale boot clock would have written it.
+        state_path = root / "turbo" / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        future = clock_state["t"] + 30 * 86400.0
+        state["controllers"]["0"]["last_pump_time"] = future
+        state_path.write_text(json.dumps(state, indent=4), encoding="utf-8")
+
+        engine2, *_ = _fresh(root, clock=engine._clock)
+        assert engine2.resume_on_startup() == "turbo"
+        restored = engine2._controllers[0].last_pump_time
+        assert restored <= clock_state["t"], (
+            f"future last_pump_time {restored} survived resume (now="
+            f"{clock_state['t']})"
+        )
+    print("PASS  resume re-baselines a controller timestamp from the future")
+
+
 def main() -> int:
     test_create_transitions_to_CREATED()
     test_start_transitions_to_RUNNING_and_applies_actuators()
     test_run_cycle_returns_pump_action_at_threshold()
+    test_chemostat_dilutes_through_dropped_od_reads()
+    test_turbidostat_still_suspends_on_dropped_od()
+    test_dropped_temperature_does_not_suspend_dilution()
+    test_chemostat_start_gate_holds_then_releases()
+    test_create_rejects_an_undilutable_od_band()
+    test_create_rejects_a_short_bolus_interval()
+    test_create_warns_when_the_bolus_cap_binds()
+    test_start_warns_when_efflux_overrun_is_disabled()
+    test_resume_rebaselines_a_future_controller_clock()
     test_run_cycle_respects_pump_wait_gate()
     test_stop_zeros_experiment_vials_only()
     test_overtemp_fault_isolates_single_vial()
@@ -1472,6 +2308,11 @@ def main() -> int:
     test_media_invalid_inputs_rejected()
     test_vials_and_media_mismatch_rejected()
     test_run_cycle_debits_correct_bottle_and_waste()
+    test_flow_rate_ml_s_default_when_idle()
+    test_flow_rate_ml_s_uses_experiment_rate_or_default()
+    test_compute_pump_quantization_exact_and_truncated()
+    test_record_manual_pump_debits_bottle_and_waste()
+    test_record_manual_pump_noop_without_bottle_mapping()
     test_low_volume_alert_is_edge_triggered()
     test_waste_alert_fires_on_threshold()
     test_media_state_persists_and_resumes()
@@ -1490,6 +2331,10 @@ def main() -> int:
     test_confirm_escalation_updates_state_and_config()
     test_confirm_escalation_409_when_not_pending()
     test_persistence_roundtrip_morbidostat()
+    test_flow_rates_32_resolution_and_broadcast()
+    test_flow_rates_calibration_block_and_estimate_quality()
+    test_create_rejects_dark_subtract_without_sidecar()
+    test_record_calibration_provenance_merges_config()
     print("\nAll experiment_engine tests passed.")
     return 0
 

@@ -139,12 +139,14 @@ class SerialManager:
 
         self.temp_cal: Optional[np.ndarray] = None
         self.od_cal: Optional[np.ndarray] = None
+        # Pristine copy of the loaded OD calibration, before any per-run
+        # blank re-anchor (apply_od_blank). clear_od_blank restores from it.
+        self._od_cal_base: Optional[np.ndarray] = None
         # True when the loaded OD calibration was measured on dark-subtracted
         # signal (LED-on - LED-off), per the OD_cal.meta.json sidecar. The
-        # enhanced reader warns once if dark subtraction is requested against a
-        # calibration that is NOT dark-subtracted (would yield wrong OD).
+        # enhanced reader REFUSES dark subtraction against a calibration that
+        # is NOT dark-subtracted (would yield silently wrong OD).
         self._od_cal_dark_subtracted = False
-        self._dark_subtract_warned = False
 
     def close(self) -> None:
         with self._lock:
@@ -175,8 +177,39 @@ class SerialManager:
         with self._lock:
             self.temp_cal = temp_cal
             self.od_cal = od_cal
+            self._od_cal_base = od_cal.copy()
             self._od_cal_dark_subtracted = dark_subtracted
-            self._dark_subtract_warned = False
+
+    @property
+    def od_cal_dark_subtracted(self) -> bool:
+        """True when the loaded OD calibration's sidecar records that it was
+        fit on dark-subtracted signal. Gates ``dark_subtract`` everywhere."""
+        return self._od_cal_dark_subtracted
+
+    def apply_od_blank(self, c_run_by_vial: dict) -> None:
+        """Apply a per-run OD blank re-anchor (CALIBRATION_PROTOCOL §5.4 /
+        §10.1) to the in-memory calibration: set row 2 (inflection OD) to
+        ``c_run`` for each given vial. Rows 0, 1 and 3 are never touched, and
+        no calibration file is modified — the persisted artefact is the run's
+        ``od_blank.json``. Idempotent per vial; vials not listed keep their
+        current row-2 value. ``clear_od_blank`` restores the pristine curve."""
+        with self._lock:
+            if self.od_cal is None:
+                raise RuntimeError("apply_od_blank requires a loaded OD calibration")
+            od_cal = self.od_cal.copy()
+            for vial, c_run in c_run_by_vial.items():
+                v = int(vial)
+                if not (0 <= v < N_VIALS):
+                    raise ValueError(f"vial must be in 0..{N_VIALS - 1}, got {v}")
+                od_cal[2, v] = float(c_run)
+            self.od_cal = od_cal
+
+    def clear_od_blank(self) -> None:
+        """Restore the pristine (pre-blank) OD calibration. No-op when no
+        calibration is loaded or no blank was ever applied."""
+        with self._lock:
+            if self._od_cal_base is not None:
+                self.od_cal = self._od_cal_base.copy()
 
     @staticmethod
     def _read_cal_dark_subtracted(od_cal_path: str) -> bool:
@@ -334,6 +367,34 @@ class SerialManager:
                 )
         return agg_out, n_valid
 
+    def collect_od_raw(self, led_power: int, n_samples: int = 5) -> dict:
+        """Calibration-wizard read primitive (CALIBRATION_PROTOCOL §5.4):
+        ``n_samples`` raw OD reads at ``led_power`` (0 = dark read), reduced
+        to per-vial NaN-aware statistics. No calibration is applied.
+
+        Returns ``{"median": [...16], "sd": [...16], "n_valid": [...16]}``;
+        a vial with zero surviving samples reports NaN median/sd."""
+        led = int(np.clip(led_power, 0, OD_LED_MAX))
+        n = max(1, int(n_samples))
+        with self._lock:
+            body = self._format_csv(np.full(N_VIALS, led))
+            samples = self._collect_od_reads(body, n)
+        median: list[float] = []
+        sd: list[float] = []
+        n_valid: list[int] = []
+        for v in range(N_VIALS):
+            col = samples[:, v]
+            col = col[~np.isnan(col)]
+            n_valid.append(int(col.size))
+            if col.size == 0:
+                median.append(float("nan"))
+                sd.append(float("nan"))
+            else:
+                median.append(float(np.median(col)))
+                # ddof=0 population SD; with n=1 that's 0.0, not NaN.
+                sd.append(float(np.std(col)))
+        return {"median": median, "sd": sd, "n_valid": n_valid}
+
     def read_od_enhanced(
         self,
         led_power: int = 2125,
@@ -346,9 +407,10 @@ class SerialManager:
         """Acquire one OD cycle with averaging, optional dark subtraction, and
         a per-vial calibration range guard. See :class:`ODReading`.
 
-        ``dark_subtract`` assumes the loaded calibration was fit on
-        dark-subtracted signal (LED-on - LED-off); a one-time warning is logged
-        if it is requested against a calibration not marked dark-subtracted."""
+        ``dark_subtract`` requires the loaded calibration to be fit on
+        dark-subtracted signal (LED-on - LED-off, per the OD_cal.meta.json
+        sidecar); requesting it against any other calibration raises
+        ``ValueError`` — mixing the two yields silently wrong OD."""
         with self._lock:
             return self._read_od_enhanced_locked(
                 led_power, n_samples, dark_subtract, n_dark, agg,
@@ -369,14 +431,18 @@ class SerialManager:
         # --- Dark phase (LED off). The photodiode still responds, so each
         # dark read is a full request/response we must drain. ---
         if dark_subtract and n_dark > 0:
-            if self.od_cal is not None and not self._od_cal_dark_subtracted \
-                    and not self._dark_subtract_warned:
-                log.warning(
-                    "dark subtraction requested but the loaded OD calibration is "
-                    "not marked dark-subtracted (OD_cal.meta.json); OD values may "
-                    "be wrong until a dark-subtracted calibration is installed"
+            if self.od_cal is not None and not self._od_cal_dark_subtracted:
+                # Hard error (SPEC §19.2 / CALIBRATION_PROTOCOL §13): the
+                # curve was fit on non-dark-subtracted signal, so subtracting
+                # the dark first yields silently wrong OD. Previously a
+                # one-time warning; the guard at experiment creation should
+                # make this unreachable, but a hand-edited config must not
+                # slip through.
+                raise ValueError(
+                    "dark_subtract=True requires an OD calibration marked "
+                    "dark_subtracted in OD_cal.meta.json; the loaded "
+                    "calibration is not"
                 )
-                self._dark_subtract_warned = True
             dark_body = self._format_csv(np.zeros(N_VIALS, dtype=int))
             dark_samples = self._collect_od_reads(dark_body, n_dark)
             dark_agg, _ = self._aggregate_samples(dark_samples, agg)

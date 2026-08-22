@@ -92,11 +92,12 @@ def test_pump_time_formula_uncapped() -> None:
     """Pick an OD that yields a sub-cap pump time so we can verify the formula.
 
     The controller fires whole-second pump_time (firmware accepts integer s
-    only); the fractional remainder is preserved in pump_time_deficit_seconds
-    and applied on a subsequent fire."""
+    only) and DISCARDS the fractional remainder -- there is no accumulator
+    (CONTROL_MODE_AUDIT.md T-3). int(t) <= t_needed is what makes the OD
+    floor unbreachable."""
     c = _make()
     # We want pump_time = -ln(0.2 / avg) * 25 / 1.0 < 20
-    # ln(0.2/avg) > -20/25 = -0.8 -> 0.2/avg > e^-0.8 ≈ 0.449 -> avg < 0.4456
+    # ln(0.2/avg) > -20/25 = -0.8 -> 0.2/avg > e^-0.8 ~ 0.449 -> avg < 0.4456
     # So pick avg = 0.43 (just above upper threshold).
     for _ in range(5):
         c.push_od(0.43)
@@ -104,19 +105,50 @@ def test_pump_time_formula_uncapped() -> None:
     assert action is not None
     expected_float = -math.log(0.2 / 0.43) * 25.0 / 1.0
     expected_whole = int(expected_float)
-    expected_residual = expected_float - expected_whole
     assert action.pump_time == float(expected_whole), (
         f"pump_time {action.pump_time}, expected {expected_whole} "
         f"(int part of formula {expected_float:.6f})"
     )
-    assert abs(c.pump_time_deficit_seconds - expected_residual) < 1e-9, (
-        f"residual deficit {c.pump_time_deficit_seconds}, "
-        f"expected {expected_residual:.6f}"
+    assert not hasattr(c, "pump_time_deficit_seconds"), (
+        "the turbidostat must carry no deficit accumulator (T-1/T-3)"
     )
     print(
-        f"PASS  pump_time formula matches SPEC §9 "
+        f"PASS  pump_time formula matches SPEC section 9 "
         f"(avg=0.43 -> formula {expected_float:.4f} s, fires {expected_whole}s, "
-        f"carries {expected_residual:.4f}s)"
+        f"remainder discarded)"
+    )
+
+
+def test_bolus_sized_from_latest_sample_not_lagged_mean() -> None:
+    """T-4: the rolling mean decides WHETHER to dilute; the newest sample
+    sizes the bolus. During growth the mean sits below the culture's present
+    density, so sizing from it under-doses."""
+    c = _make(history_window=5)
+    # Mean must clear od_upper (0.4) for hysteresis to flip the target,
+    # and the latest sample must stay under the 20 s cap so the cap does not
+    # mask which OD the bolus was sized from.
+    samples = (0.39, 0.40, 0.41, 0.42, 0.44)
+    for od in samples:
+        c.push_od(od)
+    mean = sum(samples) / len(samples)   # 0.412
+    latest = samples[-1]                 # 0.44
+    action = c.decide(now=10000.0)
+    assert action is not None
+    from_mean = int(-math.log(0.2 / mean) * 25.0)
+    from_latest = int(min(-math.log(0.2 / latest) * 25.0, 20.0))
+    assert from_mean != from_latest, "sanity: the two must differ for this test"
+    assert action.pump_time == float(from_latest), (
+        f"pump_time {action.pump_time} was sized from the lagged mean "
+        f"({from_mean}s); expected sizing from the latest sample ({from_latest}s)"
+    )
+    assert abs(action.average_od - mean) < 1e-9, (
+        "average_od must still report the rolling mean -- it is what lands "
+        "in pump_log.csv od_at_pump"
+    )
+    assert action.sizing_od == latest
+    print(
+        f"PASS  bolus sized from latest sample ({latest}) not lagged mean "
+        f"({mean:.3f}); average_od still reports the mean"
     )
 
 
@@ -229,169 +261,120 @@ def test_pump_action_efflux_seconds() -> None:
     print("PASS  PumpAction.efflux_seconds == pump_time + efflux_extra_seconds")
 
 
-def _sub_second_make(**overrides) -> TurbidostatController:
-    """Narrow hysteresis band so avg-just-above-lower regimes (the only
-    place the formula yields sub-second values with realistic flow rates)
-    stay in the target=lower branch instead of bouncing back to upper.
-
-    With od_lower=0.2, od_upper=0.205 -> midpoint=0.2025; an avg of 0.203
-    keeps target pinned to lower AND yields pump_time ≈ 0.372 s per cycle."""
-    kw = dict(
-        od_lower=0.2,
-        od_upper=0.205,
-        pump_wait_seconds=0.0,
-        min_samples_before_action=1,
-    )
-    kw.update(overrides)
-    return _make(**kw)
-
-
-def test_sub_second_deficit_accumulates_then_fires() -> None:
-    """Sub-second per-cycle pump_time must accumulate into a deficit and
-    fire when the integer part >= 1 s. The legacy firmware would silently
-    drop each sub-second command; the deficit makes the cumulative
-    dilution land as a smaller number of whole-second pumps instead."""
-    c = _sub_second_make()
-    # Whitebox: pretend hysteresis has already flipped target to lower so
-    # we can feed a steady avg-just-above-lower regime without first
-    # having to ramp OD over od_upper.
-    c.target = c.od_lower
-
-    per_cycle = -math.log(0.2 / 0.203) * 25.0 / 1.0
-    assert per_cycle < 0.5, (
-        f"sanity: per_cycle {per_cycle:.4f} should be sub-second"
-    )
-
-    fires = []
-    for tick in range(9):
-        c.push_od(0.203)  # above midpoint(0.2025), keeps target at lower
-        action = c.decide(now=100.0 * (tick + 1))
-        if action is not None:
-            fires.append((tick, action))
-
-    assert len(fires) >= 2, (
-        f"expected >=2 fires across 9 sub-second cycles "
-        f"(per_cycle={per_cycle:.4f} s); got {len(fires)}"
-    )
-    for tick, action in fires:
-        assert action.pump_time == int(action.pump_time), (
-            f"fire at tick {tick}: pump_time {action.pump_time} is not integer"
-        )
-        assert action.pump_time >= 1.0, (
-            f"fire at tick {tick}: pump_time {action.pump_time} < 1"
-        )
-    # First fire arrives no earlier than ceil(1/per_cycle) cycles in.
-    earliest_legitimate_tick = int(math.ceil(1.0 / per_cycle)) - 1
-    assert fires[0][0] >= earliest_legitimate_tick, (
-        f"first fire at tick {fires[0][0]} earlier than the deficit could "
-        f"legitimately cross 1 s (need >= tick {earliest_legitimate_tick})"
-    )
-    print(
-        f"PASS  sub-second deficit accumulates (per-cycle {per_cycle:.4f}s, "
-        f"first fire at tick {fires[0][0]}, total fires {len(fires)})"
-    )
-
-
-def test_deficit_preserves_total_dilution() -> None:
-    """The deficit accumulator should preserve total dilution: fired
-    seconds plus the residual still in the deficit equals the sum of all
-    per-cycle formula outputs (no truncation loss). Without accumulation,
-    every cycle's sub-second contribution would be silently dropped."""
-    c = _sub_second_make()
-    c.target = c.od_lower
-    per_cycle = -math.log(0.2 / 0.203) * 25.0 / 1.0
-    n_cycles = 50
-
-    fired_seconds = 0.0
-    for tick in range(n_cycles):
-        c.push_od(0.203)
-        action = c.decide(now=100.0 * (tick + 1))
-        if action is not None:
-            fired_seconds += action.pump_time
-
-    naive_total = per_cycle * n_cycles
-    reconstructed = fired_seconds + c.pump_time_deficit_seconds
-    assert abs(reconstructed - naive_total) < 1e-9, (
-        f"fired {fired_seconds} + residual {c.pump_time_deficit_seconds} "
-        f"= {reconstructed}, expected formula sum {naive_total}"
-    )
-    print(
-        f"PASS  deficit preserves total dilution "
-        f"(fired {fired_seconds}s + residual {c.pump_time_deficit_seconds:.4f}s "
-        f"== formula sum {naive_total:.4f}s)"
-    )
-
-
-def test_deficit_capped_at_pump_duration_cap() -> None:
-    """A long pump_wait stall must not let the deficit snowball past the
-    hard cap — otherwise a stuck experiment could fire a huge catch-up
-    bolus once the wait elapses."""
-    c = _make(pump_wait_seconds=1e9)  # effectively never opens the wait gate
-    # Whitebox: simulate that a pump fired at t=0 so the wait gate blocks
-    # every subsequent decide() in this test (time_since_last_pump returns
-    # inf for last_pump_time==None, which would let the very first call fire).
-    c.last_pump_time = 0.0
-    # Drive OD well above upper so each cycle's pump_time is the cap (20 s).
+def test_no_windup_across_refractory_cycles() -> None:
+    """T-1, the critical one. pump_time is an ABSOLUTE correction, not a
+    per-cycle increment, so accumulating it across cycles that fire nothing
+    makes an integrator with no anti-windup. 50 gated cycles must leave the
+    next bolus exactly as large as a single ungated decision would."""
+    c = _make(pump_wait_seconds=900.0)
     for _ in range(8):
-        c.push_od(0.9)
-    for tick in range(20):
-        c.push_od(0.9)
-        action = c.decide(now=100.0 * (tick + 1))
-        assert action is None, (
-            f"tick {tick}: pump_wait gate should block but a PumpAction fired"
+        c.push_od(0.5)
+    first = c.decide(now=0.0)
+    assert first is not None and first.pump_time == 20.0
+
+    # 50 cycles inside the refractory window: hot OD, nothing may fire and
+    # nothing may be stored up for later.
+    for tick in range(1, 51):
+        c.push_od(0.43)
+        assert c.decide(now=float(tick)) is None, f"tick {tick} fired inside pump_wait"
+
+    # Gate opens. The bolus must match the formula for the CURRENT OD alone.
+    c.push_od(0.43)
+    after = c.decide(now=1000.0)
+    assert after is not None
+    expected = int(-math.log(0.2 / 0.43) * 25.0)
+    assert after.pump_time == float(expected), (
+        f"after 50 gated cycles the bolus was {after.pump_time}s; a single "
+        f"ungated decision at the same OD asks for {expected}s -- the "
+        f"difference is accumulator windup"
+    )
+    print(
+        f"PASS  no windup: 50 refractory cycles leave the next bolus at "
+        f"{after.pump_time}s (single-decision value)"
+    )
+
+
+def test_dilution_never_undershoots_the_floor() -> None:
+    """Truncating without carrying guarantees int(t) <= t_needed, so a
+    dilution can never drive OD below od_lower. Checked directly against the
+    washout model the formula inverts."""
+    volume, flow = 25.0, 1.0
+    for lo, hi in ((0.35, 0.40), (0.30, 0.40), (0.20, 0.40), (0.20, 0.60)):
+        c = _make(od_lower=lo, od_upper=hi, pump_wait_seconds=0.0)
+        for od in (hi * 1.05, hi * 1.10, hi * 1.15, hi * 1.20, hi * 1.25):
+            c.push_od(od)
+        action = c.decide(now=100.0)
+        assert action is not None, f"band [{lo}, {hi}] failed to fire"
+        landed = action.sizing_od * math.exp(-flow * action.pump_time / volume)
+        assert landed >= lo - 1e-12, (
+            f"band [{lo}, {hi}]: {action.pump_time}s from OD "
+            f"{action.sizing_od:.3f} lands at {landed:.4f}, below the floor {lo}"
         )
-    assert c.pump_time_deficit_seconds == c.pump_duration_cap_seconds, (
-        f"deficit {c.pump_time_deficit_seconds} should be clamped at "
-        f"cap {c.pump_duration_cap_seconds}"
+    print("PASS  truncation guarantees the OD floor is never undershot")
+
+
+def test_sub_second_bolus_is_dropped_not_accumulated() -> None:
+    """T-3: with no accumulator a sub-second formula value fires nothing and
+    carries nothing. This is reachable only in a band narrower than
+    validate_control_parameters allows -- the create-time band check is what
+    makes it unreachable in a real run."""
+    # od_upper/od_lower = 1.015 -> max bolus ln(1.015)*25 = 0.37 s
+    c = _make(od_lower=0.2, od_upper=0.203, pump_wait_seconds=0.0)
+    c.target = c.od_lower  # whitebox: pretend hysteresis already flipped
+    fires = 0
+    for tick in range(50):
+        c.push_od(0.2029)
+        if c.decide(now=100.0 * (tick + 1)) is not None:
+            fires += 1
+    assert fires == 0, (
+        f"{fires} fires from a band whose largest bolus is sub-second -- "
+        "something is accumulating"
     )
     print(
-        f"PASS  deficit clamped at pump_duration_cap_seconds "
-        f"({c.pump_duration_cap_seconds}s) despite long pump_wait stall"
+        "PASS  sub-second bolus dropped, not accumulated (band validation at "
+        "experiment creation is what prevents this configuration)"
     )
 
 
-def test_deficit_persists_across_state_roundtrip() -> None:
-    """A controller that has accumulated a fractional residual must restore
-    that residual so a resumed experiment doesn't lose pending dilution."""
-    c = _sub_second_make()
-    c.target = c.od_lower
-    for tick in range(3):
-        c.push_od(0.203)
-        c.decide(now=100.0 * (tick + 1))
-    assert c.pump_time_deficit_seconds > 0.0
-
-    state = c.to_state()
-    assert "pump_time_deficit_seconds" in state, (
-        "to_state must include pump_time_deficit_seconds for persistence"
-    )
-
-    other = _sub_second_make()
-    other.restore_state(state)
-    assert abs(other.pump_time_deficit_seconds - c.pump_time_deficit_seconds) < 1e-12, (
-        f"restored deficit {other.pump_time_deficit_seconds}, "
-        f"expected {c.pump_time_deficit_seconds}"
-    )
-    print(
-        f"PASS  deficit persists across state round-trip "
-        f"({c.pump_time_deficit_seconds:.4f}s preserved)"
-    )
+def test_restore_ignores_legacy_deficit_key() -> None:
+    """A state.json written before T-3 removed the accumulator still carries
+    pump_time_deficit_seconds. Resuming across the upgrade must ignore it
+    rather than fail -- the rig can have a run in flight."""
+    c = _make()
+    c.restore_state({
+        "target": 0.2,
+        "last_pump_time": 500.0,
+        "od_history": [0.41, 0.42],
+        "total_samples_seen": 9,
+        "pump_time_deficit_seconds": 17.5,   # legacy key
+    })
+    assert c.target == 0.2
+    assert c.last_pump_time == 500.0
+    assert c.total_samples_seen == 9
+    assert not hasattr(c, "pump_time_deficit_seconds")
+    assert "pump_time_deficit_seconds" not in c.to_state()
+    print("PASS  legacy pump_time_deficit_seconds ignored on restore")
 
 
-def test_deficit_restore_clamps_corrupt_values() -> None:
-    """A negative deficit in state.json would silently block the next pump;
-    a too-large one would grant a >cap bolus. Both get clamped on restore."""
-    c1 = _make()
-    c1.restore_state({"pump_time_deficit_seconds": -7.0})
-    assert c1.pump_time_deficit_seconds == 0.0, (
-        f"negative deficit not clamped: {c1.pump_time_deficit_seconds}"
+def test_restore_rebaselines_future_timestamp() -> None:
+    """X-2: the RPi has no RTC, so a stale boot clock can put a persisted
+    last_pump_time ahead of wall time. Left alone, now - last_pump_time goes
+    negative and every dilution is blocked until wall time catches up."""
+    c = _make(pump_wait_seconds=900.0)
+    c.restore_state({"last_pump_time": 1_000_000.0}, now=1000.0)
+    assert c.last_pump_time == 1000.0, (
+        f"future timestamp not re-baselined: {c.last_pump_time}"
     )
+    # Without now=, the value is left as-is (callers that have no clock).
+    other = _make()
+    other.restore_state({"last_pump_time": 1_000_000.0})
+    assert other.last_pump_time == 1_000_000.0
 
-    c2 = _make(pump_duration_cap_seconds=20.0)
-    c2.restore_state({"pump_time_deficit_seconds": 9999.0})
-    assert c2.pump_time_deficit_seconds == 20.0, (
-        f"over-cap deficit not clamped: {c2.pump_time_deficit_seconds}"
-    )
-    print("PASS  restore clamps deficit to [0, pump_duration_cap_seconds]")
+    # And the gate opens normally after the clamp.
+    for _ in range(8):
+        c.push_od(0.5)
+    assert c.decide(now=1000.0 + 901.0) is not None
+    print("PASS  restore re-baselines a future timestamp to now (X-2)")
 
 
 def test_warmup_gate_blocks_early_action() -> None:
@@ -479,6 +462,7 @@ def main() -> int:
     test_below_target_no_pump()
     test_above_upper_switches_target_and_pumps()
     test_pump_time_formula_uncapped()
+    test_bolus_sized_from_latest_sample_not_lagged_mean()
     test_pump_wait_gate()
     test_hysteresis_back_to_upper()
     test_history_window_limits_average()
@@ -486,11 +470,11 @@ def main() -> int:
     test_state_round_trip()
     test_invalid_constructor()
     test_pump_action_efflux_seconds()
-    test_sub_second_deficit_accumulates_then_fires()
-    test_deficit_preserves_total_dilution()
-    test_deficit_capped_at_pump_duration_cap()
-    test_deficit_persists_across_state_roundtrip()
-    test_deficit_restore_clamps_corrupt_values()
+    test_no_windup_across_refractory_cycles()
+    test_dilution_never_undershoots_the_floor()
+    test_sub_second_bolus_is_dropped_not_accumulated()
+    test_restore_ignores_legacy_deficit_key()
+    test_restore_rebaselines_future_timestamp()
     test_warmup_gate_blocks_early_action()
     test_warmup_gate_persists_across_state_roundtrip()
     test_full_turbidostat_oscillation()

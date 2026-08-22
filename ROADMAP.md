@@ -8,6 +8,10 @@ sequences them into implementable sessions.
 
 - `CLAUDE.md` — hardware facts and serial protocol. Ground truth about the machine.
 - `SPEC.md` — technical specification of the software. Ground truth about *what to build*.
+- `CALIBRATION_PROTOCOL.md` — the tiered bench SOP (per-run / per-campaign / foundational)
+  and the implementation brief for the calibration wizards. Ground truth about *what the
+  numbers mean* and how they are established. Contains a numerical audit of the inherited
+  2016 constants that materially changes Session O — read §1 of it before starting O.
 - `SESSION_MASTER_PLAN.md` — the original Session A–J plan. Sessions A, B, C, F, G are
   built; D, E, H, I, J are not. Superseded for prioritisation purposes by this file.
 - `ROADMAP.md` (this file) — priority, sequencing, effort, and deferral decisions.
@@ -29,20 +33,31 @@ Reading the tree rather than the plan, the following is **built and in `main`**:
 | Media bottles, vial→bottle map, waste tracking, low/high alerts, refill | Built | `experiment_engine.py` (`_validate_and_normalize_media`, `refill_media`) |
 | Maintenance mode with 30 min auto-resume failsafe | Built | `experiment_engine.py` (`enter_maintenance` / `exit_maintenance`) |
 | Control modes: turbidostat, chemostat, morbidostat | Built | `server/control_modes/` |
-| Sub-second pump deficit accumulator | Built | all three control modes |
+| Sub-second pump deficit accumulator | Built (chemostat only) | `control_modes/chemostat.py` |
+| Control-mode audit fixes (windup, elapsed-time boli, sensor/control gate split) | Built | `CONTROL_MODE_AUDIT.md`, `server/test_control_loop.py` |
 | Data export (ZIP), exports browser, disk-usage monitoring | Built | `server/data_export.py`, `/api/storage` |
 | Crash recovery / resume from `state.json` | Built | `experiment_engine.py` (`resume_on_startup`) |
 | 16-colour distinct plot palette | **Already built** | `index.html` `PLOT_COLORS` |
 | Deployment: systemd unit, `install.sh`, Tailscale keepalive | Built | `DEPLOY.md`, `deploy/` |
+| Consumables safety interlock (reserve/waste hard stop, auto-maintenance) | Built (Session K) | `experiment_engine.py` (`_consumables_block_reason`, `_handle_consumables_block`) |
+| Volume-based fluidics (mL manual pumping with quantisation preview) | Built (Session L) | `experiment_engine.py` (`compute_pump_quantization`), `app.py` `/api/actuators/pump` |
+| Rotating disk-aware file logs, unified `events.csv`, error classification | Built (Session M) | `server/event_log.py`, `data_logger.log_event`, `/api/events/*`, `/api/health` |
+| Alert drawer, three-level alert colours, RS485 bus + per-vial health badges | Built (Session M2) | `index.html` (`#alert-drawer`, `applyHealth`) |
+| Calibration provenance, per-run OD blank, pump gravimetric wizard, reconciliation, staleness | Built (Session O) | `server/calibration_service.py`, `app.py` `/api/calibration/*`, `index.html` Calibration tab |
 
-**Not built** (relevant to this roadmap): calibration wizards of any kind (there are no
-`/api/calibration/*` endpoints at all), growth-rate estimation outside the morbidostat
-controller, anomaly/contamination detection, multi-phase protocols, experiment templates,
-authentication, PID/cascade temperature control, notifications, off-box backup, and
-parallel experiments (the engine explicitly holds one experiment in memory).
+**Sessions K, L, M, M2 and O shipped on 2026-08-20** and are folded into the table above;
+their per-session sections below carry the completion notes and verification results.
 
-### Important correction carried into this roadmap
+**Not built** (relevant to this roadmap): the Tier 3 calibration wizards (thermistor
+two-point, OD dilution series, stir RPM — Session AA, gated on bench prerequisite P2),
+growth-rate estimation outside the morbidostat controller, anomaly/contamination
+detection, multi-phase protocols, experiment templates, authentication, PID/cascade
+temperature control, notifications, off-box backup, and parallel experiments (the engine
+explicitly holds one experiment in memory).
 
+### Important corrections carried into this roadmap
+
+**1. `xr` is a closed-loop setpoint, not a PWM.**
 `SESSION_MASTER_PLAN.md` Session H states that temperature control works by
 `pwm = (target_temp - intercept) / slope`. **This is wrong and repeats the exact
 misconception `CLAUDE.md` warns about.** The `xr` value is a *closed-loop setpoint* that
@@ -51,6 +66,24 @@ runs the feedback loop, and the calibration slope is negative. Any "add PID" wor
 therefore *cascade* control (an outer loop on the Pi trimming the setpoint of an inner
 loop on the Arduino), not a replacement of a raw PWM. Session H is rewritten accordingly
 and deprioritised to P3.
+
+**2. The per-run OD blank must re-anchor row 2, not overwrite rows 0 and 1.**
+Earlier revisions of this file (and `SPEC.md` §19.2) specified the per-run blank as
+"update rows 0 and 1 of the OD calibration". Rows 0 and 1 are *fitted asymptotes* of a
+four-parameter logistic, not measurements, and they double as the validity domain in
+`serial_manager`. Implementing it as written would return negative OD on all sixteen vials
+and reject roughly half of all early-run samples as out-of-range. The correct operation is a
+one-parameter re-anchoring of row 2, which is identically a blank subtraction in OD units.
+Session O carries the full correction and the derivation is in `CALIBRATION_PROTOCOL.md`
+Appendix B.1.
+
+**3. The inherited calibration constants are not merely unverified — three of them are
+demonstrably wrong.** A numerical audit (`CALIBRATION_PROTOCOL.md` §1) shows the machine
+reports OD 0.115–0.444 for a sterile blank, that vial 0's temperature calibration is a
+5-sigma outlier likely running that sleeve ~9 °C cold while displaying the setpoint, and
+that vial 1's OD fit diverges inside its own working range. These are stated as findings
+against Session O, K and N throughout this document rather than as a generic "calibration
+is old" caveat.
 
 ---
 
@@ -62,13 +95,13 @@ the code.
 
 | # | Meeting item | Urgency | Utility | Difficulty | Priority | Session |
 |---|---|---|---|---|---|---|
-| 1 | Stop pumps when media empty / waste full | **Critical** | High | Low | **P0** | K |
-| 2 | Volume, not duration, for manual pump control | High | High | Low | **P0** | L |
-| 3 | Better logs | High | High | Low–Med | **P0** | M |
-| 4 | Better and more intelligent error logging | High | High | Med | **P0** | M |
+| 1 | Stop pumps when media empty / waste full | **Critical** | High | Low | **Done** | K |
+| 2 | Volume, not duration, for manual pump control | High | High | Low | **Done** | L |
+| 3 | Better logs | High | High | Low–Med | **Done** | M + M2 |
+| 4 | Better and more intelligent error logging | High | High | Med | **Done** | M + M2 |
 | 5 | Accurate per-vial growth rate calculator | High | **Critical** | Med–High | **P0** | N |
-| 6 | Per-run calibration wizard | High | High | Med | **P0** | O |
-| 7 | Calibration wizard (full) | High | High | High | P0/P2 | O / AA |
+| 6 | Per-run calibration wizard | High | High | Med | **Done** | O |
+| 7 | Calibration wizard (full) | High | High | High | **Done** (O) / P2 (AA) | O / AA |
 | 8 | Log last autoclave/sterilisation of fluidics | Med | High | **Low** | **P1** | P |
 | 9 | Sterilisation wizard | Med | High | Med | **P1** | P |
 | 10 | Experiment templates | Med | High | **Low** | **P1** | Q |
@@ -83,9 +116,14 @@ the code.
 | 19 | Distinct 16-colour palette | — | — | — | **Done** | AD (audit only) |
 | 20 | Map stir rate to physical RPM + animation | Low | Med | Med (bench work) | **P2** | AC |
 
-Items 3 and 4 are merged (Session M). Items 6 and 7 are split by scope (Session O covers
-the per-run and pump-flow wizards; AA covers full thermistor and OD sigmoid
-recalibration). Item 15 is split into a deterministic rule-based tier (P1) and a
+Items 3 and 4 are merged, then split by layer: **M** (backend capture and classification)
+and **M2** (the operator-facing display). The audit behind M2 found that most alerts the
+system already raises are rendered in success-green and vanish after 3.5 s, so "better
+logs" was substantially a *display* problem, not only a capture one. Items 6 and 7 are split by scope (Session O covers
+provenance, the per-run blank, pump flow and post-run reconciliation; AA covers full
+thermistor and OD sigmoid recalibration). **Item 6's difficulty is revised from Med to
+Med–High** — the audit in Session O showed the originally specified per-run blank was
+incorrect, and the versioning/provenance layer it depends on had not been costed. Item 15 is split into a deterministic rule-based tier (P1) and a
 statistical tier (P3). Item 18 is split into vial groups (P1) and true concurrency (P2).
 
 ### Deferral decisions and their reasoning
@@ -134,7 +172,10 @@ These gate the next unattended run and the handoff to other lab members.
 
 ### Session K — Consumables safety interlock
 
-**Priority: P0 (highest in the list). Effort: LIGHT–MEDIUM (45 min). Depends on: nothing.**
+**STATUS: DONE (2026-08-20).** Shipped in `experiment_engine.py`; covered by 16 tests in
+`test_experiment_engine.py` (`test_consumables_*`, `test_refill_*`, `test_media_status_*`).
+
+*Original triage: Priority P0 (highest in the list). Effort: LIGHT–MEDIUM (45 min). Depends on: nothing.*
 
 The engine already computes `_bottle_consumed_ml` and `_waste_filled_ml` and fires low/high
 alerts. It does **not** stop pumping. Today, a bottle that runs dry overnight results in the
@@ -162,23 +203,39 @@ vial drains and the run is lost. A full waste carboy floods the bench.
   currently a hardcoded default array. This is the strongest argument for doing Session O
   early. Note the dependency explicitly in the UI: if the experiment used default flow
   rates rather than measured ones, label the bottle levels "uncalibrated estimate".
-- A float switch or a load cell under the bottles would make this a measurement instead
-  of an estimate. Worth costing out — it is the single highest-value hardware addition on
-  this list.
+- **The cheap partial answer already exists: weigh the bottle.** Session O4 adds a post-run
+  mass reconciliation — media and waste masses at start and end, compared against the
+  inferred pumped volume. It costs two number fields and it is the only check that can see a
+  kinked line, a stalled pump, or a bottle someone topped up. Its drift over weeks is also
+  the signal that should trigger pump recalibration. Ship K with the estimate; use O4 to
+  learn how wrong the estimate actually is.
+- A float switch or a load cell under the bottles would make this a continuous measurement
+  instead of an estimate. Worth costing out — it is the single highest-value hardware
+  addition on this list, and O4 will produce the evidence for how much it is needed.
 
 **Verification:**
 
-- [ ] Mock run: bottle driven to reserve → influx suppressed for exactly the vials fed by it
-- [ ] Waste driven to capacity → all pumping suppressed, critical alert raised
-- [ ] All vials blocked → maintenance mode entered automatically
-- [ ] `refill_media` clears the block; nothing else does
-- [ ] Suppressed pump attempts appear in the event log with a reason
+- [x] Mock run: bottle driven to reserve → influx suppressed for exactly the vials fed by it
+- [x] Waste driven to capacity → all pumping suppressed, critical alert raised
+- [x] All vials blocked → maintenance mode entered automatically
+- [x] `refill_media` clears the block; nothing else does
+- [x] Suppressed pump attempts appear in the event log with a reason *(delivered by Session M —
+      `pump_suppressed` routes through the event funnel into `events.csv` with its reason)*
+- [x] Bottle levels are labelled "uncalibrated estimate" until Session O3 has run
 
 ---
 
 ### Session L — Volume-based fluidics
 
-**Priority: P0. Effort: LIGHT (30 min). Depends on: Session O for accuracy (ship anyway).**
+**STATUS: DONE (2026-08-20).** `compute_pump_quantization` in `experiment_engine.py`, the
+`volume_ml` branch of `/api/actuators/pump`, and the mL/seconds toggle in `index.html`.
+
+> **Accuracy caveat still stands.** Every mL figure the UI shows is computed from
+> `pump_flow_rates`, which remains the hardcoded 16-value default array that has never been
+> measured on this machine. Session L made the *units* right; **Session O3 is what makes the
+> numbers right.** Until then a "5 mL" dose is 5 mL only if the guessed flow rate is correct.
+
+*Original triage: Priority P0. Effort: LIGHT (30 min). Depends on: Session O for accuracy (ship anyway).*
 
 Researchers think in millilitres; the UI asks for seconds. Every manual dilution today
 requires mental arithmetic against a flow rate the user cannot see.
@@ -200,17 +257,33 @@ millilitre and the quantisation step is roughly one millilitre. So:
 
 **Verification:**
 
-- [ ] 5 mL request on a vial with flow rate 1.0 mL/s fires a 5 s pump
-- [ ] Sub-second requests rejected with a message naming the minimum for that vial
-- [ ] Displayed "will deliver" volume matches the logged delivered volume
-- [ ] Seconds mode still available and unchanged
-- [ ] Volume debits the correct media bottle
+- [x] 5 mL request on a vial with flow rate 1.0 mL/s fires a 5 s pump
+- [x] Sub-second requests rejected with a message naming the minimum for that vial
+      (HTTP 400, "below the minimum deliverable dose for vial N")
+- [x] Displayed "will deliver" volume matches the logged delivered volume
+- [x] Seconds mode still available and unchanged; supplying both is rejected
+- [x] Volume debits the correct media bottle (`record_manual_pump`)
 
 ---
 
 ### Session M — Structured logging and the unified event log
 
-**Priority: P0. Effort: MEDIUM (60 min). Depends on: nothing.**
+**STATUS: DONE (2026-08-20).** New `server/event_log.py`; 35 tests across
+`test_event_log.py` (24) and `test_event_log_api.py` (11). Suite: 218 passing.
+
+*Original triage: Priority P0. Effort: MEDIUM (60 min). Depends on: nothing.
+Scope: BACKEND ONLY — the operator-facing display is Session M2.*
+
+> **Note on the M/M2 split.** The two sessions were built together in one pass rather than by
+> parallel agents, so the "an agent taking M should not open `index.html`" rule below was moot.
+> The deliberate split of *capture* from *presentation* was kept in the code regardless: the
+> backend raises every alert, the frontend only renders them.
+
+> **Deliberate split.** M captures and classifies; **M2** presents. They are separated
+> because M touches no frontend code at all, which lets it run as a pure-backend agent in
+> parallel with N and O3a, while M2 batches with the other work that edits the single
+> 159 kB `frontend/templates/index.html`. Two agents editing that file concurrently will
+> conflict badly. An agent taking M should not open `index.html`.
 
 Currently `logging.basicConfig` writes to stdout, which systemd captures into the
 journal, and the only persistent structured records are `log_sensor_cycle`,
@@ -243,12 +316,86 @@ reading timestamps by eye.
 
 **Verification:**
 
-- [ ] Logs rotate and do not exceed the configured cap
-- [ ] `events.csv` is created per experiment and included in the export ZIP
-- [ ] A suppressed pump (Session K) appears in `events.csv` with its reason
-- [ ] 100 identical serial errors produce a bounded number of log lines with a count
-- [ ] Per-vial sensor health visible on the dashboard
-- [ ] Log writes stop gracefully when disk is below the floor
+- [x] Logs rotate and do not exceed the configured cap (10 MB × 5, errors 5 MB × 5)
+- [x] `events.csv` is created per experiment and included in the export ZIP
+- [x] A suppressed pump (Session K) appears in `events.csv` with its reason
+- [x] 100 identical serial errors produce a bounded number of log lines with a count
+      (11 surfaced at occurrences 1, 10, 20 … 100; **one** ring row reading `count: 100`)
+- [x] Per-vial sensor-failure counter exposed in `status()` (`nan_streak`,
+      `od_range_streak`, `sensor_health`)
+- [x] `GET /api/events/recent` ring buffer populated whether or not an experiment runs
+- [x] Log writes stop gracefully when disk is below the floor (128 MB, deliberately *below*
+      `DISK_CRITICAL_FREE_BYTES` so the disk alert fires before the logs go quiet)
+
+---
+
+### Session M2 — Operator-facing error surface
+
+**STATUS: DONE (2026-08-20).** Alert drawer, three-level toast colours, RS485 bus indicator,
+and per-vial sleeve badge in `index.html`; backed by `/api/events/recent`,
+`/api/events/<id>/ack` and `/api/health`.
+
+*Original triage: Priority P0. Effort: MEDIUM (60 min). Depends on: M for the ring buffer; the
+one-line colour fix depends on nothing. Owns `frontend/templates/index.html`.*
+
+**All four defects below are fixed.** The audit table and defect list are kept as the record of
+what was wrong and why it mattered — read them as history, not as current state.
+
+Spec: `SPEC.md` §20.4.
+
+An operator currently cannot debug this machine without SSH. The alert path exists but is
+thinner than it looks, and in one respect it actively misleads.
+
+**Audit of what's there** (verified against the code, Aug 2026):
+
+| | Count | Consequence |
+|---|---|---|
+| `log.exception` / `log.error` / `log.warning` sites | 73 | Journal only — SSH required |
+| Sites that raise an `alert` to the browser | 13 | Everything else is invisible |
+| Alert display lifetime | 3500 ms | Then gone permanently |
+| Alert history / persistence across reload | none | Refresh wipes the slate |
+
+**The four defects, and the one to fix immediately:**
+
+1. **Warnings render as success green.** `socket.on("alert")` computes
+   `msg.level === "critical" ? "error" : "ok"`, and `.toast.ok` is `--status-ok` (#16a34a).
+   **Seven of the engine's ten `_broadcast_alert` sites pass `level="warning"`** (two
+   `critical`, one computed) — media low, waste high, OD out of range — so most alerts
+   appear in the same green as "Stir applied".
+   This is a one-line change; ship it ahead of the rest of the session, it needs no
+   backend work.
+2. **Ephemeral** — a 03:00 alert is gone by morning, recoverable only from the journal.
+3. **No persistence across reload**, and no history on a second browser.
+4. **The failures most likely to end a run are log-only**: `pump_command failed`
+   (`app.py:671`), `pump firing failed for vial %d` (`app.py:1129`),
+   `set_temperature_celsius failed` (`app.py:563`), `execute queued pump actions failed on
+   exit` (`app.py:1017`), and `data_logger.log_pump_event failed` (`app.py:683`) — the last
+   being silent data loss.
+
+**What it builds:** the alert drawer (persistent, filterable, unacked badge, three distinct
+level colours), reload persistence via `GET /api/events/recent`, acknowledgement for
+criticals, an RS485 bus-health indicator distinct from the socket.io one, and the per-vial
+sensor-health badge. Full behaviour in `SPEC.md` §20.4.
+
+**Design note.** Keep the toast for transient confirmations of user-initiated actions —
+it is a fine acknowledgement channel and a bad error channel. The drawer is the error
+channel. Resist merging them.
+
+**Verification:**
+
+- [x] A `warning` alert is visually distinct from both success and critical
+      (`--status-warn` / `--status-critical` / `--status-info`; none reuse `--status-ok`)
+- [x] An alert raised with the browser closed appears in the drawer on next load
+- [x] Critical alerts persist until acknowledged; acknowledgement is recorded as an event
+- [x] Killing the serial link turns the bus indicator red while socket.io stays connected
+      — *backend verified (bus reaches `down` after 3 missed cycles, socket.io unaffected);
+      the red-dot rendering was confirmed by eye in the browser, not by a driven test*
+- [x] A forced `pump_command` failure surfaces in the drawer, not just the journal
+- [x] A repeating fault produces one drawer entry with a rising count, not hundreds
+      (41 forced failures → 1 row, `count: 41`)
+- [ ] **Drawer state is correct on a second browser opened mid-experiment — NOT VERIFIED.**
+      Two browsers were never opened simultaneously. The mechanism is server-side (the ring is
+      global and `refreshEvents()` runs on connect), so it should hold, but it is untested.
 
 ---
 
@@ -279,7 +426,10 @@ reported:
    rate. Over a window containing *k* dilution events with delivered volumes *vᵢ* into
    vial volume *V*, `μ ≈ Σ ln(1 + vᵢ/V) / Δt`. Depends only on pump volumes and event
    times, not on OD noise — much lower variance, but it inherits any error in the pump
-   flow calibration and is only valid when OD is genuinely stationary.
+   flow calibration and is only valid when OD is genuinely stationary. Until Session O3 has
+   run, that inherited error is unbounded: `pump_flow_rates` is a hardcoded array that has
+   never been measured on this machine, so this estimator is currently precise and possibly
+   biased, which is the worse of the two failure modes.
 
 **Report both, and treat their disagreement as a diagnostic.** Persistent divergence
 means something physical: biofilm/wall growth (the culture is denser than the planktonic
@@ -289,7 +439,12 @@ disagreement signal feeds Session V.
 **Edge cases that must be handled explicitly:**
 
 - Low-OD regime — below ~0.05 the sigmoid calibration is at its noisy tail; return
-  `None`, not a wild number.
+  `None`, not a wild number. Note that the floor is **not the same on every vial**: the audit
+  in Session O found optical sensitivity varying four-fold across sleeves (92–375 counts per
+  0.01 OD), so the low-OD cutoff and any reported uncertainty should be per-vial, derived
+  from the blank read noise recorded each run rather than a single global constant. Vial 1
+  additionally has a divergent fit above OD ≈ 1 and should be excluded from quantitative
+  comparisons until Session AA.
 - Insufficient data — the turbidostat is dormant for its first 8 cycles anyway; require a
   minimum sample count and time span before emitting a value.
 - Lag phase and stationary phase are not exponential; report a goodness-of-fit (R²)
@@ -309,56 +464,236 @@ disagreement signal feeds Session V.
 
 ---
 
-### Session O — Per-run and pump-flow calibration wizards
+### Session O — Calibration: provenance, per-run blank, pump flow, reconciliation
 
-**Priority: P0. Effort: DEEP (90 min, plus bench time). Depends on: nothing.
-Blocks accuracy of: K, L, N, R.**
+**STATUS: DONE (2026-08-20).** All four sub-items (O1, O2, O3a+O3, O4) shipped:
+`server/calibration_service.py` (envelope, versioned store, blank/pump sessions,
+thermal-settling tracker, staleness), the `/api/calibration/*` routes in `app.py`, the
+32-flow-rate engine plumbing, and the Calibration tab + OD-blank/pump/reconciliation
+wizards in `index.html`. Covered by `test_calibration_service.py` (26 tests),
+`test_calibration_api.py` (10 tests), and the O3a additions in
+`test_experiment_engine.py` / `test_serial_manager.py`. **What did NOT ship:** the Tier 3
+wizards (thermistor two-point, OD dilution series, stir RPM — Session AA, gated on bench
+prerequisite P2) and dedicated screens for Tier 0 pre-flight / §5.1 priming / §5.2
+spot-check rotation / §5.3 temperature verification, which stay on the printed run sheet
+(the §5.2 spot-check *is* runnable through the pump wizard by selecting just the four due
+lines). The software half is done; **the bench work — Tier 2 gravimetric calibration and
+a first real blank — has not been run**, so every accuracy claim below still holds until
+someone stands at the balance.
 
-There are currently **no calibration endpoints at all**, and `SPEC.md` §14 open question 3
-notes that the existing `temp_calibration.txt` and `OD_cal.txt` came from a previous user
-and have never been verified. Every OD number the system reports and every volume it
-believes it pumped rests on unvalidated 2016-era constants. This is the quiet blocker
-under most of the other work.
+*Original triage: Priority P0. Effort: DEEP (2–3 h across four sub-items, plus ~1 h
+bench). Depends on: nothing. Blocks accuracy of: K, L, N, R.*
 
-Scope for this session is deliberately the two calibrations with the best
-value-to-effort ratio. Full thermistor and OD sigmoid recalibration is Session AA.
+> **The bench protocol is `CALIBRATION_PROTOCOL.md`.** Part I of that document
+> is the tiered SOP (Tier 0 pre-flight → Tier 1 per-run → Tier 2 per-campaign pumps → Tier 3
+> foundational); Part II is the endpoint-by-endpoint implementation brief for this session,
+> including file formats, guards, wizard screens and a verification checklist. This section
+> is the priority and scope decision; that document is the *how*.
 
-**O1 — Pump flow calibration (gravimetric).** For each of the 32 pumps: prime, fire for a
-fixed 20 s into a tared vessel, user enters the mass or volume delivered, wizard computes
-mL/s and writes `calibration/pump_calibration.json`. This directly improves the interlock
-(K), the volume controls (L), the dilution-rate growth estimator (N), and the forecast (R).
-Bench time is roughly 40 minutes for all 32; the wizard should support doing it in
-batches and resuming.
+`SPEC.md` §14 open question 3 notes that the existing `temp_calibration.txt` and
+`OD_cal.txt` came from a previous user and have never been verified. Those files have been
+audited **numerically** (not yet on the bench), and the situation is worse than
+"unverified".
 
-**O2 — Per-run OD blank (meeting item 6).** The full 4-parameter sigmoid is a long
-calibration nobody will repeat before every experiment. What *is* worth repeating is
-re-establishing the two asymptotes with the actual vials, actual media, and actual sleeve
-seating for this run: record the dark reading (LEDs off) and the blank reading (LEDs on,
-sterile media, no cells) per vial, and update rows 0 and 1 of the OD calibration for this
-run only. This corrects the dominant per-run error sources — vial-to-vial optical
-variation, sleeve seating, media colour — in about 5 minutes, without touching the
-inflection point and Hill coefficient that genuinely need a dilution series.
+#### What the audit found — and why it changes this session's scope
 
-**Design notes:**
+Full tables in `CALIBRATION_PROTOCOL.md` Appendix A. Four findings, all computed from the
+committed calibration files:
 
-- Never overwrite `calibration/*.txt` in place. Write versioned files with a timestamp
-  and a `source` field, keep the previous one, and record which calibration version an
-  experiment used inside its `config.json`. Calibration provenance is part of the data.
-- Per-run blanks belong to the experiment directory, not the global calibration
-  directory, precisely because they are run-specific.
-- The wizard needs raw-mode access (`set_temperature_raw` exists; an equivalent raw OD
-  LED path is needed) — expose these under `/api/calibration/*`, not the normal actuator
-  routes, so ordinary use cannot reach them.
+1. **The machine reports OD 0.115–0.444 for a sterile blank.** Feeding a plausible blank
+   signal (~58 000 counts) through the current curves returns a non-zero OD on every vial —
+   a **0.33 OD spread across sleeves at zero cells**. Every turbidostat threshold in use today
+   is being compared against a number carrying a large, vial-specific, unmeasured offset. This
+   is the concrete size of what O2 buys.
+
+2. **The per-run blank as originally specified here would break the OD path.** See the spec
+   correction below. This is the single most important change in this revision.
+
+3. **Vial 0's temperature calibration is a 5-sigma outlier.** Its intercept (86.493) and slope
+   sit **+5.9 SD** and **+5.4 SD** off the other fifteen (4.5 on median/MAD). To request 37 °C
+   the software sends `xr = 482` to vial 0 and `xr ≈ 403` to everything else. If vial 0's
+   thermistor behaves like its neighbours, **commanding 37 °C is landing it at ≈ 28 °C while
+   the dashboard reads 37.0 °C.** The remaining fifteen agree to ±1.5 °C at a common setpoint,
+   which is itself evidence that vial 0 is a bad *fit* rather than a different sleeve.
+   This is a 20-minute bench check with a reference thermometer and should be done before the
+   next temperature-controlled run, ahead of any software work here.
+
+4. **Optical sensitivity varies four-fold across sleeves** — 92 counts per 0.01 OD on vial 1
+   against 375 on vial 9. Vial 1 is additionally broken: its fitted lower asymptote (44 262)
+   sits *inside* the normal working signal range, so its curve diverges above OD ≈ 1 and no
+   per-run blank will fix it. Consequence for Session N and the control modes: per-vial OD
+   noise is not uniform and should be reported, not assumed. A threshold separation of
+   0.02 OD is meaningful on vial 9 and is noise on vial 1.
+
+#### O1 — Calibration provenance and versioning (build this first)
+
+Not glamorous, and everything else is unsafe without it. A common JSON envelope
+(`schema`, `version`, `supersedes`, `operator`, `source`, `conditions`, `data`, `fit`, `qc`),
+a `calibration/current.json` pointer, per-subsystem version directories, and the legacy
+`.txt` files regenerated as a *derived view* so `SerialManager.load_calibration()` needs no
+change. Experiment `config.json` records a version for every subsystem it used.
+
+`conditions` is not decoration — LED power, stir PWM, setpoint, bench temperature, fluid,
+vial-map version. Two calibrations without their conditions cannot be compared. Reject a
+write with an empty `conditions` block.
+
+#### O2 — Per-run OD blank — **correction to the previous spec**
+
+**Previous text in this file and in `SPEC.md` §19.2 said: "update rows 0 and 1 of the OD
+calibration". Do not implement it that way.** Rows 0 and 1 are the fitted asymptotes of a
+four-parameter logistic, not measurements. Two concrete consequences:
+
+- Every fitted upper asymptote is **1.4×–8.7× the observed signal level** (81 938–503 890
+  against readings near 58 000) — an extrapolation the hardware never reaches, consistent
+  with a 16-bit ADC that cannot exceed 65 535. A measured blank is a point *on* the curve at
+  OD ≈ 0; the model places the asymptote at OD → −∞. They are not the same quantity.
+- `serial_manager._read_od_enhanced_locked` uses rows 0 and 1 as the **validity domain**
+  (`in_domain = (corrected > mn) & (corrected < mx)`). Setting `mx` to the measured blank
+  makes every reading at or above the blank return `NaN`. Early in a run OD sits at the blank,
+  so noise alone would discard roughly half the samples and `experiment_engine` would raise
+  "OD out of calibrated range" on all 16 vials.
+
+Substituting measured values into rows 0/1 moves reported OD at a 50 000-count signal from
+**+0.66 to −6.62** on vial 0, and negative on all sixteen.
+
+**Correct approach — re-anchor row 2 only:**
+
+```python
+c_run = np.log10((b - a) / (blank_raw - a) - 1.0) / d      # rows 0, 1, 3 untouched
+```
+
+This is *identically* `OD_new(S) = OD_old(S) − OD_old(blank)` — a blank subtraction in OD
+units, a rigid vertical shift that preserves the curve shape the dilution series paid for and
+leaves the validity domain alone. Derivation in `CALIBRATION_PROTOCOL.md` Appendix B.1; the
+four correctness assertions have been checked against the committed `OD_cal.txt`.
+
+The dark read is still taken every run, but recorded as a **diagnostic, not a correction**:
+the 2016 curve was fit on non-dark-subtracted signal and there is no `OD_cal.meta.json`
+sidecar saying otherwise, so `dark_subtract=True` against it is silently wrong. The blank
+re-anchoring absorbs a constant dark offset anyway. Dark subtraction switches on only when
+Session AA produces a dark-subtracted curve and its sidecar — and the blank must switch with
+it. Make this a hard error rather than the current log warning.
+
+Also correct in `SPEC.md` §6: the blank response should report `"updated_rows": [2]`, and
+return the per-vial OD offset removed — that number is what the operator actually needs to
+see, because it says how wrong the previous run was.
+
+#### O3 — Pump flow calibration (gravimetric)
+
+Unchanged in intent. For each of the 32 pumps: prime, fire for a fixed 20 s into a tared
+vessel, operator enters delivered mass, wizard computes mL/s and writes a versioned
+`calibration/pump/…json`.
+
+> #### ✅ Correction resolved 2026-08-20: the engine plumbing (O3a) has landed
+>
+> Earlier revisions of this section said the engine "already prefers
+> `config["calibration"]["pump_flow_rates"]` … so populating that block is the whole
+> integration." That was false until O3a shipped: `_resolve_flow_rates` used to coerce
+> through `_as_list_of_16`, so a 32-element array raised
+> `ValueError: 'pump_flow_rates' list must have length 16, got 32`. It now resolves
+> through `_as_flow_rates_32` (scalar → 32; length-16 → broadcast to both directions;
+> length-32 → as-is), and the claim is finally true: a complete pump calibration's 32
+> rates flow from `calibration/pump/…json` into `config["calibration"]["pump_flow_rates"]`
+> at experiment creation and from there into per-direction controller rates.
+
+**O3a — engine plumbing for 32 independent flow rates (SHIPPED with this session).**
+Scope as implemented:
+
+1. **`_resolve_flow_rates`** returns 32 values. Back-compatible: a scalar broadcasts to all
+   32; a length-16 list broadcasts each vial's rate to both its influx and efflux pump
+   (exactly today's behaviour, and the correct initial state — influx and efflux start
+   equal until O3 measures otherwise); a length-32 list is used as-is. Ordering is the
+   canonical pump index from `CLAUDE.md`: `0..15` influx, `16..31` efflux.
+2. **Controllers** (`turbidostat.py:81`, `chemostat.py:42`, `morbidostat.py:79`, plus the
+   delegating property at `morbidostat.py:167`) carry `flow_rate_influx_ml_s` and
+   `flow_rate_efflux_ml_s`, initialised equal. Keep `flow_rate_ml_s` as a deprecated alias
+   for the influx rate so `_debit_media_locked` and any external caller keep working during
+   the transition. **Dilution timing uses the influx rate only** — that is already correct
+   and must not change behaviour.
+3. **`_debit_media_locked`** (`experiment_engine.py:1393`): media debit stays influx-only
+   and is already right. Waste accumulation is wrong today, but do **not** simply swap in
+   the efflux rate — see `SPEC.md` §16.2. Once efflux overrun is engaged, the physically
+   correct model is `waste += influx_ml` (volume is pinned by the straw, so liquid out
+   equals liquid in). Until the overrun decision is made, leave waste as-is and add a
+   `TODO` referencing §16.2 rather than encoding a second wrong model.
+4. **Tests.** Add coverage for a 32-length array, a 16-length array (broadcast), and a
+   scalar. Every existing test pins `[1.0]*16` (`test_experiment_engine.py`, 10+ sites), so
+   there is currently zero regression protection here.
+
+This is a behaviour-preserving refactor: with influx and efflux initialised equal, every
+existing test must still pass unchanged.
+
+**Do not build software flow balancing.** `t_efflux = (F_in × t_in)/F_out` is defeated by
+the firmware's whole-second quantisation — for typical dilutions the truncation is the same
+magnitude as the correction. Volume regulation belongs to the efflux straw. Full reasoning
+in `SPEC.md` §16.2.
+
+Bench time is roughly an hour for all 32 and nobody will do it in one sitting, so the session
+must be **resumable**: per-pump state persisted, progress visible, abort leaves no partial
+file. Acceptance: 3 replicates, CV ≤ 5 %, within 15 % of the previous calibration, non-zero
+and within 2× of the manifold median. Mass→volume needs the bench-temperature density, and
+viscous media (high-sugar YPD, glycerol) should be calibrated in the actual medium.
+
+Worth stating plainly: **a 0.01 g balance resolves 0.05 % on a 20 s fire.** The balance is
+nowhere near the limiting factor — priming, line compliance and tubing wear are. That is why
+replicates and the CV criterion matter more than balance precision.
+
+#### O4 — Post-run mass reconciliation (new, ~20 min)
+
+Weigh the media bottle and waste carboy at the start and end of a run; compare the mass deltas
+against the software's accumulated `duration × flow_rate`. Agreement within ±10 % passes.
+
+This is the cheapest thing in the roadmap and the only check that validates the entire
+open-loop volume chain end to end — it is the one thing that can see a kinked line, a stalled
+pump, or a bottle someone topped up without telling the software (`SPEC.md` §14 Q8). Logged
+per run, the ratio's drift over weeks *is* the peristaltic tubing-wear signal, which is what
+should trigger recalibration rather than a fixed calendar interval.
+
+Needs one endpoint (`POST /api/experiments/{name}/reconcile`), two number fields in the UI,
+and a stored record. It also gives Session K's "uncalibrated estimate" label an evidence-based
+exit condition.
+
+#### Design notes
+
+- Never overwrite `calibration/*` in place. Versioned files with timestamp, operator and
+  `source`; previous versions retained; the version recorded in the experiment's
+  `config.json`. Calibration provenance is part of the dataset — a plot whose calibration
+  cannot be reconstructed is not reproducible.
+- Per-run blanks belong in `experiments/{name}/`, not `calibration/`, precisely because they
+  are run-specific.
+- Calibration is the **only** consumer of raw actuator paths. *(Done:
+  `POST /api/actuators/temperature/raw` moved to `/api/calibration/raw/temperature`, and
+  `/api/calibration/raw/od_led` was built.)* This matters more than usual given the
+  inverted `xr` convention.
 - Refuse to run any calibration while an experiment is RUNNING.
+- Refuse to save a bad fit — non-monotonic pump response, R² below a floor, a thermistor fit
+  spanning under 15 °C — overridable only with a recorded `override_reason`.
+- **Surface staleness.** Pump calibration goes stale on age, on cumulative pump-seconds (the
+  pump log already has them — sum them), or on a failed O4 reconciliation. A missing per-run
+  blank should hard-block the run, not warn.
+- **Review screens are the point.** Before committing any calibration the operator must see:
+  new value, previous value, delta, and which acceptance criteria passed. A wizard that just
+  says "done" reproduces exactly the situation that let finding 3 above sit unnoticed since
+  2016.
 
-**Verification:**
+#### Verification (2026-08-20: all software items pass in the test suite)
 
-- [ ] Pump wizard writes per-pump mL/s; engine picks them up via `calibration.pump_flow_rates`
-- [ ] Measured flow reproduces to within 15 % on a repeat run
-- [ ] Per-run blank updates rows 0–1 only, scoped to the experiment
-- [ ] Previous calibration files retained; experiment `config.json` records the version used
-- [ ] Calibration endpoints refuse to run during an active experiment
-- [ ] Bottle levels lose the "uncalibrated estimate" label once real flow rates exist
+- [x] `reanchor_od_calibration` yields `OD(blank) == 0.0` on all 16 vials
+- [x] Rows 0, 1, 3 bitwise unchanged by a blank commit; only row 2 differs
+- [x] `OD_new(S) − OD_old(S)` is constant in `S` per vial (shape preservation)
+- [x] Blank commit rejected when any blank falls outside the domain `(a, b)`
+- [x] Blank commit rejected when LED power or stir PWM differ from the run's values
+- [x] Enabling `dark_subtract` against a curve lacking the sidecar is a hard error, not a warning
+- [x] Pump wizard writes per-pump mL/s; engine consumes them via `calibration.pump_flow_rates`
+- [ ] Measured flow reproduces to within 15 % on a repeat run *(bench — Tier 2 not yet run)*
+- [x] Pump session survives a server restart mid-calibration and resumes correctly
+- [x] Aborting any wizard leaves no partial file in `calibration/`
+- [x] Previous calibration files retained; experiment `config.json` records a version per subsystem
+- [x] Legacy `.txt` views regenerate from `current.json` and load in `SerialManager`
+- [x] Calibration endpoints refuse to run during an active experiment
+- [x] Raw temperature and raw LED routes unreachable from the normal actuator surface
+- [x] O4 reconciliation record written; ratio outside ±10 % marks the pump calibration stale
+- [x] Bottle levels lose the "uncalibrated estimate" label once real flow rates exist
 
 ---
 
@@ -698,10 +1033,43 @@ per-group. **Effort: DEEP (2–3 h).**
 
 The remainder of meeting items 6/7 that Session O deliberately deferred: a 2-point
 thermistor calibration against a reference thermometer, and a proper OD dilution series
-fitting all four sigmoid parameters. Both need substantial bench time (a couple of hours
-each across 16 vials) and both are prerequisites for publishable absolute OD values —
-but the per-run blank from Session O covers day-to-day relative accuracy. Blocked in
-practice by `SPEC.md` §14 open question 4 (the heater diagnosis). **Effort: DEEP + bench.**
+fitting all four sigmoid parameters. Both need substantial bench time and both are
+prerequisites for publishable absolute OD values — but the per-run blank from Session O
+covers day-to-day relative accuracy. **Full procedures: `CALIBRATION_PROTOCOL.md` §8.1 and
+§8.2 (Tier 3). Effort: MEDIUM software, ~5 h bench.**
+
+**Blocked in practice** by `SPEC.md` §14 open question 4 (heater diagnosis), which
+`CALIBRATION_PROTOCOL.md` restates as prerequisite P2: confirm the heaters actually turn
+off when sent `xr = 4095`. Note the protocol's observation that historical "stuck-on"
+behaviour may have been the inverted-`xr` command bug rather than failed MOSFETs — worth
+30 minutes of testing before concluding hardware is at fault.
+
+Two things the audit has already changed about this session's scope:
+
+- **It is no longer optional for temperature.** Vial 0's calibration is a 5-sigma outlier
+  (see Session O) and probably has that sleeve running ~9 °C cold while the UI displays the
+  setpoint. Either the two-point calibration fixes it or the sleeve is genuinely different
+  and needs flagging — but the current file cannot be trusted on that vial.
+- **Vials 0, 1, 6, 14 and 15 are the priority.** All five show the signature of a poorly
+  constrained OD fit (|c| > 2 with shallow |d|, or a lower asymptote inside the working
+  range). Vial 1's fit diverges above OD ≈ 1. If bench time is short, recalibrate those five
+  rather than spreading effort evenly.
+
+**Efficiency note that makes the temperature half tractable:** ambient is a *free 16-way
+simultaneous calibration point*. With heaters off and stir running, all sixteen vials
+equilibrate to the same room temperature, so one reference reading serves all of them; only
+the hot point needs the probe moved vial to vial (~35 min). That turns a nominal
+"couple of hours per subsystem" into roughly 90 minutes.
+
+Acceptance criteria worth writing into the wizard rather than leaving to judgement: two
+points spanning ≥ 15 °C, fitted slope within ±10 % and intercept within ±2 °C of the pack
+median, and — the check that actually matters — an *independent* verification at an
+intermediate target (e.g. 30 °C) agreeing with the reference thermometer within 0.5 °C on at
+least four vials. A two-point fit reproduces its own two points trivially; only the middle
+tells you whether the response is linear. For OD: R² ≥ 0.99 per vial, residual < 0.02 OD,
+inflection point inside the measured range, and the fit performed on **dark-subtracted**
+signal with an `OD_cal.meta.json` sidecar recording that fact — that sidecar is what lets
+Session O2's dark read graduate from diagnostic to correction.
 
 ### Session AB — True parallel experiments
 
@@ -719,8 +1087,19 @@ RPM per sleeve across the 0–15 PWM range, by tachometer, strobe, or high-frame
 of a marked stir bar. Worth doing because "600 RPM" is reportable in a methods section
 and "stir setting 8" is not, and because stir bars couple inconsistently across sleeves —
 the calibration will likely reveal real vial-to-vial variation worth knowing about.
-Sample 4 points per sleeve and interpolate rather than all 16 settings. **Effort: MEDIUM
-software, ~2 h bench.**
+Sample 4 points per sleeve (PWM 4, 7, 10, 13) and interpolate rather than all 16 settings.
+**Procedure: `CALIBRATION_PROTOCOL.md` §8.3. Effort: MEDIUM software, ~2 h bench.**
+
+**Currently blocked on equipment, not time.** The lab has a balance, a reference thermometer
+and a spectrophotometer, but no tachometer, strobe, or high-frame-rate camera. The cheapest
+unblock is a phone shooting 240 fps with a white paint dot on one end of the stir bar, or an
+inexpensive optical tachometer. Until one exists, stir stays reported as a raw PWM and this
+session cannot start.
+
+Worth noting for Session O: stir setting affects the OD blank (vortex geometry and entrained
+air change the optical path), which is why `CALIBRATION_PROTOCOL.md` requires the per-run
+blank to be taken at the run's stir PWM and rejects a commit where they differ. That coupling
+holds whether or not RPM is ever calibrated.
 
 ### Session AD — Palette audit
 
@@ -778,14 +1157,20 @@ Ordered for risk reduction first, then usability, with bench work batched.
 
 | Week | Sessions | Theme |
 |---|---|---|
+| 0 | *(bench, ~1 h)* | **Prerequisites, before any of this:** vial→sleeve map (`SPEC.md` §14 Q2), heater off-test (§14 Q4), and the 20-minute vial-0 temperature check |
 | 1 | **K**, **L** | Stop losing experiments to empty bottles; make pumps speak millilitres |
-| 2 | **O** (+ bench) | Calibrate pumps and per-run blanks — unblocks the accuracy of everything |
-| 3 | **M**, **N** | Observability and the growth-rate engine (the dependency hub) |
-| 4 | **P**, **Q**, **U** | Hygiene records, templates, drag-assign — the handoff-usability block |
+| 2 | **O** (+ ~1 h bench) | Provenance, per-run blank, pump gravimetric, reconciliation — unblocks the accuracy of everything |
+| 3 | **M**, **N** | Observability (backend) and the growth-rate engine (the dependency hub) |
+| 4 | **M2**, **P**, **Q**, **U** | Error surface + hygiene records, templates, drag-assign — the frontend/handoff block |
 | 5 | **R**, **T**, **V** | Forecasting, derived plots, rule-based detection (all consume N) |
 | 6 | **S**, **W**, **X** | Supervised override, Slack alerts, off-box backup |
 | 7 | **Y** | Vial groups — the practical form of "parallel experiments" |
 | 8+ | Z, AA, AB, AC, AD, AE | Post-prototype, reprioritised at the next lab meeting |
+
+Week 0 is not software and is short, but skipping it invalidates week 2: every per-vial
+constant is attached to a logical index, and if index 7 is not the sleeve you think it is,
+the whole calibration set is scrambled. The vial-0 temperature check in particular should
+happen before the next temperature-controlled run regardless of where the software gets to.
 
 Weeks 1–3 are the ones that determine whether an unattended multi-day run survives.
 Weeks 4–6 are what make the system usable by someone who did not write it. If time is
@@ -793,5 +1178,14 @@ short, cut from week 7 onward, not from weeks 1–3.
 
 **Bring to a design discussion before implementing:** Session N (which growth-rate
 estimator is authoritative, and what the lab considers acceptable error), Session O (the
-gravimetric protocol and who does the bench work), and Session Y (whether groups really
-do cover the parallel-experiment need, before committing to the larger AB refactor).
+gravimetric protocol is now written — the open question is *who does the bench work*,
+`SPEC.md` §14 Q11), and Session Y (whether groups really do cover the parallel-experiment
+need, before committing to the larger AB refactor).
+
+**Open items inherited from `CALIBRATION_PROTOCOL.md`** that need a decision rather than
+code: who owns the bench work (≈1 h for Tier 2, ≈5 h for Tier 3); whether to buy a
+tachometer or use a 240 fps phone for Session AC; which turbidity standard to use for the
+Session AA dilution series (killed cells, heat-fixed cells, or beads); and replacing the
+protocol's provisional OD noise thresholds with measured repeatability after about five
+runs — the blank SDs recorded each run *are* that measurement, so it costs nothing but
+patience.

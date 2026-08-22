@@ -53,13 +53,15 @@ All members of the Isaacs Lab at Yale, ranging from undergraduate researchers wi
 ### Phase 3: Calibration + monitoring — **STARTED**
 
 - [x] Historical data plotting (uPlot, per-vial modal and plots view)
-- [ ] Guided calibration wizard for temperature and OD (§19)
-- [ ] Pump flow rate calibration (§19) — blocks the accuracy of §15, §16, §17
-- [ ] Per-run OD blank (§19)
+- [x] Calibration provenance and versioning (§19.1) — shipped 2026-08-20 (Session O)
+- [x] Per-run OD blank (§19.2) — corrected spec implemented; hard-blocks start when missing
+- [x] Pump flow rate calibration (§19.3) — wizard + 32-rate engine plumbing shipped; **bench Tier 2 still to run**
+- [x] Post-run mass reconciliation (§19.4)
+- [ ] Guided calibration wizard for temperature and OD (§19.5, Phase 4)
 - [ ] Growth rate estimation service (§17)
-- [ ] Consumables safety interlock (§15)
-- [ ] Volume-based fluidics (§16)
-- [ ] Structured logging and unified event log (§20)
+- [x] Consumables safety interlock (§15) — Session K
+- [x] Volume-based fluidics (§16) — Session L
+- [x] Structured logging and unified event log (§20) — Sessions M/M2
 - [ ] Hygiene records and sterilisation wizard (§18)
 - [ ] Supervised per-vial override (§21)
 - [ ] Rule-based anomaly and stall detection (§22)
@@ -160,6 +162,8 @@ All members of the Isaacs Lab at Yale, ranging from undergraduate researchers wi
 evolver-gui/
   CLAUDE.md                     # Claude Code context document
   SPEC.md                       # This file
+  ROADMAP.md                    # Current prioritised work plan
+  CALIBRATION_PROTOCOL.md       # Bench SOP + calibration wizard implementation brief
   README.md                     # Project overview and setup instructions
 
   server/
@@ -194,14 +198,22 @@ evolver-gui/
       experiment.html           # Experiment setup page
       calibration.html          # Calibration wizard (Phase 3)
 
-  calibration/
-    OD_cal.txt                  # OD calibration data (4 x 16)
-    temp_calibration.txt        # Temperature calibration data (2 x 16)
-    pump_calibration.json       # Pump flow rates per vial
+  calibration/                  # See §19.1 — versioned, never overwritten in place
+    vial_map.json               # Logical vial -> physical sleeve (§14 open question 2)
+    current.json                # Pointer: subsystem -> active version filename
+    od/2026-08-16T142203Z.json  # Versioned artefacts, one dir per subsystem
+    temperature/…json
+    pump/…json                  # Per-pump mL/s, 32 entries
+    stir/…json
+    OD_cal.txt                  # Legacy view (4 x 16), regenerated from current.json
+    OD_cal.meta.json            # {"dark_subtracted": bool} — gates §19.2 dark subtraction
+    temp_calibration.txt        # Legacy view (2 x 16), regenerated from current.json
+    _sessions/                  # In-progress, resumable wizard state
 
   experiments/                  # Created at runtime
     {experiment_name}/
-      config.json               # Experiment parameters
+      config.json               # Experiment parameters + calibration versions used
+      od_blank.json             # Per-run OD blank (§19.2) — run-scoped, not global
       vial00_OD.csv
       vial00_temp.csv
       vial00_pump_log.csv
@@ -339,8 +351,9 @@ POST /api/actuators/temperature
   Body: {"values_c": [37, 37, ...]}  // 16 target temperatures in Celsius
   Response: {"status": "ok", "current_temp_c": [30.1, ...], "raw_adc": [423, ...]}
   // Internally calls set_temperature_celsius; do NOT post raw setpoint integers here.
-  // The calibration wizard (Phase 3) has a separate /api/calibration/temperature/raw
-  // endpoint that exposes set_temperature_raw for advanced use.
+  // The calibration surface has a separate POST /api/calibration/raw/temperature
+  // endpoint that exposes set_temperature_raw (409 while an experiment is RUNNING);
+  // it replaced the old /api/actuators/temperature/raw route in Session O.
 
 POST /api/actuators/stir
   Body: {"values": [8, 8, ...]}  // 16 speed values
@@ -399,34 +412,88 @@ GET /api/experiments/{name}/status
   }
 ```
 
-### Calibration endpoints (Phase 3 — §19, not yet implemented)
+### Calibration endpoints (§19 — IMPLEMENTED 2026-08-20 except the Tier 3 block)
+
+Everything below exists as listed (`server/calibration_service.py` + `app.py`), with one
+exception: the thermistor two-point / OD dilution series / stir routes are **not built**
+(ROADMAP Session AA, Phase 4). The blank-session routes operate on the currently loaded
+CREATED experiment rather than taking an experiment name; QC refusals return **422** with
+the qc block, overridable by re-posting with an `override_reason`.
 
 ```
-GET /api/calibration/temperature
-  Response: {"slopes": [...], "intercepts": [...], "last_calibrated": "...", "version": "..."}
-
-GET /api/calibration/od
-  Response: {"params": [[...], [...], [...], [...]], "last_calibrated": "...", "version": "..."}
-
-GET /api/calibration/pump
-  Response: {"flow_rates_ml_s": {"influx": [...16], "efflux": [...16]},
+GET  /api/calibration/                # index: per subsystem — current version, age,
+                                      #   staleness state, qc summary
+GET  /api/calibration/temperature
+  Response: {"slopes": [...], "intercepts": [...], "last_calibrated": "...",
+             "version": "...", "outlier_vials": [...]}
+GET  /api/calibration/od
+  Response: {"params": [[...], [...], [...], [...]], "dark_subtracted": bool,
              "last_calibrated": "...", "version": "..."}
+GET  /api/calibration/pump
+  Response: {"flow_rates_ml_s": [...32],   // flat 32: index 0..15 influx, 16..31 efflux
+             "last_calibrated": "...", "version": "...", "pump_seconds_since": [...32]}
+  // Ordering is the canonical pump index (CLAUDE.md, "Pump command format"). An earlier
+  // revision of this line used an {"influx": [...], "efflux": [...]} object; that was
+  // retracted in favour of the flat-32 already specified in CALIBRATION_PROTOCOL §11.3,
+  // which matches the hardware binary addressing. See §16.1.
+GET  /api/calibration/history         # all versions, for provenance
+GET  /api/calibration/staleness       # what is overdue and why (§19.6)
 
-POST /api/calibration/{subsystem}/start     # subsystem = temperature | od | pump
-POST /api/calibration/{subsystem}/record    # append one measurement point
-POST /api/calibration/{subsystem}/finish    # fit, write a NEW versioned file, return the fit
-POST /api/calibration/{subsystem}/abort
+--- per-run OD blank (§19.2) ---
+POST /api/calibration/od/blank/start
+  Body: {"experiment": "name", "led_power": 2125, "stir_pwm": 8,
+         "target_temp_c": 37.0, "n_samples": 5}
+  → validates preconditions (conditions match the run; thermally settled), returns session id
+POST /api/calibration/od/blank/dark        # n reads at LED 0
+  Response: {"median": [...16], "sd": [...16], "n_valid": [...16]}
+POST /api/calibration/od/blank/measure     # n reads at led_power; same shape
+POST /api/calibration/od/blank/commit
+  Response: {"status": "ok", "updated_rows": [2], "c_run": [...16],
+             "od_offset_removed": [...16], "qc": {...}}
+POST /api/calibration/od/blank/abort
 
-POST /api/calibration/od/blank              # per-run blank; scoped to an experiment
-  Body: {"experiment": "name", "stage": "dark" | "blank"}
-  Response: {"status": "ok", "raw": [...16], "updated_rows": [0] | [1]}
+--- pump gravimetric (§19.3) ---
+POST /api/calibration/pump/start      # {pumps, fire_seconds, replicates, fluid,
+                                      #  fluid_density_g_ml, bench_temp_c}
+POST /api/calibration/pump/fire       # {pump_id} — fires once, returns actual duration
+POST /api/calibration/pump/record     # {pump_id, replicate, mass_g}
+GET  /api/calibration/pump/session    # progress; which pumps remain (resumability)
+POST /api/calibration/pump/finish     # fit, QC, write versioned file
+POST /api/calibration/pump/abort
 
-GET  /api/calibration/history               # all versions, for provenance
+--- thermistor two-point / OD dilution series / stir (§19.5) — NOT BUILT (Session AA) ---
+POST /api/calibration/temperature/start | /point | /finish | /abort
+POST /api/calibration/od/series/start   | /point | /finish | /abort
+POST /api/calibration/stir/record       | /finish
+
+--- raw escape hatches, calibration-only ---
+POST /api/calibration/raw/temperature      # {setpoints: [...16]} — wraps set_temperature_raw
+POST /api/calibration/raw/od_led           # {power: 0..2200} — needs building
 ```
 
-All `/api/calibration/*` routes reject requests while an experiment is RUNNING, and are
-the only routes permitted to reach the raw actuator paths (`set_temperature_raw`, raw OD
-LED power). See §19.
+Note the corrected blank response: **`"updated_rows": [2]`**, not `[0]` or `[1]`. The
+per-run blank re-anchors the inflection parameter only; see the warning in §19.2 for why
+writing rows 0 or 1 breaks the OD path. `od_offset_removed` is the number the operator
+actually needs — it says how wrong the previous run was.
+
+All `/api/calibration/*` mutating routes reject requests while an experiment is RUNNING,
+and are the only routes permitted to reach the raw actuator paths (`set_temperature_raw`,
+raw OD LED power). See §19.6.
+
+Related, though it lives on the experiment surface:
+
+```
+POST /api/experiments/{name}/reconcile     # §19.4 post-run mass reconciliation
+  Body: {"media_start_g": ..., "media_end_g": ..., "waste_start_g": ...,
+         "waste_end_g": ..., "density_g_ml": ...}   // each side optional as a pair
+  Response (as built — one block per side that was weighed, plus the overall flag):
+    {"media": {"inferred_ml": ..., "measured_ml": ..., "ratio": ..., "within_tolerance": bool},
+     "waste": {... same shape ...} | null,
+     "within_tolerance": bool, "pump_calibration_version": "...", "timestamp": "..."}
+  // Writes experiments/{name}/reconciliation.json and appends to
+  // calibration/reconciliation_log.json (the staleness trend input). 409 while
+  // that experiment is RUNNING.
+```
 
 ### Consumables, hygiene, override, and template endpoints (not yet implemented)
 
@@ -580,13 +647,17 @@ Saved when experiment is created. Serves as a complete record of parameters used
         "pump_wait_minutes": 15,
         "volume_ml": 25,
         "od_led_power": 2125,
-        "efflux_extra_seconds": 5
+        "efflux_extra_seconds": 0
     },
     "calibration": {
         "temp_cal_file": "temp_calibration.txt",
         "od_cal_file": "OD_cal.txt",
-        "pump_flow_rates": [0.95, 1.1, 0.975, 0.85, 0.95, 1.05, 1.05, 1.05,
-                            1.025, 1.125, 1.0, 1.0, 1.05, 1.15, 1.1, 1.025]
+        "pump_flow_rates": [
+            0.95, 1.1, 0.975, 0.85, 0.95, 1.05, 1.05, 1.05,
+            1.025, 1.125, 1.0, 1.0, 1.05, 1.15, 1.1, 1.025,
+            0.95, 1.1, 0.975, 0.85, 0.95, 1.05, 1.05, 1.05,
+            1.025, 1.125, 1.0, 1.0, 1.05, 1.15, 1.1, 1.025
+        ]
     },
     "notes": "Replicate adaptation experiment in LB, 8 vials"
 }
@@ -640,21 +711,45 @@ logic:
         set target = od_upper
 
     if average_od > target:
-        pump_time = -(ln(od_lower / average_od) * volume) / flow_rate
+        # Refractory gate FIRST. Nothing is computed, and nothing is
+        # remembered, on a cycle that will not fire.
+        if (now - last_pump_time) < pump_wait:
+            return
+
+        # The lagged mean above decided WHETHER to dilute; the newest sample
+        # sizes the bolus. The mean is a noise filter, not an estimate of the
+        # culture's density right now.
+        sizing_od = od_history[-1]
+        pump_time = -(ln(od_lower / sizing_od) * volume) / flow_rate
         pump_time = min(pump_time, 20)  # cap at 20 seconds
 
-        # Sub-second deficit accumulator (hardware-floor workaround;
-        # see "Sub-second pump-time deficit" note below).
-        deficit = min(deficit + pump_time, 20)
-
-        if (now - last_pump_time) >= pump_wait and int(deficit) >= 1:
-            whole = int(deficit)
-            deficit -= whole
+        # Truncate to whole seconds and DISCARD the remainder. No accumulator
+        # -- see "Sub-second pump-time deficit" below for why one belongs in
+        # the chemostat and not here.
+        whole = int(pump_time)
+        if whole >= 1:
             fire influx + efflux for whole seconds
             fire efflux alone for efflux_extra seconds
             log pump event
             emit experiment_event
 ```
+
+> **Corrected 2026-08-21 (CONTROL_MODE_AUDIT.md T-1 – T-4).** The previous
+> revision of this block specified the deficit accumulator *and* placed the
+> `pump_wait` check after it. That ordering was a **spec defect, not a coding
+> slip**: `pump_time` is an absolute correction, so adding it to a persistent
+> accumulator on every cycle — including the cycles the refractory gate then
+> blocked — built an integrator with no anti-windup. Closed-loop simulation
+> measured the OD floor breached by 10–47 % depending on band width, worst
+> with a tight band and a long `pump_wait`. Wide bands hid it completely,
+> because the required bolus already exceeded the 20 s cap and capped and
+> wound-up behaviour coincided.
+>
+> Because `int(t) <= t_needed` always, truncating without carrying makes the
+> floor unbreachable by construction. The cost is that a *second* bolus inside
+> one diluting episode may be sub-second and is then dropped; that is bounded
+> and safe, because `validate_control_parameters` guarantees at experiment
+> creation that the first bolus of every episode is >= 1 s (see below).
 
 ### Chemostat control mode (Phase 2)
 
@@ -666,8 +761,24 @@ inputs:
     bolus_interval — derived from dilution_rate
 
 logic:
-    pump_time_per_bolus = (dilution_rate * volume) / (3600 / bolus_interval) / flow_rate
+    # Optional start gate. Absent both parameters, dilution begins at
+    # inoculation density as before.
+    if not dilution_started:
+        if (start_od is set and last_od >= start_od)
+           or (start_after_seconds is set and elapsed >= start_after_seconds):
+            dilution_started = True
+        else:
+            return
+
     every bolus_interval seconds:
+        # Sized from the time that ACTUALLY elapsed, clamped so a resume
+        # after an outage cannot fire one enormous catch-up bolus.
+        elapsed = min(now - last_bolus_time, 4 * bolus_interval)
+        pump_time_per_bolus = (dilution_rate * volume * elapsed / 3600) / flow_rate
+        if pump_time_per_bolus > safety_cap:
+            raise a bolus_cap_clipped event      # the requested D is unreachable
+            pump_time_per_bolus = safety_cap
+
         # Sub-second deficit accumulator (hardware-floor workaround;
         # see "Sub-second pump-time deficit" note below).
         deficit = min(deficit + pump_time_per_bolus, safety_cap)
@@ -676,7 +787,35 @@ logic:
             deficit -= whole
             fire influx for whole seconds
             fire efflux for whole + efflux_extra seconds
+            total_volume_ml += whole * flow_rate    # DELIVERED, not intended
 ```
+
+Constraints and bookkeeping (CONTROL_MODE_AUDIT.md C-1 – C-5):
+
+- **`bolus_interval_seconds` must be >= 2 s.** `safety_cap` is
+  `min(20, bolus_interval - 1)`; below a 2 s interval that falls under the
+  firmware's 1 s resolution, so `int(deficit) >= 1` is never true and the
+  controller silently delivers nothing while booking the full volume.
+  Rejected in the constructor and again at experiment creation.
+- **Boli are sized from elapsed time, never the nominal interval.** The sensor
+  loop sleeps `interval - work`, so its true period is `max(interval, work)`:
+  it can only ever run slower than nominal, which makes a nominal-interval
+  bolus under-dose systematically. Measured −17 % to −34 % D under realistic
+  loop overrun, −29 % at 30 % dropped cycles.
+- **OD validity is not a precondition.** A chemostat is open-loop; the engine
+  consults `controller.requires_od` and only suspends modes that genuinely
+  close the loop on OD. See §9 "Sensor validity vs. control gating" below.
+- **`total_volume_ml` books what was delivered**, `total_volume_intended_ml`
+  what was prescribed. When the duration cap binds the two diverge, and that
+  divergence is the honest record — booking intent is how a run reports
+  D=5.00 while the truth is 4.80. `boli_fired` counts actual deliveries;
+  `bolus_cycles` counts gate-passing cycles.
+- **Optional `start_od` / `start_after_seconds`** hold the first bolus until
+  the culture is dense enough (or enough time has passed). The two are OR'd,
+  deliberately: with both set the timeout is the escape hatch for a sleeve
+  whose OD never reads, so a dead sensor cannot hold the run at inoculation
+  density indefinitely. Without a gate, dilution at D above the culture's µ
+  washes it out from inoculation and nothing notices.
 
 #### Sub-second pump-time deficit (hardware-floor workaround)
 
@@ -686,17 +825,69 @@ pump_time was sub-second silently truncated to zero and never fired.
 For a slow chemostat (e.g. D=0.5/h, V=25, T=60: pump_time_per_bolus ≈
 0.21 s) this means the firmware would deliver no dilution at all.
 
-Each control mode keeps a per-vial **deficit accumulator**: every cycle's
-formula output is added to the deficit (capped at the mode's safety
-limit), and the controller fires `int(deficit)` seconds when that reaches
-≥ 1 s, carrying the fractional remainder forward. Total dilution
-delivered equals total dilution prescribed (modulo the < 1 s residual
-still sitting in the accumulator at any moment), which the legacy
-behaviour did not guarantee.
+**The chemostat keeps a per-vial deficit accumulator; the turbidostat
+deliberately does not.** This asymmetry is the single most important thing in
+this section, and getting it wrong is what CONTROL_MODE_AUDIT.md T-1 found.
 
-Deficit state is persisted in `state.json` and clamped to
-`[0, safety_cap]` on restore so a corrupted file cannot suppress the
-next pump or grant an over-cap catch-up bolus.
+In the **chemostat** the accumulated quantity is a genuine per-interval
+*increment* of prescribed dilution. Every bolus cycle's `pump_time_per_bolus`
+is added to the deficit (capped at the mode's safety limit), and the
+controller fires `int(deficit)` seconds when that reaches >= 1 s, carrying the
+fractional remainder forward. Total dilution delivered equals total dilution
+prescribed, modulo the < 1 s residual sitting in the accumulator at any
+moment — which the legacy behaviour did not guarantee. Deficit state is
+persisted in `state.json` and clamped to `[0, safety_cap]` on restore so a
+corrupted file cannot suppress the next pump or grant an over-cap catch-up
+bolus.
+
+In the **turbidostat** the same-looking quantity is an *absolute setpoint
+error* — the seconds needed to bring the current OD down to `od_lower` — and
+accumulating it is an integrator with no anti-windup. It is therefore
+truncated and the remainder discarded. Nothing is lost that matters:
+hysteresis guarantees the first bolus of each diluting episode is at least
+`ln(od_upper/od_lower) * V / F` seconds, which is sub-second only for a band
+narrower than `exp(F/V)` ~ 1.041 at V=25, F=1 — narrower than the 3.9 % OD
+step a single 1 s bolus produces, i.e. a band the machine could not track
+anyway. `validate_control_parameters` rejects such a band at experiment
+creation, which is what turns the legacy silent stall into a visible error.
+
+An earlier revision of this section claimed "total dilution delivered equals
+total dilution prescribed" for *both* modes. That claim holds for the
+chemostat and was false for the turbidostat.
+
+#### Sensor validity vs. control gating
+
+A dropped or out-of-range sensor read is a *sensor* condition. Whether it
+should suspend *control* depends on the mode, and the engine must not conflate
+the two (CONTROL_MODE_AUDIT.md C-2):
+
+- Each controller exposes **`requires_od`**. It is `True` for the turbidostat
+  and morbidostat, which close the loop on OD, and `False` for the chemostat,
+  which does not. The chemostat raises it only while an unmet `start_od` gate
+  is armed.
+- `run_cycle` suspends the control decision for a vial only when its OD is
+  unusable **and** that vial's controller requires OD. `out_of_range` is the
+  case that matters most: it means the culture is denser than the calibration
+  covers, i.e. exactly when a chemostat must keep diluting.
+- A dropped **temperature** read skips per-vial heater safety for that cycle
+  and nothing else. Pumping does not depend on temperature, and the Arduino
+  closes the heater loop on its own thermistor whether or not the Pi received
+  the sample.
+
+#### Control-parameter validation at experiment creation
+
+`validate_control_parameters` (`experiment_engine.py`) runs inside
+`create_experiment`. Hard errors become HTTP 400; warnings are returned in the
+create response as `warnings: [...]` **and** raised through the alert funnel so
+they land in the run's event log.
+
+| | Condition | Result |
+|---|---|---|
+| turbidostat / morbidostat | `ln(od_upper/od_lower) * V / F < 1 s` | **400** — band can never dilute |
+| chemostat | `bolus_interval_seconds < 2 s` | **400** — delivers nothing, books everything |
+| turbidostat / morbidostat | first bolus of an episode < 2 s | warning — truncation eats a large share of each dose |
+| chemostat | `D * V * interval / 3600 > safety_cap * F` | warning — every bolus clipped, names the reachable D |
+| all | `efflux_extra_seconds == 0` | warning — volume regulation disengaged (§16.2) |
 
 ### Morbidostat control mode (Phase 2)
 
@@ -1053,7 +1244,7 @@ These decisions can be deferred but should be resolved before Phase 2:
 
 2. **Vial numbering:** The physical layout of vials in the eVOLVER needs to be mapped. The vial-identification script (one stirrer at a time) needs to be run to create a mapping from logical vial number to physical position.
 
-3. **Calibration validity:** The existing temp_calibration.txt and OD_cal.txt are from a previous user (Bernie/Brandon). They need to be verified against known standards before running real experiments.
+3. **Calibration validity — partly answered, and the answer is bad.** The existing temp_calibration.txt and OD_cal.txt are from a previous user (Bernie/Brandon). They have now been audited **numerically** (§19.0): the machine reports OD 0.115–0.444 for a sterile blank, vial 0's temperature calibration is a 5-sigma outlier probably running that sleeve ~9 °C cold while displaying the setpoint, and vial 1's OD fit diverges inside its own working range. **Bench verification against known standards is still outstanding** and is now a prerequisite for anything quantitative, not a nice-to-have. Procedures: `CALIBRATION_PROTOCOL.md` Tiers 2 and 3.
 
 4. **Heater stuck-on issue:** Diagnosis in progress. If MOSFETs are failed-on, hardware repair is needed before temperature-controlled experiments. OD and stir experiments can proceed independently. **Note:** the inverted `xr` setpoint convention (see §10 "Heater control convention") was discovered while debugging this issue — any prior code or operator command that sent `xr=0` "to turn the heaters off" was actually requesting ~82 °C, which would explain stuck-on behaviour even with healthy MOSFETs. Before concluding hardware is at fault, verify the heaters do turn off when sent `xr=4095` (or `set_temperature_celsius` with ambient target).
 
@@ -1078,7 +1269,10 @@ These decisions can be deferred but should be resolved before Phase 2:
 
 ## 15. Consumables safety interlock
 
-**Status: not implemented. Priority P0 (`ROADMAP.md` Session K).**
+**Status: IMPLEMENTED 2026-08-20 (`ROADMAP.md` Session K).**
+`experiment_engine.py` — `_consumables_block_reason`, `_handle_consumables_block`,
+`_bottle_blocked_locked`, `_waste_blocked_locked`. Blocks clear only via `refill_media`.
+Suppressed attempts are recorded as `pump_suppressed` events (§20.2).
 
 The engine tracks `_bottle_consumed_ml` and `_waste_filled_ml` and raises low/high alerts,
 but nothing stops pumping. An overnight bottle-empty condition currently results in the
@@ -1117,13 +1311,27 @@ disconnected tube or a manually topped-up bottle.
 - Tag each bottle's estimate `calibrated` or `uncalibrated` depending on whether the
   experiment used measured `pump_flow_rates` (§19) or the hardcoded defaults, and display
   that distinction.
-- See §14 open question 8 on replacing inference with a float switch or load cell.
+- **The cheap partial answer is to weigh the bottle.** §19.4 adds a post-run mass
+  reconciliation — media and waste masses at start and end, compared against the inferred
+  pumped volume. It is the only check that can see a kinked line, a stalled pump, or a
+  manually topped-up bottle, and its drift over weeks is the tubing-wear signal that should
+  trigger recalibration. Ship the estimate; use §19.4 to learn how wrong it is.
+- See §14 open question 8 on replacing inference with a float switch or load cell — §19.4
+  will produce the evidence for how much that hardware is actually needed.
 
 ---
 
 ## 16. Volume-based fluidics
 
-**Status: not implemented. Priority P0 (`ROADMAP.md` Session L).**
+**Status: IMPLEMENTED 2026-08-20 (`ROADMAP.md` Session L).**
+`compute_pump_quantization` in `experiment_engine.py`; `volume_ml` branch of
+`POST /api/actuators/pump`; mL/seconds toggle with a live "will deliver" preview in
+`index.html`. Sub-second requests are rejected with the per-vial minimum rather than
+truncated to zero.
+
+> **Units are right; the numbers are only as good as `pump_flow_rates`,** which is still the
+> unmeasured hardcoded default array. Session O3 (gravimetric calibration) is what makes a
+> requested 5 mL actually be 5 mL.
 
 Manual pump controls currently take a duration in seconds. Researchers work in
 millilitres, so every manual dilution requires mental arithmetic against a per-vial flow
@@ -1157,6 +1365,90 @@ differing per vial.
 Automatic dilutions in the control modes are unaffected — they already handle sub-second
 amounts correctly via the deficit accumulator (§9). This section governs the manual path
 only, where there is a human who can be told what will actually happen.
+
+### 16.1 Per-pump flow rates — schema and the engine gap
+
+**There are 32 physically distinct pumps and they do not share a flow rate.** Influx and
+efflux are separate peristaltic heads with separate tubing; firing both for the same
+duration does not move the same volume.
+
+**Canonical schema — a flat 32-element array**, ordered by the pump index convention in
+`CLAUDE.md` ("Pump command format"):
+
+```
+index 0..15   →  influx pump for vial (index)
+index 16..31  →  efflux pump for vial (index - 16)
+```
+
+That is, array index equals the exponent in the hardware binary address (`2^N` influx,
+`2^(N+16)` efflux), so the software index and the wire address never diverge. This matches
+the format already specified in `CALIBRATION_PROTOCOL.md` §11.3.
+
+> #### ✅ Engine gap closed 2026-08-20 (ROADMAP Session O3a)
+>
+> `_resolve_flow_rates` used to coerce through `_as_list_of_16`, so a 32-element array
+> raised `ValueError: 'pump_flow_rates' list must have length 16, got 32` at experiment
+> creation — while three documents claimed populating
+> `config["calibration"]["pump_flow_rates"]` was "the whole integration". The plumbing
+> has now landed and the claim is true.
+
+Engine changes as implemented (Session O3a, 2026-08-20):
+
+1. `_resolve_flow_rates` resolves through `_as_flow_rates_32`: a scalar broadcasts to all
+   32; a length-16 list broadcasts each vial's rate to both directions (the pre-O3
+   behaviour, and the correct initial state until O3 has actually measured anything); a
+   length-32 list is used as-is. Validated at experiment creation.
+2. All three controllers carry `flow_rate_influx_ml_s` **and** `flow_rate_efflux_ml_s`,
+   initialised equal when only the deprecated `flow_rate_ml_s` kwarg is given (which
+   remains accepted, and survives as a read-only alias for the influx rate). Only the
+   influx rate participates in dilution timing
+   (`pump_time = -(ln(od_lower/avg_od) × volume) / flow_rate_influx`).
+3. `_debit_media_locked` still computes `efflux_ml` from the **influx** rate,
+   deliberately, with a TODO pointing here: media consumption is influx-only and correct;
+   waste accumulation stays as-is per §16.2 — the fix is not simply "use the efflux rate".
+4. `test_experiment_engine.py` covers 32-length, 16-length (broadcast) and scalar inputs,
+   plus the `calibration` block path and the estimate-quality flip.
+5. The manual-pump mL conversion (`/api/actuators/pump` and its preview) is
+   direction-aware: `ExperimentEngine.flow_rate_ml_s(vial, direction)` selects the influx
+   or efflux pump's rate.
+
+### 16.2 Volume regulation is a hardware loop, not a software one
+
+**The efflux straw sets the working volume.** The efflux tube terminates at a fixed height
+in the vial; once the level reaches that tip the pump draws air and removes nothing more.
+Running efflux *longer* than strictly necessary therefore pins working volume to the straw
+height on every dilution, regardless of pump mismatch, tubing wear, or viscosity. This is a
+closed loop, and it is engaged by `efflux_extra_seconds`.
+
+**Do not implement software flow balancing.** The obvious fix —
+`t_efflux = (F_influx × t_influx) / F_efflux` — is defeated by the firmware's whole-second
+quantisation (§9). For a representative dilution (t_in = 3 s, F_in = 1.00, F_out = 0.95)
+the balanced duration is 3.16 s and truncates to 3 s: the correction is the same size as
+the truncation, so it vanishes. Recovering it would need a second deficit accumulator on
+the efflux side and would *still* leave sub-second residual imbalance every cycle. It is
+open-loop compensation against a hardware floor, where a hardware closed loop already
+exists.
+
+Consequences once overrun is engaged:
+
+- **Waste accumulation is `waste += influx_ml`, exactly.** Volume is pinned, so liquid
+  removed per dilution equals liquid added. Computing waste as
+  `efflux_seconds × efflux_flow_rate` is wrong twice: it uses a duration that deliberately
+  exceeds the liquid available, and counts the air-drawing portion as liquid. This
+  supersedes the naive reading of §16.1 item 3.
+- **`volume_ml` becomes a measured geometric constant** — set by where the straw is cut —
+  rather than the unverified `25.0` default in the config.
+- **The §17 dilution-rate growth estimator gets an honest `V`.** `μ ≈ Σ ln(1 + vᵢ/V)/Δt` is
+  biased by a drifting vial volume; pinning V removes that bias.
+
+**Current state and the open gate.** `efflux_extra_seconds` defaults to **0.0** across all
+three control modes (commit `a7b408a`, "live-validated default from eVOLVER-001"), which
+disables the mechanism entirely and makes level an open-loop integral of flow mismatch —
+undetectable in software, since there is no level sensor. **Establish why it was set to 0
+before restoring it**: if the straw currently sits too deep, overrun over-drains and the
+straw must be re-cut first; if the concern was foaming or aerosol from drawing air through
+culture, that bounds the safe overrun. This is a bench question, not a code question, and
+it gates `ROADMAP.md` Sessions K and L.
 
 ---
 
@@ -1262,64 +1554,241 @@ writing a hygiene record on completion.
 
 ## 19. Calibration wizards
 
-**Status: not implemented — there are no `/api/calibration/*` routes in the codebase at
-all. Priority P0 for pump and per-run blank (`ROADMAP.md` Session O); Phase 4 for full
-thermistor and OD sigmoid recalibration.**
+**Status: §19.1–§19.4 and §19.6 IMPLEMENTED 2026-08-20 (`ROADMAP.md` Session O).**
+`server/calibration_service.py` holds the envelope, the versioned store under
+`calibration/` (with the legacy `.txt` files regenerated as a derived view), the OD-blank
+and pump wizard sessions, the thermal-settling tracker, staleness, and reconciliation;
+`app.py` exposes them under `/api/calibration/*` and `index.html` carries the Calibration
+tab with the OD-blank, pump and reconciliation wizards. §19.5 (full thermistor and OD
+sigmoid recalibration) remains **Phase 4 / Session AA**, gated on bench prerequisite P2.
+The software is bench-ready; **Tier 2 gravimetric calibration and the first real blank
+have not yet been run**, so the numeric caveats below still stand until they are.
+
+> **The bench protocol is `CALIBRATION_PROTOCOL.md`.** Part I is the tiered SOP the lab
+> actually follows (Tier 0 pre-flight → Tier 1 per-run → Tier 2 per-campaign pumps → Tier 3
+> foundational); Part II is the endpoint-by-endpoint implementation brief, with file
+> formats, guards, wizard screens and a verification checklist. This section is the
+> specification; that document is the procedure and the evidence behind it.
 
 Every OD value the system reports and every volume it believes it moved rests on
-unvalidated 2016-era constants inherited from a previous user (§14 open question 3).
+2016-era constants inherited from a previous user (§14 open question 3). Those constants
+have now been audited **numerically**, and three of them are demonstrably wrong rather than
+merely unverified — see §19.0. The audit changed the design of §19.2, so read it before
+implementing.
 
-### 19.1 Pump flow calibration (gravimetric) — P0
+### 19.0 What the audit of the inherited constants found
+
+Full tables in `CALIBRATION_PROTOCOL.md` §1 and Appendix A; all figures computed from the
+committed `calibration/*.txt`.
+
+1. **The machine reports OD 0.115–0.444 for a sterile blank.** A plausible blank signal
+   (~58 000 counts) returns a non-zero OD on every vial — a **0.33 OD spread across sleeves
+   at zero cells**. Every OD threshold currently in use is compared against a number
+   carrying a large, vial-specific, unmeasured offset. Removing this is what §19.2 is for.
+
+2. **Rows 0 and 1 are fitted asymptotes, not measurements.** Every fitted upper asymptote
+   is **1.4×–8.7× the observed signal level** (81 938–503 890 against readings near
+   58 000) — an extrapolation the hardware never reaches, consistent with a 16-bit ADC
+   capped at 65 535. This invalidates the previous specification of §19.2; see the
+   correction there.
+
+3. **Vial 0's temperature calibration is a 5-sigma outlier.** Its intercept (86.493) and
+   slope sit **+5.9 SD** and **+5.4 SD** off the other fifteen (4.5 on median/MAD). To
+   request 37 °C the software sends `xr = 482` to vial 0 and `xr ≈ 403` to everything else.
+   If vial 0's thermistor behaves like its neighbours, **commanding 37 °C lands it at
+   ≈ 28 °C while the UI displays 37.0 °C.** The other fifteen agree to ±1.5 °C at a common
+   setpoint, which is itself evidence of a bad fit rather than a different sleeve. A
+   20-minute bench check with a reference thermometer resolves it (§19.5).
+
+4. **Optical sensitivity varies four-fold across sleeves** — 92 counts per 0.01 OD on
+   vial 1 against 375 on vial 9. Vial 1 is additionally broken: its fitted lower asymptote
+   (44 262) sits *inside* the working signal range, so its curve diverges above OD ≈ 1 and
+   no per-run blank will fix it. **Consequence for §17 and the control modes:** per-vial OD
+   uncertainty is not uniform and must be reported rather than assumed. A threshold
+   separation of 0.02 OD is meaningful on vial 9 and is noise on vial 1.
+
+### 19.1 Calibration provenance and versioning — P0, build first
+
+Nothing else in this section is safe without it.
+
+- A common JSON envelope for every artefact: `schema`, `subsystem`, `version`,
+  `supersedes`, `operator`, `source`, `conditions`, `data`, `fit`, `qc`.
+- `calibration/current.json` points at the active version per subsystem; per-subsystem
+  directories hold every previous version (they are small — retain all of them).
+- The legacy `OD_cal.txt` and `temp_calibration.txt` become a **derived view**, regenerated
+  from `current.json`, so `SerialManager.load_calibration()` needs no change.
+- `conditions` is mandatory, not decoration: LED power, stir PWM, setpoint, bench
+  temperature, fluid and density, vial-map version. Two calibrations without their
+  conditions cannot be compared. Reject a write with an empty `conditions` block.
+- Every experiment's `config.json` records a version for each subsystem it used.
+
+### 19.2 Per-run OD blank — P0 — **corrected specification**
+
+> ⚠ **This section previously specified "update rows 0 and 1 of the OD calibration".
+> That was wrong and would be actively harmful. Do not implement it that way.**
+>
+> Rows 0 and 1 are the fitted asymptotes of a four-parameter logistic, not measurements
+> (§19.0 finding 2), and `serial_manager._read_od_enhanced_locked` additionally uses them
+> as the **validity domain**: `in_domain = (corrected > mn) & (corrected < mx)`. Setting
+> `mx` to a measured blank makes every reading at or above the blank return `NaN`. Early in
+> a run OD sits at the blank, so noise alone would discard roughly half of all samples and
+> `experiment_engine` would raise "OD out of calibrated range" on all sixteen vials.
+> Substituting measured values into rows 0/1 moves reported OD at a 50 000-count signal
+> from **+0.66 to −6.62** on vial 0, and negative on every vial.
+
+The full four-parameter sigmoid is a long calibration nobody will repeat before every
+experiment. What *is* worth repeating is re-anchoring the curve against this run's actual
+vials, media and sleeve seating.
+
+**Procedure (≈10 min, `CALIBRATION_PROTOCOL.md` §5.4).** Taken last, immediately before
+inoculation, under final run conditions — sterile medium at working volume, sleeves seated,
+stir at the run's PWM, temperature equilibrated and held ≥ 10 min, LED at the run's power.
+
+1. **Dark read** — LED power 0, five reads, per-vial median and SD.
+2. **Blank read** — LED at the run value, five reads, per-vial median and SD.
+3. **Re-anchor row 2 only:**
+
+```python
+c_run = np.log10((b - a) / (blank_raw - a) - 1.0) / d    # rows 0, 1, 3 untouched
+```
+
+This is *identically* `OD_new(S) = OD_old(S) − OD_old(blank)` — a blank subtraction in OD
+units, a rigid vertical shift that preserves the curve shape the dilution series paid for
+and leaves the validity domain intact. Derivation: `CALIBRATION_PROTOCOL.md` Appendix B.1.
+
+**Rows 0, 1 and 3 are never modified by a per-run blank.** They change only in §19.5.
+
+**Correcting offset is not correcting gain.** If a vial's optical coupling has changed
+enough to alter the slope of signal against OD, the blank will read 0 while every non-zero
+OD is wrong. The blank-median acceptance window (±10 % of the campaign reference) is the
+tripwire; §19.5 is the fix.
+
+**The dark read is a diagnostic, not a correction.** The 2016 curve was fit on
+non-dark-subtracted signal and carries no `OD_cal.meta.json` sidecar saying otherwise, so
+`dark_subtract=True` against it is silently wrong — `serial_manager` logs a warning today
+and this should become a hard error. The blank re-anchoring absorbs a constant dark offset
+anyway. Dark subtraction switches on only when §19.5 produces a dark-subtracted curve and
+its sidecar, and the blank must switch with it; a dark-subtracted curve with a
+non-dark-subtracted blank is as wrong as the reverse.
+
+Per-run blanks are written to the **experiment directory**
+(`experiments/{name}/od_blank.json`), not the global calibration directory, because they
+are run-specific by definition.
+
+### 19.3 Pump flow calibration (gravimetric) — P0 — IMPLEMENTED
 
 For each of the 32 pumps: prime the line, fire for a fixed 20 s into a tared vessel,
-operator enters delivered mass or volume, wizard computes mL/s and writes
-`calibration/pump_calibration.json`. Supports batching and resumption — 32 pumps is about
-40 minutes of bench work and nobody will do it in one sitting.
+operator enters delivered mass, wizard computes mL/s and writes a versioned
+`calibration/pump/…json`. The engine consumes it through
+`experiment_engine._resolve_flow_rates`, which prefers
+`config["calibration"]["pump_flow_rates"]` over the hardcoded defaults — a claim that
+became true only when Session O3a's 32-rate plumbing landed (see §16.1). A **partial**
+calibration (e.g. the §5.2 four-line spot-check) merges over the previous version's rates;
+only a version with all 32 rates populated is fed to new experiments.
 
-Directly improves §15 (interlock), §16 (volume controls), §17 (dilution estimator), and
+Directly improves §15 (interlock), §16 (volume controls), §17 (dilution estimator) and
 consumables forecasting.
 
-### 19.2 Per-run OD blank — P0
+- **Resumable.** ~1 hour of bench work for all 32 and nobody does it in one sitting:
+  per-pump state persisted, progress visible, abort leaves no partial file.
+- **Acceptance:** 3 replicates with CV ≤ 5 %; within 15 % of the previous calibration;
+  non-zero and within 2× of the manifold median; monotonic if multiple durations are tested.
+- Mass→volume uses the **bench-temperature** density. Calibrate in water unless the medium
+  is appreciably more viscous or dense (high-sugar YPD, glycerol), in which case use the
+  medium and record which fluid was used.
+- A 0.01 g balance resolves 0.05 % on a 20 s fire. The balance is nowhere near the limiting
+  factor — priming, line compliance and tubing wear are, which is why replicates and the CV
+  criterion matter more than balance precision.
 
-The full 4-parameter sigmoid is a long calibration nobody will repeat before every
-experiment. What *is* worth repeating is re-establishing the two asymptotes against this
-run's actual vials, media, and sleeve seating:
+### 19.4 Post-run mass reconciliation — P0, small
 
-- **Dark reading** — LEDs off → OD calibration row 0
-- **Blank reading** — LEDs on, sterile media, no cells → OD calibration row 1
+Weigh the media bottle and waste carboy at the start and end of a run; compare the mass
+deltas against the software's accumulated `duration × flow_rate`. Agreement within ±10 %
+passes.
 
-Rows 2 and 3 (inflection point, Hill coefficient) are untouched; they genuinely require a
-dilution series. This corrects the dominant per-run error sources — vial-to-vial optical
-variation, sleeve seating, media colour — in roughly 5 minutes.
+This is the only check that validates the entire open-loop volume chain end to end — it is
+the one thing that can see a kinked line, a stalled pump, or a bottle someone topped up
+without telling the software (§14 open question 8). Logged per run, the ratio's drift over
+weeks *is* the peristaltic tubing-wear signal, and should trigger recalibration in place of
+a fixed calendar interval.
 
-Per-run blanks are written into the **experiment directory**, not the global calibration
-directory, because they are run-specific by definition.
+Needs one endpoint (`POST /api/experiments/{name}/reconcile`), two number fields in the UI,
+and a stored record. It also gives §15's `uncalibrated` label an evidence-based exit
+condition.
 
-### 19.3 Full temperature and OD recalibration — Phase 4
+### 19.5 Full temperature and OD recalibration — Phase 4
 
-Two-point thermistor calibration against a reference thermometer, and an OD dilution
-series fitting all four sigmoid parameters. Several hours of bench work; prerequisites
-for publishable absolute OD values. Blocked in practice by §14 open question 4 (heater
-electrical health).
+Two-point thermistor calibration against a reference thermometer, and an OD dilution series
+fitting all four sigmoid parameters. Procedures: `CALIBRATION_PROTOCOL.md` §8.1 and §8.2.
+Prerequisites for publishable absolute OD values. Blocked in practice by §14 open question 4
+(heater electrical health) — though note that historical "stuck-on" behaviour may have been
+the inverted-`xr` command bug rather than failed MOSFETs, which is 30 minutes of testing to
+establish.
 
-### 19.4 Cross-cutting requirements
+No longer optional for temperature: §19.0 finding 3 means vial 0 cannot be trusted until
+this runs. For OD, vials 0, 1, 6, 14 and 15 all show the signature of a poorly constrained
+fit; if bench time is short, recalibrate those five rather than spreading effort evenly.
 
-- **Never overwrite calibration files in place.** Write versioned files carrying a
-  timestamp, operator, and `source`; retain the previous version; record the calibration
-  version used inside each experiment's `config.json`. Calibration provenance is part of
-  the dataset — a plot whose calibration cannot be reconstructed is not reproducible.
-- Calibration is the **only** consumer of raw actuator paths (`set_temperature_raw`, raw
-  OD LED power). Expose them under `/api/calibration/*` so ordinary operation cannot
-  reach them.
+**Efficiency note that makes the temperature half tractable:** ambient is a *free 16-way
+simultaneous calibration point*. With heaters off and stir running, all sixteen vials
+equilibrate to the same room temperature, so one reference reading serves all of them; only
+the hot point needs the probe moved vial to vial (~35 min).
+
+**Acceptance — temperature:** two points spanning ≥ 15 °C; fitted slope within ±10 % and
+intercept within ±2 °C of the pack median; and — the check that actually matters — an
+*independent* verification at an intermediate target (e.g. 30 °C) agreeing with the
+reference thermometer within 0.5 °C on at least four vials. A two-point fit reproduces its
+own two points trivially; only the middle reveals whether the response is linear.
+
+**Acceptance — OD:** R² ≥ 0.99 per vial against true OD600 from a benchtop
+spectrophotometer; residual < 0.02 OD or 5 %, whichever is larger; fitted lower asymptote
+clearly below the lowest measured signal; inflection point inside the measured range;
+monotonic across the working range. Fit on **dark-subtracted** signal and write
+`calibration/OD_cal.meta.json` with `{"dark_subtracted": true}` — that sidecar is what lets
+§19.2's dark read graduate from diagnostic to correction. Use a non-growing turbidity source
+(killed cells, heat-fixed cells, or beads) so the series does not drift over the two hours
+it takes to measure 16 vials.
+
+### 19.6 Cross-cutting requirements
+
+- **Never overwrite calibration files in place.** Versioned files carrying timestamp,
+  operator and `source`; the previous version retained; the version recorded in each
+  experiment's `config.json`. Calibration provenance is part of the dataset — a plot whose
+  calibration cannot be reconstructed is not reproducible.
+- **Calibrate in the state you will run in.** Same vial type, fill volume, medium, sleeve
+  position, stir PWM, thermally equilibrated. A blank taken with the stirrer off is not a
+  blank for a run with the stirrer at 8. Reject a blank commit whose LED power or stir PWM
+  differs from the run's.
+- Calibration is the **only** consumer of raw actuator paths. *(Done 2026-08-20:
+  `POST /api/actuators/temperature/raw` moved to `POST /api/calibration/raw/temperature`,
+  and `POST /api/calibration/raw/od_led` was built; both 409 while RUNNING.)* Ordinary
+  operation cannot reach a raw heater setpoint, which matters more than usual given the
+  inverted `xr` convention (§10).
 - All calibration routes refuse to run while an experiment is RUNNING.
-- On completion, report the fit quality and refuse to save an obviously bad fit (e.g.
-  non-monotonic pump response, R² below a floor) without explicit override.
+- **Refuse to save an obviously bad fit** — non-monotonic pump response, R² below the floor,
+  a thermistor fit spanning under 15 °C — overridable only with a recorded `override_reason`
+  in `qc.overridden_by`.
+- **Surface staleness.** Pump calibration goes stale on age, on cumulative pump-seconds (the
+  pump log already holds them — sum them), or on a failed §19.4 reconciliation. A missing
+  per-run blank should hard-block the run rather than warn.
+- **Review screens are the point.** Before committing any calibration the operator must see
+  the new value, the previous value, the delta, and which acceptance criteria passed. A
+  wizard that only says "done" reproduces exactly the situation that let §19.0 finding 3 sit
+  unnoticed since 2016.
+- **Prerequisite: the vial→sleeve map** (§14 open question 2). Every per-vial constant is
+  attached to a logical index; if index 7 is not the sleeve you think it is, the whole
+  calibration set is scrambled. Record the `vial_map` version in every calibration write and
+  warn loudly when it is null.
 
 ---
 
 ## 20. Observability: structured logging and the event log
 
-**Status: minimal (`logging.basicConfig` to stdout). Priority P0 (`ROADMAP.md` Session M).**
+**Status: IMPLEMENTED 2026-08-20 (`ROADMAP.md` Sessions M and M2).**
+`server/event_log.py` holds the rotating disk-guarded handlers, the event ring buffer, the
+rate limiter, and the `BusHealth` / `VialHealth` classifiers. `DataLogger.log_event` writes
+`events.csv`; `app.py` funnels every alert and experiment event through one pair of functions
+so nothing can reach a browser without also being captured.
 
 ### 20.1 Rotating file logs
 
@@ -1354,6 +1823,115 @@ Logging every serial hiccup identically buries the one that matters. Classify:
 
 Rate-limit repeated identical errors: log the first, then every Nth with an occurrence
 count. A stuck loop must not be able to fill the disk in an hour.
+
+### 20.4 Operator-facing error surface
+
+**Status: IMPLEMENTED 2026-08-20 (`ROADMAP.md` Session M2).**
+
+§20.1–§20.3 are about *capturing* errors. This section is about an operator seeing them
+without SSH-ing into the Pi.
+
+#### What was built
+
+- **Alert drawer** — persistent, collapsible, filterable by level / vial /
+  unacknowledged-only, with an unacked-count badge in the header. Three visually distinct
+  levels, none of which reuses the success colour. `index.html` `#alert-drawer`.
+- **Reload persistence** — `GET /api/events/recent?level=&category=&vial=&limit=` over a
+  500-entry server-side ring, populated whether or not an experiment is running.
+- **Acknowledgement** — `POST /api/events/<id>/ack`. The acknowledgement is itself recorded
+  as an event, so `events.csv` shows who cleared what and when.
+- **RS485 bus health** — `#bus-conn`, fed by the `health` block on every `sensor_update`
+  and by `GET /api/health`. Amber while frames are being dropped, red after
+  `DEFAULT_SENSOR_FAILURE_THRESHOLD` consecutive failures. Distinct from the socket.io dot.
+- **Per-vial sleeve badge** — `.vial-health` on each card, from the streak counters the
+  engine now exposes in `status()` (`nan_streak`, `od_range_streak`, `sensor_health`).
+- **Escalation** — every actuator-command, serial, and data-logger failure now raises an
+  alert as well as logging, rate-limited so a repeating fault is one entry with a rising
+  count rather than hundreds.
+
+The toast is retained for transient confirmations of user-initiated actions. It is a
+reasonable acknowledgement channel and was never an acceptable *error* channel.
+
+#### What the surface looked like before (the audit that motivated this)
+
+Before Session M2, an `alert` WebSocket event originated from **13 sites**: three in `app.py` (watchdog
+trigger `:404`, emergency stop `:711`, disk-low `:1190`) and ten in `experiment_engine.py`
+via `_broadcast_alert` (`experiment_engine.py:2265`) covering media low, waste high, OD
+range and NaN streaks, latched vial faults, escalations, and maintenance transitions.
+Engine alerts reached the socket through an `on_alert` lambda; the browser handled the
+event at `index.html` `socket.on("alert")` and called `showToast` and nothing else.
+
+*(Line numbers above are pre-Session-M2 and will not resolve against current `main`.)*
+
+#### The four defects this section was written to fix
+
+**All four are now closed.** They are kept as the record of what was wrong and why it
+mattered -- read them as history, not as current state.
+
+1. **Warnings are styled as success.** The handler reads
+   `const kind = msg.level === "critical" ? "error" : "ok"`, and `.toast.ok` is
+   `--status-ok: #16a34a` — green. **Seven of the engine's ten `_broadcast_alert` sites
+   pass `level="warning"` literally** (two are `critical`, one is computed at `:1677`), so
+   the majority of alerts the system raises — media bottle low, waste nearly full, OD out
+   of range — render in the same green as "Stir applied". One-line fix; it should not wait
+   for the rest of the session.
+
+2. **Alerts are ephemeral.** `showToast` clears after 3500 ms and nothing retains the
+   message. An alert raised at 03:00 is gone by morning: not on screen, not in a file
+   (`events.csv` per §20.2 did not exist yet), recoverable only from the systemd journal
+   over SSH. This defeated the entire purpose of raising it.
+
+3. **Nothing survives a page reload.** There is no client- or server-side history, so
+   refreshing the dashboard — or opening it on a second machine — shows a clean slate
+   regardless of what has happened.
+
+4. **Most failures never reach the browser at all.** There are 73 `log.exception` /
+   `log.error` / `log.warning` sites across the server against 13 alert-raising sites. The
+   silent ones include the failures most likely to ruin a run:
+   `pump_command failed` (`app.py:671`), `pump firing failed for vial %d`
+   (`app.py:1129`), `set_temperature_celsius failed` (`app.py:563`),
+   `execute queued pump actions failed on exit` (`app.py:1017`), and
+   `data_logger.log_pump_event failed` (`app.py:683`) — the last being **silent data
+   loss**, a pump row that never reaches the CSV.
+
+Additionally, the header connection indicator reflects the **socket.io** connection, not
+the RS485 bus. If the serial link fails while Flask stays up, the browser continues to
+show "connected" beside stale or NaN readings, and all 13 `log.exception` sites in
+`serial_manager.py` are invisible.
+
+#### Required behaviour
+
+**Alert drawer.** A persistent, collapsible panel with an unacknowledged-count badge in
+the header. Each row: timestamp, level, subsystem/category, vial (if applicable), message,
+and expandable detail. Filterable by level and vial. Three visually distinct levels —
+info, warning, critical — none of which may reuse the success colour.
+
+**Persistence across reload.** `GET /api/events/recent?level=&limit=` backed by a
+server-side ring buffer (default 500 entries) that is populated **whether or not an
+experiment is running** — calibration faults, manual-control failures, and serial errors
+all occur while idle, so a per-experiment `events.csv` is not sufficient on its own. When
+an experiment *is* running, the drawer reads through to `events.csv` for full history.
+
+**Acknowledgement.** `critical` entries persist until explicitly acknowledged rather than
+ageing out; the acknowledgement (who, when) is recorded as an event. Warnings may age out
+of the drawer but never out of `events.csv`.
+
+**Escalation of log-only failures.** Every actuator-command failure, serial read/write
+failure, and data-logger write failure must emit an alert in addition to logging. The
+triage rule: *if a human would want to know within the hour, it is an alert; otherwise it
+is a log line.* Apply the §20.3 rate-limiting so a repeating fault produces one alert with
+a rising count, not hundreds.
+
+**RS485 bus health.** An indicator distinct from the socket.io indicator, showing time
+since the last successful read per subsystem (temperature, OD), amber after one missed
+cycle and red after `DEFAULT_SENSOR_FAILURE_THRESHOLD` consecutive failures.
+
+**Per-vial health badge.** Surface the existing per-vial sensor-failure counter on the
+vial card, so a single degraded sleeve is visible without opening anything.
+
+The existing toast is retained for transient confirmations of user-initiated actions
+("Stir applied"). It is a reasonable acknowledgement channel; it is simply not an
+acceptable *error* channel.
 
 ---
 
@@ -1407,6 +1985,7 @@ and during the turbidostat's 8-cycle warmup.
 |---|---|---|
 | Stall | μ < 0.05/h for > 2 h with OD > 0.1 | warning |
 | Dead culture | OD monotonically falling > 1 h with no dilution | warning |
+| Chemostat washout | OD monotonically falling > 2 h *while dilution is active* | critical |
 | Dilution-response failure | Influx fired but OD did not drop by the expected fraction | warning |
 | Runaway growth | OD above upper threshold for > 3 consecutive cycles despite dilution | warning |
 | Estimator divergence | Segment-regression μ and dilution-rate μ differ > 50 % for > 1 h (§17) | info |
@@ -1417,6 +1996,16 @@ and during the turbidostat's 8-cycle warmup.
 **No rule may stop an experiment.** Every alert must carry the evidence that triggered it —
 the numbers, the window, the threshold. An alert that only says "possible contamination"
 trains users to dismiss alerts, which is worse than having none.
+
+The **chemostat washout** rule is the deferred half of CONTROL_MODE_AUDIT.md C-5. The
+other half — the optional `start_od` / `start_after_seconds` gate that stops a run diluting
+at inoculation density — shipped 2026-08-21. Washout is the failure that gate does not
+cover: D set above the culture's actual µ (e.g. D=0.5/h against a minimal-media µ≈0.35/h)
+dilutes faster than the culture grows, and the vial empties of cells over hours with every
+subsystem reporting healthy. It is `critical` rather than `warning` because the run is
+already unrecoverable by the time it is visible, and it is listed here rather than in the
+control mode because it is a detection rule, not a control decision — the chemostat must
+keep delivering the rate it was asked for.
 
 The dilution-response check deserves emphasis: by comparing the OD drop a dilution
 *should* have produced against what actually happened, it catches the two most common
@@ -1462,7 +2051,7 @@ disproportionate payoff for handing the system to new lab members.
 - Curated built-ins: standard turbidostat (8 vials, LB, 37 °C), chemostat dilution series,
   morbidostat escalation, OD-only monitoring with heaters parked at ambient.
 - Templates record the calibration version they assume and warn on load if calibration has
-  changed since (§19.4).
+  changed since (§19.1, §19.6).
 - Export/import as a portable file, so a protocol can be shared between labs or attached
   to a paper.
 
@@ -1499,10 +2088,19 @@ Stir is currently a raw PWM value 0–15 (this one really *is* a PWM, unlike `xr
 §10). "Stir setting 8" is not reportable in a methods section; "600 RPM" is.
 
 - Measure actual RPM per sleeve across the 0–15 range by tachometer, strobe, or
-  high-frame-rate video of a marked stir bar. Sample ~4 points per sleeve and interpolate
-  rather than measuring all 16 settings.
-- Store as `calibration/stir_calibration.json`, per vial, following the versioning rules
-  in §19.4.
+  high-frame-rate video of a marked stir bar. Sample 4 points per sleeve (PWM 4, 7, 10, 13)
+  and interpolate rather than measuring all 16 settings. Procedure:
+  `CALIBRATION_PROTOCOL.md` §8.3.
+- **Currently blocked on equipment, not time.** The lab has a balance, a reference
+  thermometer and a spectrophotometer, but no tachometer, strobe or high-frame-rate camera.
+  Cheapest unblock: a phone shooting 240 fps with a white paint dot on one end of the stir
+  bar, or an inexpensive optical tachometer.
+- Store as `calibration/stir/…json`, per vial, following the versioning rules in §19.1
+  and §19.6.
+- **Coupling worth noting even if RPM is never calibrated:** stir setting affects the OD
+  blank, because vortex geometry and entrained air change the optical path. That is why
+  §19.2 requires the per-run blank to be taken at the run's stir PWM and rejects a commit
+  where the two differ.
 - Display RPM alongside the PWM setting in the UI and record it in `config.json`.
 - Optional: bind an animation's rotation rate to the calibrated RPM in the experiment
   designer. Cosmetic, and last.
