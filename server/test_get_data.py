@@ -15,8 +15,11 @@ import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import data_export as dx  # noqa: E402
 from experiment_engine import ExperimentEngine  # noqa: E402
 
 
@@ -216,3 +219,157 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+# ===========================================================================
+# Bounded tail reads  (see data_export.read_tail_rows)
+# ===========================================================================
+#
+# The optimisation's whole safety argument is that the tail read is a
+# PREFILTER: it returns a superset and `filter_rows_by_hours` still trims
+# exactly. These tests assert that equivalence directly against a reference
+# that reads the whole file, so a future change to the chunking cannot quietly
+# start dropping rows.
+
+
+def _reference_get_data(path, parameter, hours=None, last_n=None,
+                        max_points=None):
+    """What get_data did before the tail read: read everything, then filter."""
+    with path.open("r", encoding="utf-8", newline="") as f:
+        lines = f.read().splitlines()
+    if not lines:
+        return {"timestamps": [], "values": []}
+    header = lines[0].split(",")
+    rows = lines[1:]
+    try:
+        elapsed_col = header.index("elapsed_hours")
+    except ValueError:
+        elapsed_col = 1
+    if hours is not None and rows:
+        rows = dx.filter_rows_by_hours(rows, elapsed_col, hours)
+    if last_n is not None:
+        rows = rows[-last_n:]
+    col = header.index("calibrated_od" if parameter == "od"
+                       else "calibrated_temp_c")
+    ts, vals = [], []
+    for line in rows:
+        parts = line.split(",")
+        ts.append(parts[0] if parts else "")
+        cell = parts[col] if len(parts) > col else ""
+        try:
+            vals.append(float(cell) if cell != "" else None)
+        except ValueError:
+            vals.append(None)
+    if max_points is not None:
+        ts, vals = ExperimentEngine._downsample_minmax(ts, vals, max_points)
+    return {"timestamps": ts, "values": vals}
+
+
+def _write_big_od(root: Path, name: str, vial: int, n_rows: int,
+                  crlf: bool = True, gaps=()) -> Path:
+    exp = root / name
+    exp.mkdir(parents=True, exist_ok=True)
+    path = exp / f"vial{vial:02d}_OD.csv"
+    eol = "\r\n" if crlf else "\n"
+    with path.open("w", encoding="utf-8", newline="") as f:
+        f.write("timestamp,elapsed_hours,raw_adc,calibrated_od,n_valid,flag,dark" + eol)
+        for i in range(n_rows):
+            od = "" if i in gaps else f"{0.2 + (i % 500) * 0.001:.4f}"
+            f.write(f"2026-05-12T10:00:{i % 60:02d}+00:00,{i * 10 / 3600:.4f},"
+                    f"52000,{od},5,ok," + eol)
+    return path
+
+
+@pytest.mark.parametrize("crlf", [True, False])
+@pytest.mark.parametrize("hours", [0.5, 1.0, 6.0, 24.0, 1000.0])
+def test_tail_read_matches_a_full_read(crlf, hours) -> None:
+    """Byte-identical results to the read-everything reference, across windows
+    that fall inside, on, and outside the file's span, for both line endings."""
+    with TmpRoot() as root:
+        path = _write_big_od(root, "Big", 0, 20000, crlf=crlf, gaps=(5, 6, 7))
+        eng = _engine(root)
+        for max_points in (None, 500):
+            got = eng.get_data("Big", 0, "od", hours=hours, max_points=max_points)
+            want = _reference_get_data(path, "od", hours=hours,
+                                       max_points=max_points)
+            assert got == want, f"hours={hours} crlf={crlf} mp={max_points}"
+
+
+@pytest.mark.parametrize("last_n", [1, 5, 500, 19999, 20000, 999999])
+def test_tail_read_last_n_matches_a_full_read(last_n) -> None:
+    with TmpRoot() as root:
+        path = _write_big_od(root, "Big", 0, 20000)
+        eng = _engine(root)
+        got = eng.get_data("Big", 0, "od", last_n=last_n)
+        want = _reference_get_data(path, "od", last_n=last_n)
+        assert got == want
+
+
+def test_tail_read_hours_and_last_n_together() -> None:
+    with TmpRoot() as root:
+        path = _write_big_od(root, "Big", 0, 20000)
+        eng = _engine(root)
+        got = eng.get_data("Big", 0, "od", hours=2.0, last_n=100)
+        want = _reference_get_data(path, "od", hours=2.0, last_n=100)
+        assert got == want
+
+
+def test_tail_read_degenerate_files() -> None:
+    """Smaller than one chunk, header-only, and empty."""
+    with TmpRoot() as root:
+        eng = _engine(root)
+        small = _write_big_od(root, "Small", 0, 3)
+        assert eng.get_data("Small", 0, "od", hours=1.0) == \
+            _reference_get_data(small, "od", hours=1.0)
+
+        exp = root / "HeaderOnly"
+        exp.mkdir()
+        (exp / "vial00_OD.csv").write_text(
+            "timestamp,elapsed_hours,raw_adc,calibrated_od\n", encoding="utf-8")
+        assert eng.get_data("HeaderOnly", 0, "od", hours=1.0)["values"] == []
+        assert eng.get_data("HeaderOnly", 0, "od", last_n=5)["values"] == []
+
+        exp2 = root / "Empty"
+        exp2.mkdir()
+        (exp2 / "vial00_OD.csv").write_text("", encoding="utf-8")
+        assert eng.get_data("Empty", 0, "od", hours=1.0)["values"] == []
+
+
+def test_tail_read_is_bounded_in_bytes() -> None:
+    """The point of the exercise, asserted deterministically.
+
+    A byte count, not a wall-clock timing, so it cannot flake: a 1 h window on
+    a 7-day file must not read anything like the whole file.
+    """
+    with TmpRoot() as root:
+        path = _write_big_od(root, "Week", 0, 60480)      # 7 days at 10 s
+        total = path.stat().st_size
+        assert total > 3_000_000, "fixture should be a few MB"
+
+        read_bytes = {"n": 0}
+        real_open = Path.open
+
+        def counting_open(self, *a, **kw):
+            fh = real_open(self, *a, **kw)
+            if self == path:
+                real_read = fh.read
+
+                def read(*ra, **rkw):
+                    data = real_read(*ra, **rkw)
+                    read_bytes["n"] += len(data)
+                    return data
+                fh.read = read
+            return fh
+
+        eng = _engine(root)
+        Path.open = counting_open
+        try:
+            got = eng.get_data("Week", 0, "od", hours=1.0, max_points=500)
+        finally:
+            Path.open = real_open
+
+        want = _reference_get_data(path, "od", hours=1.0, max_points=500)
+        assert got == want
+        assert read_bytes["n"] < total // 4, (
+            f"read {read_bytes['n']} of {total} bytes for a 1 h window"
+        )

@@ -7,6 +7,8 @@ vial, three append-only CSV files::
     vial00_OD.csv          # timestamp,elapsed_hours,raw_adc,calibrated_od,n_valid,flag,dark
     vial00_temp.csv        # timestamp,elapsed_hours,raw_adc,calibrated_temp_c
     vial00_pump_log.csv    # timestamp,elapsed_hours,direction,duration_seconds,od_at_pump
+    vial00_growth.csv      # SPEC §17 growth estimates, written at the engine's
+                           # 60 s recompute cadence (not the 10 s sensor tick)
     ...
 
 State machine::
@@ -52,6 +54,29 @@ PUMP_HEADER = (
     "direction",
     "duration_seconds",
     "od_at_pump",
+)
+# SPEC §17 / GROWTH_RATE_METHOD.md §7.7 — a PARALLEL file, not new columns
+# in vial{NN}_OD.csv. That file's header is load-bearing: data_export.py
+# carries no version or schema marker at all, so any positional parser --
+# including the lab's own analysis scripts -- would break silently on an
+# inserted column.
+#
+# `flags` is PIPE-separated, not comma. events.csv and the export filters are
+# read back with line/comma splitting (data_export.filter_rows_by_hours), so a
+# quoted comma inside a field would corrupt every downstream reader; the same
+# hazard is why `_one_line` exists below.
+GROWTH_HEADER = (
+    "timestamp",
+    "elapsed_hours",
+    "regime",
+    "growth_rate_per_hour",
+    "doubling_time_min",
+    "r_squared",
+    "windows_searched",
+    "fit_span_s",
+    "fit_od_start",
+    "fit_od_end",
+    "flags",
 )
 ESCALATION_HEADER = (
     "timestamp",
@@ -269,6 +294,7 @@ class DataLogger:
             self._init_csv(exp_dir / f"vial{v:02d}_OD.csv", OD_HEADER)
             self._init_csv(exp_dir / f"vial{v:02d}_temp.csv", TEMP_HEADER)
             self._init_csv(exp_dir / f"vial{v:02d}_pump_log.csv", PUMP_HEADER)
+            self._init_csv(exp_dir / f"vial{v:02d}_growth.csv", GROWTH_HEADER)
         # events.csv is machine-wide, not per-vial, so it lives beside them
         # rather than being one file per vial. Pre-created (rather than lazily
         # created on first write) so an export always finds it.
@@ -494,6 +520,54 @@ class DataLogger:
                     direction,
                     _format_number(duration_seconds, 2),
                     _format_number(od_at_pump, 4),
+                ],
+            )
+
+    def log_growth(
+        self,
+        timestamp_iso: str,
+        vial: int,
+        report,
+    ) -> None:
+        """Append one growth estimate for ``vial`` to its growth CSV.
+
+        ``report`` is a ``growth_rate.GrowthReport``. Taken as an opaque
+        object rather than imported, so ``data_logger`` keeps no dependency on
+        the estimator.
+
+        Written at the engine's recompute cadence (60 s), not the 10 s sensor
+        tick: the estimate does not change meaningfully in one cycle, and this
+        keeps the file roughly a sixth the size of the OD file.
+
+        A row is written even when ``mu_per_hour`` is ``None`` -- the flags
+        column is then the record of *why* nothing was estimable, which is the
+        part an operator actually needs when a run reports no growth.
+        """
+        with self._lock:
+            if self._active_name is None:
+                return
+            if vial not in self._active_vials:
+                return
+            exp_dir = self._active_dir
+            elapsed_h = self._elapsed_hours_locked(timestamp_iso)
+            est = report.growth
+            path = exp_dir / f"vial{vial:02d}_growth.csv"
+            self._append_row(
+                path,
+                [
+                    timestamp_iso,
+                    f"{elapsed_h:.4f}",
+                    _one_line(report.regime),
+                    _format_number(est.mu_per_hour, 5),
+                    _format_number(est.doubling_time_min, 2),
+                    _format_number(est.r_squared, 5),
+                    _format_int(est.windows_searched),
+                    _format_number(est.span_seconds, 1),
+                    _format_number(est.window_start_od, 4),
+                    _format_number(est.window_end_od, 4),
+                    # Pipe-separated: a comma here would split one estimate
+                    # across two columns for every line-based reader.
+                    "|".join(est.flags),
                 ],
             )
 

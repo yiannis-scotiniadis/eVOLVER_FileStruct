@@ -351,7 +351,11 @@ processes, owns `/dev/ttyAMA0` directly, and serves the dashboard at
 | Pump gravimetric wizard (32 pumps, resumable session, QC + override) | Built | `/api/calibration/pump/*` |
 | 32 independent flow rates in the engine (influx ≠ efflux) | Built | `experiment_engine._as_flow_rates_32`, `control_modes/*` |
 | Post-run mass reconciliation + staleness surfacing + dashboard banner | Built | `/api/experiments/{name}/reconcile`, `/api/calibration/staleness` |
+| Per-vial growth-rate service (μ, doubling time, R², gated dilution diagnostic) | Built | `server/growth_rate.py`, `/api/growth_rate`, `vialNN_growth.csv` |
 
+**Session N shipped 2026-08-23** — the per-vial growth-rate service: the estimator, the
+engine-owned OD history and dilution boundaries, `status()` / WebSocket / API / CSV
+surfaces, and the validation harness. No control mode was touched.
 **Sessions K, L, M and M2 shipped 2026-08-20** — consumables interlock, volume-based manual
 pumping, structured logging + the unified event log, and the operator-facing alert drawer.
 **Session O shipped 2026-08-20** — calibration provenance, the per-run OD blank, the pump
@@ -360,7 +364,7 @@ bench-ready but **no Tier 1/Tier 2 procedure has yet been run on the bench**, so
 inherited-constant caveats below still stand.
 
 **Not yet built** (in rough priority order — see `ROADMAP.md`):
-a general per-vial growth-rate service, the Tier 3 calibration wizards (thermistor
+the Tier 3 calibration wizards (thermistor
 two-point, OD dilution series, stir RPM — `/api/calibration/temperature/*`, `od/series/*`
 and `stir/*` do not exist; Session AA), hygiene/sterilisation records, experiment
 templates, supervised per-vial override, anomaly detection, notifications, off-box
@@ -374,13 +378,17 @@ backup, vial groups, multi-phase protocols, and authentication.
 - `SPEC.md` — technical specification. §15–§25 cover the subsystems listed as not-yet-built.
 - `SESSION_MASTER_PLAN.md` — the original Session A–J plan. A/B/C/F/G are built; read the
   status header at the top before following any of its prompts.
+- `GROWTH_RATE_METHOD.md` — the growth-rate estimator: what the algorithm is, what was
+  measured about it, and what was deliberately not ported from the Isaacs Lab notebook.
+  Plays the role for Session N that `CALIBRATION_PROTOCOL.md` plays for Session O.
+  `SPEC.md` §17 is the specification of what shipped.
 - `CONTROL_MODE_AUDIT.md` — line-by-line + closed-loop audit of the turbidostat and
   chemostat (Aug 2026). All findings fixed as of 2026-08-21 except the `efflux_extra_seconds`
   bench decision (X-1, warning only) and the washout detector (C-5, deferred); the document
   is kept as the record of what was wrong.
 - `DEPLOY.md` — operator runbook for the RPi.
 
-### Five facts worth carrying into any new work
+### Six facts worth carrying into any new work
 
 1. **`xr` is a closed-loop setpoint, not a PWM, and the slope is negative.** The Arduino
    already closes the temperature loop. `xr=0` requests ~82 °C. See the Testing warning
@@ -429,6 +437,19 @@ backup, vial groups, multi-phase protocols, and authentication.
    the versioned JSON envelopes are the source of truth. (The old fact here — that
    `_as_list_of_16` rejected 32-element `pump_flow_rates` — was fixed by Session O3a;
    32/16/scalar are all accepted now. See `SPEC.md` §16.1.)
+
+6. **There is exactly one reported growth rate, and volume never touches it.** The
+   Isaacs Lab windowed log-linear fit within inter-dilution segments is *the* μ
+   (`server/growth_rate.py`). The dilution-rate calculation is a **gated diagnostic**,
+   off while `calibration/current.json` has `"pump": null` — which it does. Dilution
+   events feed the reported μ as *timestamps only*; `delivered_ml` is read solely by the
+   diagnostic, which is what keeps μ independent of the uncalibrated pump array (a test
+   doubles every volume and requires the reported μ to be bit-identical). Three
+   consequences for new work: **fitting `ln(OD)` across a dilution reads 80–99 % low**, so
+   never do it; **`r_squared` must never be presented without `windows_searched`**, because
+   max-R² selection inflates it; and growth output goes to `vialNN_growth.csv`, never a new
+   column in `vialNN_OD.csv` — `data_export.py` has no schema marker, so a positional
+   parser (the lab's own scripts included) breaks silently on an inserted column.
 
 ## Technical constraints
 
@@ -507,6 +528,11 @@ eVOLVER_FileStruct/
     serial_manager.py        # RS485 (real hardware); owns /dev/ttyAMA0
     mock_serial_manager.py   # Simulated hardware — run app.py --mock
     experiment_engine.py     # Lifecycle, run_cycle, media tracking, maintenance, resume
+    growth_rate.py           # SPEC §17 growth estimation — pure, I/O-free, no engine imports
+    replay_growth.py         #   replay a logged run through the estimator (read-only)
+    verify_growth_rate.py    #   accuracy report + `--generate` for the 1x-time fixtures
+    bench_growth_rate.py     #   RUN ON THE PI: growth-service cost vs the 10 s tick budget
+    bench_read_paths.py      #   RUN ON THE PI: get_data / export / staleness read costs
     data_logger.py           # Per-vial CSV writers
     data_export.py           # ZIP bundles, filtering
     event_log.py             # rotating logs, event ring, error classification (SPEC §20)
@@ -526,6 +552,8 @@ eVOLVER_FileStruct/
   experiments/{name}/        # Runtime output
     config.json  state.json
     vial00_OD.csv  vial00_temp.csv  vial00_pump_log.csv  ...
+    vial00_growth.csv        # SPEC §17 growth estimates, 60 s cadence — a PARALLEL file;
+                             #   vialNN_OD.csv's header is never extended (see fact 6)
     events.csv               # unified event log (SPEC §20.2)
     od_blank.json            # per-run OD blank envelope (SPEC §19.2) — run-scoped
     reconciliation.json      # post-run mass reconciliation record (SPEC §19.4)

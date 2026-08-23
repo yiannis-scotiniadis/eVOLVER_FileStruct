@@ -3,8 +3,10 @@
 **Scope:** the estimator behind `ROADMAP.md` Session N and `SPEC.md` §17.
 **Source algorithm:** `Growth analysis New HTX 2025_03_05.ipynb`, SECTION 4
 (`Doubling_time`), by YC/MN/KKG, after Lajoie *et al.* 2013 and Kuznetsov *et al.* 2017.
-**Status:** design brief, not yet implemented. Written to be executed by Claude Code.
-**Revised 2026-08-22** after the scope decisions in §0.
+**Status:** IMPLEMENTED 2026-08-23 as `server/growth_rate.py`. This document remains the
+reasoning and the evidence behind it; `SPEC.md` §17 is the specification of what shipped.
+**Revised 2026-08-22** after the scope decisions in §0; §10 and §10.1 updated 2026-08-23
+with what the verification actually found.
 
 **Relationship to the other docs.** `SPEC.md` §17 says *what the service must expose*;
 `ROADMAP.md` Session N says *when it gets built and what blocks on it*; this document says
@@ -503,57 +505,117 @@ and the refactor blast radius (§7 — no control mode is touched).
 
 ## 10. Verification
 
-Extends Session N's checklist rather than replacing it.
+Extends Session N's checklist rather than replacing it. **Results below are from
+`server/test_growth_rate.py` (44 tests) and `server/verify_growth_rate.py`** as of
+2026-08-23.
 
-- [ ] Synthetic pure exponential at known μ recovered within 5 % *(Session N; measured at
-      ±0.4 % bias, sd 2.2–3.7 % — expected to pass comfortably)*
-- [ ] Dilution events do not depress the estimate *(Session N)* — assert the naive
-      cross-dilution fit reproduces the −80 %/−94 %/−99 % errors of §3.3, so the test
-      documents what the segmenting is protecting against
-- [ ] Low OD and short history return `None`, not a number *(Session N)*
-- [ ] R² reported; a deliberately non-exponential series produces a low R² *(Session N)*
-- [ ] μ appears in `status()`, the WebSocket payload, and the per-vial CSV *(Session N —
-      note the CSV column must be **added**, §7.7)*
-- [ ] A segment with a 120 s injected mixing transient is estimated within 5 % (the
-      window search doing its job; whole-segment OLS gives +7.1 % here)
-- [ ] A flat OD series at 0.30 returns a valid estimate, not `TypeError` (measurement #7)
-- [ ] A culture stalling at OD 0.26 is flagged `band_not_spanned` rather than returning
-      DT = 131 min at R² = 0.99 (measurement #8)
-- [ ] `windows_searched` present in every returned estimate
-- [ ] Slope ≤ 0 returns `doubling_time_min = None`, never a negative or infinite number
-- [ ] With `current.json` `"pump": null`, `dilution_check.enabled` is `False`, no
-      divergence warning is raised, and `reason_unavailable` is populated
-- [ ] With pump rates present, the diagnostic agrees with the reported μ within 10 % on a
-      simulated steady-state turbidostat **using `v/V`** — and demonstrably fails to when
-      `ln(1+v/V)` is substituted (the regression test for §4.4)
-- [ ] A run with no `od_blank.json` produces estimates flagged `uncalibrated_floor`
-- [ ] A dilution spanning three sensor cycles produces exactly one boundary, and no
+- [x] Synthetic pure exponential at known μ recovered within 5 % — **measured +0.1 % to
+      +1.7 % on a segmented turbidostat, −0.0 % to −0.4 % on a batch curve**
+- [x] Dilution events do not depress the estimate — the naive cross-dilution fit is pinned
+      in a test, and **reproduces the failure at −89 % / −110 % / −242 %** on a narrow band
+      with frequent dilutions. (On the *default* band with a 15 min refractory gate,
+      dilutions are ~1 h apart and a 30 min naive window usually sits inside one segment,
+      so it happens to read correctly — which is exactly why the test uses the narrow-band
+      configuration. The failure is a property of the configuration, not a constant.)
+- [x] Low OD and short history return `None`, not a number
+- [x] R² reported; a deliberately non-exponential series produces a low R²
+- [x] μ appears in `status()`, the WebSocket payload, and the per-vial CSV — **a new
+      parallel `vialNN_growth.csv`, §7.7**
+- [x] A segment with a 120 s injected mixing transient is estimated within 5 % —
+      **measured +2.08 % against whole-segment OLS's +7.06 %, reproducing §4.1's +7.1 %**
+- [x] A flat OD series at 0.30 returns a valid estimate, not `TypeError`
+- [x] A culture stalling at OD 0.26 is flagged `band_not_spanned`
+- [x] `windows_searched` present in every returned estimate
+- [x] Slope ≤ 0 returns `doubling_time_min = None`, never a negative or infinite number
+- [x] With `current.json` `"pump": null`, `dilution_check.enabled` is `False`, no divergence
+      warning is raised, and `reason_unavailable` is populated
+- [x] With pump rates present, the diagnostic agrees with the reported μ within 10 % on a
+      simulated steady-state turbidostat using `v/V` — **measured −0.4 %** — and reads
+      **−24.0 %** when `ln(1+v/V)` is substituted
+- [x] A run with no `od_blank.json` produces estimates flagged `uncalibrated_floor`
+- [x] A dilution spanning three sensor cycles produces exactly one boundary, and no
       mid-dilution sample lands inside either adjoining segment
-- [ ] A pump suppressed by the §15 consumables gate creates **no** segment boundary
-- [ ] A manual efflux-only sampling event creates a boundary and contributes 0 mL to
-      the diagnostic
-- [ ] Simulated chemostat at known D: §4.6 mass balance recovers μ within 10 % and is
+- [x] A pump suppressed by the §15 consumables gate creates **no** segment boundary
+- [x] A manual efflux-only sampling event creates a boundary and contributes 0 mL
+- [x] Simulated chemostat at known D: the §4.6 mass balance recovers μ within 10 %
+      (**measured −0.1 % to −0.3 % synthetic, −1.8 % on the generated fixture**) and is
       flagged `assumes_commanded_D`; regime B is not attempted
-- [ ] Reported μ is bit-identical when `delivered_ml` on every event is scaled by 2×
-      (proves volume never reaches the reported path — §4.5)
-- [ ] Round-trip against the notebook: run `estimate_batch` on one plate-reader well's
-      data, **using the notebook's own constants (band 0.1–0.5, 8-sample window)**, and
-      reproduce its doubling time to within 1 %. **This is the acceptance test that matters
-      to the lab** — it is what makes eVOLVER numbers and plate-reader numbers the same
-      quantity.
+- [x] Reported μ is bit-identical when `delivered_ml` on every event is scaled by 2×
+- [ ] **Round-trip against the notebook** — the test is written and `skipif`-guarded on the
+      companion files, which are not in the repository. **Still the acceptance test that
+      matters to the lab.**
 
-### 10.1 Validation data
+### 10.0 One measurement that changed a constant
 
-There is **no real multi-hour eVOLVER run in `experiments/`** — the longest
-`vial00_OD.csv` is 15 rows. Verification rests on synthetic series, `MockSerialManager`,
-and the plate-reader round-trip. The round-trip needs the notebook's companion files
-(`2026_08_16 DEO.074-4.xlsx`, `strain_layout.csv`, `strain_info.csv`, `growth_media.csv`),
-none of which are in the repository. Add the first real turbidostat run to the regression
-corpus when one exists; that is also the corpus §22.2 needs.
+`lag_time_hours` originally measured from the first sample it was handed. The engine hands
+over a rolling 3 h window, so on a batch phase longer than that the lag was a number about
+the window rather than about the culture: **measured −16.7 h against a true −8.6 h** at
+μ = 0.35 h⁻¹. It now takes an explicit `origin_s` (the run start on the engine's clock) and
+reproduces the analytic value to two decimals at μ = 0.35 / 0.70 / 1.20.
+
+### 10.1 Validation data — corrected
+
+The earlier claim here, that no multi-hour run exists in `experiments/` and the longest
+`vial00_OD.csv` is 15 rows, was **wrong**: `experiments/` is gitignored, so it reflected the
+committed stubs rather than the working tree. `TestForLabMeeting2` has **852 rows over
+2.37 h** at 10 s cadence with 29 dilutions per vial; `TestForLabMeeting3` has 528 rows
+spanning 1019 h with three large gaps; `TestShort` and `hey1` are comparable.
+
+**They still cannot validate accuracy, for a different reason.** Every one is a
+`MockSerialManager` run at its default `time_multiplier = 100`. The culture crosses the
+whole OD band in two or three samples (apparent μ 22–36 h⁻¹), and `pump_wait_minutes = 5`
+puts every inter-dilution segment at 300 s — below `MIN_FIT_SPAN_SECONDS`. Replayed through
+`server/replay_growth.py` they are a genuine **guard-rail** test, and they pass it: no
+exception across `TestForLabMeeting3`'s 1019 h and three multi-hundred-hour gaps, no NaN
+reaching the payload, and **every estimate correctly `None` and flagged**
+`insufficient_segments` / `short_span` / `uncalibrated_floor` rather than a plausible wrong
+number. Returning nothing, for a stated reason, is the right answer to a run configured
+that way — and `validate_control_parameters` now warns about that configuration at
+experiment creation.
+
+### 10.2 The fixture that does validate accuracy
+
+`python server/verify_growth_rate.py --generate` writes
+`experiments/GrowthRateValidation1/` (turbidostat, band 0.2–0.6, `pump_wait_minutes = 15`,
+10 h) and `experiments/GrowthRateValidationChemo1/` (chemostat, D = 0.5 /h, 12 h) through
+the **real** `ExperimentEngine`, the real controllers and the real `DataLogger`, at a real
+10 s cadence with a seeded clock. Measured against ground truth
+`μ = mu_max · f(T) · (1 − OD/K)`: **median error −3.4 % to −4.4 % (turbidostat, R² ≈ 0.99)
+and −1.8 % (chemostat)**. The residual negative bias is expected and explainable —
+μ_true is highest immediately after a dilution, when OD is lowest, and those are exactly the
+samples the 60 s post-dilution skip excises.
+
+**One finding worth carrying forward: `MockSerialManager`'s OD noise is process noise, not
+measurement noise.** It adds into its own state once per `_advance`, unscaled by how much
+sim time that advance covered:
+
+```python
+self.od_abs = self.od_abs + self._rng.normal(0.0, OD_NOISE_SIGMA, N_VIALS)
+```
+
+At `time_multiplier = 100` that is a plausible wobble, because one advance covers 100 s of
+growth. At 1× it is a random walk with sd 0.005 per 5 s tick — sd 0.16 over a 1.5 h batch
+phase on a culture inoculated at OD 0.05, enough to drive OD into the 1e-4 clip floor. A
+first attempt at this fixture measured a realized `d(ln OD)/dt` of **0.64 /h against a
+modelled 1.08 /h** because of it, and the estimator was blamed before the mock was.
+
+It is **not patched** — changing it would alter behaviour for every other mock-backed test,
+and that is the user's call — so the generator owns its own culture model (the mock's own
+logistic, deterministic) and adds measurement noise on read, using the mock as the actuator
+sink and thermal model only. If the mock is ever wanted as a quantitative fixture, the fix
+is to apply OD noise at read time, or to scale it by `sqrt(sim_dt)` the way the temperature
+model two lines above already does.
+
+Add the first real turbidostat run to the regression corpus when one exists; that is also
+the corpus §22.2 needs.
 
 ---
 
 ## 11. Corrections required to `SPEC.md` §17 and `ROADMAP.md` Session N
+
+> **APPLIED 2026-08-23.** All five sub-items below have been made in both documents. The
+> section is kept as the record of what was wrong and why, since the superseded design is
+> the one a reader may remember.
 
 ### 11.1 "Two estimators, both reported" no longer holds
 

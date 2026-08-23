@@ -35,6 +35,7 @@ import re
 import shutil
 import threading
 import time
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -47,8 +48,14 @@ from control_modes.chemostat import (
 )
 from control_modes.morbidostat import EscalationEvent, MorbidostatController
 from control_modes.turbidostat import PumpAction, TurbidostatController
-from data_export import filter_rows_by_hours
+from data_export import (
+    filter_rows_by_hours,
+    read_header,
+    read_tail_rows,
+)
 from data_logger import _VALID_NAME
+
+import growth_rate as growth
 from serial_manager import (
     HEATER_OFF_SETPOINT,
     MAX_SAFE_TEMP_C,
@@ -289,6 +296,25 @@ def validate_control_parameters(
                     f"{100.0 * (min_bolus_s - int(min_bolus_s)) / min_bolus_s:.0f}% "
                     "of each dilution. Widen the band for finer control."
                 )
+
+        # GROWTH_RATE_METHOD.md §4.5: the refractory gate is what makes
+        # segmentation viable at all -- turbidostat segments can never be
+        # shorter than pump_wait however fast the culture grows. Below the
+        # estimator's minimum fit span, every segment is too short to fit and
+        # the growth-rate service reports nothing for the whole run. That is a
+        # degraded analysis, not an unsafe run, so it warns and proceeds.
+        pump_wait_min = float(
+            parameters.get("pump_wait_minutes", DEFAULT_PUMP_WAIT_MINUTES)
+        )
+        min_span_min = growth.MIN_FIT_SPAN_SECONDS / 60.0
+        if pump_wait_min < min_span_min:
+            warnings.append(
+                f"pump_wait_minutes={pump_wait_min:g} is below the growth-rate "
+                f"service's minimum fit span ({min_span_min:g} min), so every "
+                "inter-dilution segment will be too short to fit and no growth "
+                "rate will be reported for this run. Dilution itself is "
+                "unaffected."
+            )
 
     elif mode == "chemostat":
         dilution_rate = float(parameters.get("dilution_rate_per_hour", 0.5))
@@ -546,6 +572,30 @@ class ExperimentEngine:
         self._nan_streak: dict[int, int] = {}
         self._od_range_streak: dict[int, int] = {}
         self._vial_faults: dict[int, Optional[str]] = {}
+
+        # Growth-rate service (SPEC §17 / GROWTH_RATE_METHOD.md §7). All of
+        # it lives here rather than in a control mode: `TurbidostatController.
+        # od_history` is a `deque[float]` with maxlen 5 and no timestamps, so
+        # it cannot feed the estimator, and Session N deliberately does not
+        # touch the control modes.
+        self._od_history: dict[int, deque] = {}
+        self._dilution_events: dict[int, deque] = {}
+        self._growth_reports: dict[int, growth.GrowthReport] = {}
+        # Serialised form, built once per recompute rather than once per tick.
+        # `growth_snapshot()` is called from the sensor loop for every
+        # `sensor_update`, and `GrowthReport.to_dict()` costs ~45 us -- 0.7 ms
+        # per tick for 16 vials here, ~30 ms on the deployment Pi, for a value
+        # that only changes once a minute. GrowthReport is frozen, so caching
+        # it is safe.
+        self._growth_payload: dict[str, dict] = {}
+        # Per-vial next-due time, staggered so the 16 recomputes are spread
+        # across the interval instead of landing on one tick (see
+        # _maybe_update_growth_locked).
+        self._growth_due: dict[int, float] = {}
+        self._growth_run_start: float = 0.0
+        # Pushed in by app.py from CalibrationService.growth_context(); the
+        # engine deliberately does no calibration parsing of its own.
+        self._growth_context: dict = {}
         self._created_at: Optional[datetime] = None
         self._started_at: Optional[datetime] = None
         self._stopped_at: Optional[datetime] = None
@@ -721,6 +771,7 @@ class ExperimentEngine:
             self._nan_streak = {v: 0 for v in self._vials}
             self._od_range_streak = {v: 0 for v in self._vials}
             self._vial_faults = {v: None for v in self._vials}
+            self._reset_growth_state_locked()
             self._created_at = _now_utc()
             self._started_at = None
             self._stopped_at = None
@@ -770,6 +821,10 @@ class ExperimentEngine:
             self._load_media_locked(self._config.get("media"))
 
             self._started_at = _now_utc()
+            # Growth state is rebuilt HERE, not at create time: the wizard can
+            # sit on CREATED for minutes, and the lag extrapolation's origin
+            # must be inoculation.
+            self._reset_growth_state_locked()
             self._data_logger.activate_experiment(self._name, start=self._started_at)
 
             try:
@@ -1404,6 +1459,11 @@ class ExperimentEngine:
                     if getattr(controller, "requires_od", True):
                         continue
                 else:
+                    # Engine-owned timestamped history for the growth-rate
+                    # service (§7.2). Appended for EVERY valid OD regardless
+                    # of controller type; the controller's own history is a
+                    # separate, deliberately untouched concern.
+                    self._push_od_history_locked(vial, now, float(od))
                     # MorbidostatController needs the timestamp for its
                     # growth-rate fit; others take only the OD.
                     if isinstance(controller, MorbidostatController):
@@ -1464,12 +1524,28 @@ class ExperimentEngine:
                 ):
                     self._enter_maintenance_locked(reason="consumables")
 
+            # (4a3) Record dilution boundaries for the growth-rate service
+            # (§7.3). Runs AFTER the §15 consumables gate, so a suppressed
+            # pump correctly creates no boundary -- and, unlike the media
+            # debit below, is NOT conditional on `self._media_bottles`: a run
+            # configured without media still needs its segment boundaries.
+            self._record_dilution_events_locked(pump_actions, now)
+
             # (4b) debit media consumption + waste accumulation and
             # edge-trigger threshold alerts. Bookkeeping is optimistic
             # (assumes the caller's pump_command will succeed); for Phase 1
             # the sub-percent error is acceptable.
             if self._media_bottles:
                 self._debit_media_locked(pump_actions)
+
+            # (4d) Growth-rate estimates, throttled well below the sensor
+            # cadence -- the estimate does not change meaningfully in 10 s
+            # (§7.4), and this keeps vialNN_growth.csv ~1/6 the size of the
+            # OD file.
+            try:
+                self._maybe_update_growth_locked(now, timestamp_iso)
+            except Exception:
+                log.exception("growth-rate update failed")
 
             # (5) re-send stir setpoints (drift protection)
             try:
@@ -1547,6 +1623,11 @@ class ExperimentEngine:
                     sensor_health = "lossy"
                 else:
                     sensor_health = "ok"
+                # SPEC §17 / Session N. `growth_flags` and `r_squared` travel
+                # WITH the number by design: a slope fitted through
+                # non-exponential data is meaningless, and presenting it
+                # unqualified is worse than presenting nothing.
+                report = self._growth_reports.get(vial)
                 per_vial[str(vial)] = {
                     "target": target,
                     "avg_od": avg,
@@ -1557,6 +1638,20 @@ class ExperimentEngine:
                     "nan_streak": nan_streak,
                     "od_range_streak": od_range_streak,
                     "sensor_health": sensor_health,
+                    "mu_per_hour": (
+                        report.growth.mu_per_hour if report else None
+                    ),
+                    "doubling_time_min": (
+                        report.growth.doubling_time_min if report else None
+                    ),
+                    "r_squared": report.growth.r_squared if report else None,
+                    "regime": report.regime if report else None,
+                    "growth_flags": (
+                        list(report.growth.flags) if report else []
+                    ),
+                    "dilution_check": (
+                        report.dilution_check.to_dict() if report else None
+                    ),
                 }
             return {
                 "name": self._name,
@@ -1737,22 +1832,52 @@ class ExperimentEngine:
         if not path.is_file():
             raise FileNotFoundError(f"data file not found: {path}")
 
-        # Read whole file (CSVs are append-only and small-ish for Phase 1).
-        with path.open("r", encoding="utf-8", newline="") as f:
-            lines = f.read().splitlines()
-        if not lines:
+        # A 7-day run is ~60 000 rows and 3.2 MB PER VIAL, and the Plots tab
+        # asks every active vial at once, so reading the whole file to answer
+        # "the last hour, downsampled to 500 points" cost 1.23 s per vial and
+        # grew without bound. `read_tail_rows` reads only the tail the request
+        # can need; it is a PREFILTER returning a superset, and
+        # `filter_rows_by_hours` below still does the exact trim, so the window
+        # semantics are unchanged and still defined in one place.
+        header = read_header(path)
+        try:
+            elapsed_col = header.index("elapsed_hours")
+        except ValueError:
+            elapsed_col = 1
+
+        if hours is None and last_n is None:
+            # The Plots tab's "All" range genuinely wants every row, so there is
+            # no bound to exploit and O(n) is the honest cost of the request.
+            #
+            # This deliberately stays a bulk read. Streaming it through
+            # `data_export.iter_csv_rows` was tried and measured WORSE on both
+            # axes -- 4.0 s / 13.6 MB against 1.2 s / 9.9 MB on a 7-day file --
+            # because the consumer materialises the list anyway, so all the
+            # generator adds is 60 000 Python-level resumptions and incremental
+            # list growth. `splitlines()` builds the same list in one C call.
+            # (The streaming primitive still earns its place in `wide_csv_iter`,
+            # where rows are consumed one at a time and never all held.)
+            with path.open("r", encoding="utf-8", newline="") as f:
+                lines = f.read().splitlines()
+            data_rows = lines[1:] if lines else []
+        else:
+            header2, data_rows = read_tail_rows(
+                path, hours=hours, last_n=last_n, elapsed_col=elapsed_col,
+            )
+            if header2:
+                header = header2
+                try:
+                    elapsed_col = header.index("elapsed_hours")
+                except ValueError:
+                    elapsed_col = 1
+
+        if not header:
             return {"timestamps": [], "values": []}
-        header = lines[0].split(",")
-        data_rows = lines[1:]
 
         # Time-window filter on the elapsed_hours column, relative to the
         # last available row (not wall-clock, so stopped runs still work).
         # Shared with data_export.build_bundle so the window semantics match.
         if hours is not None and data_rows:
-            try:
-                elapsed_col = header.index("elapsed_hours")
-            except ValueError:
-                elapsed_col = 1
             data_rows = filter_rows_by_hours(data_rows, elapsed_col, hours)
 
         if last_n is not None:
@@ -1834,6 +1959,270 @@ class ExperimentEngine:
         return out_ts, out_v
 
     # ------------------------------------------------------------------
+    # Growth-rate service (SPEC §17 / GROWTH_RATE_METHOD.md §7)
+    # ------------------------------------------------------------------
+    #
+    # Everything here is engine-owned on purpose. Session N touches no
+    # control mode: `TurbidostatController.od_history` is a `deque[float]`
+    # with maxlen 5 and no timestamps, so it cannot feed the estimator, and
+    # widening it would push analysis state into a controller whose only job
+    # is the dilution decision.
+
+    def _reset_growth_state_locked(self) -> None:
+        self._od_history = {v: deque() for v in self._vials}
+        self._dilution_events = {v: deque() for v in self._vials}
+        self._growth_reports = {}
+        self._growth_payload = {}
+        now = self._clock()
+        group_period = (
+            growth.RECOMPUTE_INTERVAL_SECONDS
+            / max(growth.VIALS_PER_RECOMPUTE_GROUP_DIVISOR, 1)
+        )
+        self._growth_due = {
+            v: now + (i % growth.VIALS_PER_RECOMPUTE_GROUP_DIVISOR) * group_period
+            for i, v in enumerate(self._vials)
+        }
+        # Run start on the SAME clock the OD history uses. `_started_at` is a
+        # wall-clock datetime and `self._clock()` need not be wall time, so the
+        # two are not interchangeable. Only the lag extrapolation reads this,
+        # and it needs an origin at inoculation rather than at the start of
+        # the rolling 3 h window.
+        self._growth_run_start = self._clock()
+
+    def _push_od_history_locked(self, vial: int, now: float, od: float) -> None:
+        """Append one timestamped OD sample and trim the window by TIME.
+
+        Bounded by duration rather than sample count because the sensor
+        loop's real period is ``max(10 s, work)`` and can only run slow -- a
+        maxlen deque would silently shorten the analysis window on a loaded
+        box, which is exactly when estimates matter most.
+        """
+        hist = self._od_history.setdefault(vial, deque())
+        hist.append((float(now), float(od)))
+        cutoff = float(now) - growth.HISTORY_WINDOW_SECONDS
+        while hist and hist[0][0] < cutoff:
+            hist.popleft()
+
+    def _influx_ml_locked(self, vial: int, action: PumpAction) -> float:
+        """Influx volume for one pump action, in mL.
+
+        The single home of this formula. Media debiting and the growth
+        service's dilution diagnostic both consume it; computing it twice is
+        how the two drift apart.
+        """
+        controller = self._controllers.get(vial)
+        if controller is None:
+            return 0.0
+        return action.pump_time * controller.flow_rate_influx_ml_s
+
+    def _record_dilution_events_locked(
+        self, pump_actions: list[tuple[int, PumpAction]], now: float
+    ) -> None:
+        """Record one segment boundary per pump action (§4.5).
+
+        A boundary is an interval, not an instant: influx runs for
+        ``pump_time``, efflux for ``pump_time + efflux_extra_seconds``, and
+        mixing continues after that. With ``pump_time`` capped at 20 s against
+        a 10 s loop, one dilution can span two or three sensor cycles, so the
+        estimator excises the whole interval rather than assuming one OD
+        sample per event.
+
+        ``delivered_ml`` is recorded but never reaches the reported growth
+        rate -- only the gated diagnostic reads it (§4.5). That is what keeps
+        the reported growth rate independent of the uncalibrated pump array.
+        """
+        for vial, action in pump_actions:
+            events = self._dilution_events.setdefault(vial, deque())
+            events.append(
+                growth.DilutionEvent(
+                    t_start=float(now),
+                    t_efflux_end=float(now) + action.pump_time
+                    + action.efflux_extra_seconds,
+                    delivered_ml=self._influx_ml_locked(vial, action),
+                )
+            )
+            self._trim_dilution_events_locked(vial, now)
+
+    def _record_manual_boundary_locked(
+        self, vial: int, direction: str, delivered_ml: float
+    ) -> None:
+        """Boundary for a manual / override pump (§4.5).
+
+        Efflux-only operations -- the common "take 3 mL for a sample" -- are
+        boundaries that contribute **zero** to the dilution diagnostic:
+        removing culture does not change its concentration, but it does change
+        working volume and can perturb the optical path.
+        """
+        if vial not in self._vials:
+            return
+        now = self._clock()
+        events = self._dilution_events.setdefault(vial, deque())
+        events.append(
+            growth.DilutionEvent(
+                t_start=now,
+                t_efflux_end=now,
+                delivered_ml=(
+                    float(delivered_ml) if direction == "influx" else 0.0
+                ),
+            )
+        )
+        self._trim_dilution_events_locked(vial, now)
+
+    def _trim_dilution_events_locked(self, vial: int, now: float) -> None:
+        events = self._dilution_events.get(vial)
+        if not events:
+            return
+        cutoff = float(now) - growth.HISTORY_WINDOW_SECONDS
+        while events and events[0].t_efflux_end < cutoff:
+            events.popleft()
+
+    def set_growth_context(self, context: Optional[dict]) -> None:
+        """Install the calibration-derived context the estimator needs:
+        per-vial OD floors, suspect vials, and whether pump flow rates have
+        been calibrated.
+
+        Supplied by ``CalibrationService.growth_context()`` and pushed in by
+        ``app.py``. The engine deliberately does no calibration parsing of its
+        own -- the floor is ``max(0.05, 10 x blank_sd_od[vial])`` and
+        ``blank_sd`` is recorded in ADC counts, which only the calibration
+        layer knows how to convert to OD.
+        """
+        with self._lock:
+            self._growth_context = dict(context or {})
+
+    def _growth_gate_locked(self, vial: int, floor: float):
+        """Regime-A range gate, derived per run rather than ported (§4.2).
+
+        ``od_lower_thresh`` / ``od_upper_thresh`` are literally the density
+        range the operator chose to run at, which is exactly what the
+        notebook's 0.1-0.5 band was approximating for a different instrument,
+        different strains and different media.
+
+        The ceiling needs no explicit calibration-domain clamp: the enhanced
+        OD reader already rejects out-of-domain signals before they reach the
+        engine (they arrive as NaN carrying an ``out_of_range`` flag).
+        """
+        c = self._controllers.get(vial)
+        inner = getattr(c, "_inner", c)
+        lo_thresh = getattr(inner, "od_lower", None)
+        hi_thresh = getattr(inner, "od_upper", None)
+        if lo_thresh is None or hi_thresh is None:
+            return None
+        return (max(lo_thresh * 0.5, floor), hi_thresh * 1.5)
+
+    def _growth_due_vials_locked(self, now: float) -> list[int]:
+        """Which vials to recompute on this tick.
+
+        Each vial is due once per ``RECOMPUTE_INTERVAL_SECONDS``, but the due
+        times are staggered across the interval and the per-tick count is
+        capped, so the work is spread over ticks rather than landing on one.
+
+        This is for the deployment target. The recompute runs on the
+        sensor-loop thread inside this lock, and the pre-2016 Pi this ships to
+        has a single core (Pi 1 Model B) or four slow ones (Pi 2 Model B) to
+        share between the control loop, Flask and socketio. Sixteen vials in
+        one burst is the shape that stalls a tick there;
+        ``ceil(16/6) = 3`` per tick is not. Measure with
+        ``server/bench_growth_rate.py`` on the actual Pi.
+
+        Due times, not a group counter, because the sensor loop's period is
+        ``max(10 s, work)`` and genuinely varies — a counter would silently
+        stretch the refresh interval on a loaded box.
+        """
+        cap = max(
+            1,
+            math.ceil(
+                len(self._vials) / max(growth.VIALS_PER_RECOMPUTE_GROUP_DIVISOR, 1)
+            ),
+        )
+        due = [v for v in self._vials if now >= self._growth_due.get(v, 0.0)]
+        # Oldest-due first, so a vial can never be starved by ordering.
+        due.sort(key=lambda v: self._growth_due.get(v, 0.0))
+        return due[:cap]
+
+    def _maybe_update_growth_locked(self, now: float, timestamp_iso: str) -> None:
+        """Recompute the growth estimates that are due on this tick (§7.4)."""
+        vials = self._growth_due_vials_locked(now)
+        if not vials:
+            return
+
+        ctx = self._growth_context
+        floors = ctx.get("od_floor") or {}
+        suspect = set(int(v) for v in (ctx.get("suspect_vials") or []))
+        blank_present = bool(ctx.get("blank_present"))
+        pump_calibrated = bool(ctx.get("pump_calibrated"))
+        pump_reason = ctx.get("pump_reason_unavailable")
+        mode = (self._config or {}).get("mode", "turbidostat")
+
+        for vial in vials:
+            self._growth_due[vial] = now + growth.RECOMPUTE_INTERVAL_SECONDS
+            c = self._controllers.get(vial)
+            if c is None:
+                continue
+            floor = float(
+                floors.get(vial, floors.get(str(vial), growth.DEFAULT_OD_FLOOR))
+            )
+            extra: list[str] = []
+            if not blank_present:
+                # §8: with no committed blank the floor has no measured basis.
+                # This is the live case today -- no blank has ever been taken.
+                extra.append(growth.FLAG_UNCALIBRATED_FLOOR)
+            if vial in suspect:
+                extra.append(growth.FLAG_CALIBRATION_SUSPECT)
+
+            inner = getattr(c, "_inner", c)
+            samples_seen = getattr(inner, "total_samples_seen", None)
+            warmup = getattr(
+                inner, "min_samples_before_action", growth.DEFAULT_WARMUP_SAMPLES,
+            )
+
+            try:
+                report = growth.estimate(
+                    samples=list(self._od_history.get(vial, ())),
+                    now=now,
+                    dilution_events=list(self._dilution_events.get(vial, ())),
+                    mode=mode,
+                    od_floor=floor,
+                    od_range=self._growth_gate_locked(vial, floor),
+                    volume_ml=float(getattr(c, "volume_ml", DEFAULT_VOLUME_ML)),
+                    dilution_rate_per_hour=getattr(
+                        c, "dilution_rate_per_hour", None,
+                    ),
+                    pump_calibrated=pump_calibrated,
+                    pump_reason_unavailable=pump_reason,
+                    samples_seen=samples_seen,
+                    warmup_samples=int(warmup),
+                    extra_flags=tuple(extra),
+                    origin_s=self._growth_run_start,
+                )
+            except Exception:
+                log.exception("growth estimate failed for vial %d", vial)
+                continue
+
+            self._growth_reports[vial] = report
+            self._growth_payload[str(vial)] = report.to_dict()
+            try:
+                self._data_logger.log_growth(
+                    timestamp_iso=timestamp_iso, vial=vial, report=report,
+                )
+            except Exception:
+                log.exception("log_growth failed for vial %d", vial)
+
+    def growth_snapshot(self) -> dict:
+        """Per-vial growth reports for the API and the ``sensor_update``
+        payload. ``{}`` when nothing is running.
+
+        Returns the cached serialised form; the per-vial dicts are rebuilt
+        only when an estimate is, so this is a dict copy rather than 16
+        recursive `asdict` walks on every 10 s tick. Treat the inner dicts as
+        read-only snapshots.
+        """
+        with self._lock:
+            if self._status != ExperimentStatus.RUNNING:
+                return {}
+            return dict(self._growth_payload)
+
+    # ------------------------------------------------------------------
     # Media tracking (must hold self._lock)
     # ------------------------------------------------------------------
 
@@ -1850,7 +2239,7 @@ class ExperimentEngine:
             controller = self._controllers.get(vial)
             if controller is None:
                 continue
-            influx_ml = action.pump_time * controller.flow_rate_influx_ml_s
+            influx_ml = self._influx_ml_locked(vial, action)
             # TODO(SPEC §16.2): waste accumulation still uses the influx rate.
             # Deliberate: with efflux overrun engaged the physically correct
             # model is `waste += influx_ml` (volume pinned by the straw), and
@@ -1885,6 +2274,16 @@ class ExperimentEngine:
         manual pump on an empty bottle still fires; only the accounting is
         handled here."""
         with self._lock:
+            # A manual pump perturbs the culture exactly as an automatic one
+            # does, so it cuts the OD series whether or not media accounting
+            # applies to this vial (§4.5). Recorded BEFORE the bottle_id
+            # early return for that reason. An efflux-only operation -- the
+            # common "take 3 mL for a sample" -- is a boundary that
+            # contributes ZERO to the dilution diagnostic: removing culture
+            # does not change its concentration.
+            self._record_manual_boundary_locked(
+                vial, direction, delivered_ml,
+            )
             bottle_id = self._vial_to_bottle.get(vial)
             if bottle_id is None:
                 return
@@ -2803,8 +3202,20 @@ class ExperimentEngine:
             }
             for vial in self._vials:
                 self._od_range_streak.setdefault(vial, 0)
+            # Growth history is NOT persisted: it is a rolling 3 h window of
+            # raw OD, cheap to refill from the live sensor loop and
+            # meaningless across a restart gap of unknown length. The service
+            # simply reports `short_span` until the window refills.
+            self._reset_growth_state_locked()
             self._created_at = _parse_iso(state.get("created"))
             self._started_at = _parse_iso(state.get("started"))
+            if self._started_at is not None:
+                # `_started_at` is wall clock; `_clock()` need not be. Translate
+                # rather than assuming they share an origin, so a resumed run's
+                # lag extrapolation still counts from inoculation.
+                self._growth_run_start = self._clock() - (
+                    _now_utc() - self._started_at
+                ).total_seconds()
 
             # Rebuild controllers and restore their state
             self._controllers = self._build_controllers(
@@ -2884,6 +3295,13 @@ class ExperimentEngine:
         self._nan_streak = {}
         self._od_range_streak = {}
         self._vial_faults = {}
+        self._od_history = {}
+        self._dilution_events = {}
+        self._growth_reports = {}
+        self._growth_payload = {}
+        self._growth_due = {}
+        self._growth_run_start = 0.0
+        self._growth_context = {}
         self._created_at = None
         self._started_at = None
         self._stopped_at = None

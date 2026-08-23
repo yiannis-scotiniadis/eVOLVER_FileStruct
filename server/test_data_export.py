@@ -313,8 +313,134 @@ def main() -> int:
     test_storage_report_shapes()
     test_experiment_disk_usage()
     test_disk_alert_decision_edges()
+    test_wide_csv_merge_collapses_duplicate_timestamps()
+    test_wide_csv_merge_sinks_unparseable_elapsed_to_the_end()
+    test_wide_csv_merge_handles_ragged_vials()
+    test_wide_csv_iter_and_wide_csv_agree()
+    test_bundle_manifest_row_counts_survive_streaming()
     print("\nAll data_export tests passed.")
     return 0
+
+
+
+# ---------------------------------------------------------------------------
+# wide_csv: the streaming k-way merge
+# ---------------------------------------------------------------------------
+#
+# wide_csv was a dict join holding one {timestamp: value} entry per vial per
+# row -- 967 000 entries and a 190 MB peak on a 7-day 16-vial run, on a machine
+# with 512 MB. It is now a merge over per-vial cursors with one row each in
+# flight. These tests pin the two behaviours a reasonable rewrite silently
+# changes, both of which the first attempt here got wrong.
+
+
+def _write_od(exp, vial, rows, crlf=True):
+    """rows: (timestamp, elapsed_cell, od_cell)."""
+    exp.mkdir(parents=True, exist_ok=True)
+    eol = "\r\n" if crlf else "\n"
+    with (exp / f"vial{vial:02d}_OD.csv").open("w", encoding="utf-8", newline="") as f:
+        f.write("timestamp,elapsed_hours,raw_adc,calibrated_od,n_valid,flag,dark" + eol)
+        for ts, eh, od in rows:
+            f.write(f"{ts},{eh},52000,{od},5,ok," + eol)
+
+
+def _ts(i):
+    return f"2026-05-12T10:{i:02d}:00+00:00"
+
+
+def test_wide_csv_merge_collapses_duplicate_timestamps() -> None:
+    """The dict join did ``value_by_vial[v][ts] = val``, so consecutive rows
+    sharing a timestamp collapsed to the LAST one -- which happens for real when
+    a resumed run re-writes the same second. A naive merge emits them as two
+    output rows instead."""
+    with TmpRoot() as root:
+        exp = root / "Dup"
+        _write_od(exp, 0, [(_ts(0), "0.0000", "0.1000"),
+                           (_ts(1), "0.1000", "0.2000"),
+                           (_ts(1), "0.1000", "0.9999"),   # same ts, later value
+                           (_ts(2), "0.2000", "0.3000")])
+        text = dx.wide_csv(exp, "od", [0])
+        rows = text.strip().splitlines()[1:]
+        assert len(rows) == 3, rows
+        assert rows[1] == f"{_ts(1)},0.1000,0.9999", rows[1]
+    print("PASS  wide_csv collapses duplicate timestamps, last value winning")
+
+
+def test_wide_csv_merge_sinks_unparseable_elapsed_to_the_end() -> None:
+    """`_elapsed_sort_key` sorts unparseable elapsed cells to (1, 0.0), i.e.
+    after everything else. The merge holds those rows back and appends them, so
+    a corrupt cell cannot reorder the good data around it."""
+    with TmpRoot() as root:
+        exp = root / "Bad"
+        _write_od(exp, 0, [(_ts(0), "0.0000", "0.1000"),
+                           (_ts(1), "n/a", "0.2000"),
+                           (_ts(2), "0.2000", "0.3000")])
+        rows = dx.wide_csv(exp, "od", [0]).strip().splitlines()[1:]
+        assert rows[0].startswith(_ts(0))
+        assert rows[1].startswith(_ts(2))
+        assert rows[2].startswith(_ts(1))     # the corrupt one, last
+    print("PASS  wide_csv sinks unparseable elapsed rows to the end")
+
+
+def test_wide_csv_merge_handles_ragged_vials() -> None:
+    """Staggered starts, different lengths, a sparse vial and a gap -- all in
+    one file set, since the merge has to keep sixteen cursors aligned."""
+    with TmpRoot() as root:
+        exp = root / "Ragged"
+        _write_od(exp, 0, [(_ts(i), f"{i*0.1:.4f}",
+                            "" if i == 3 else f"{0.1*i:.4f}") for i in range(6)])
+        _write_od(exp, 1, [(_ts(i), f"{i*0.1:.4f}", f"{0.2*i:.4f}")
+                           for i in range(2, 4)], crlf=False)   # LF, short
+        _write_od(exp, 5, [(_ts(i), f"{i*0.1:.4f}", f"{0.3*i:.4f}")
+                           for i in (0, 3)])                    # sparse
+        rows = dx.wide_csv(exp, "od", [0, 1, 5]).strip().splitlines()
+        assert rows[0] == "timestamp,elapsed_hours,vial00,vial01,vial05"
+        body = rows[1:]
+        assert len(body) == 6
+        assert body[0] == f"{_ts(0)},0.0000,0.0000,,0.0000"
+        assert body[2] == f"{_ts(2)},0.2000,0.2000,0.4000,"
+        # vial00 dropped a read at i=3 -> blank, but the row still exists
+        assert body[3] == f"{_ts(3)},0.3000,,0.6000,0.9000"
+        assert body[5] == f"{_ts(5)},0.5000,0.5000,,"
+    print("PASS  wide_csv merges ragged/staggered/sparse vials")
+
+
+def test_wide_csv_iter_and_wide_csv_agree() -> None:
+    """`build_bundle` streams through `wide_csv_iter`; the string form is just
+    its join. They must not drift."""
+    with TmpRoot() as root:
+        exp = root / "Same"
+        _write_od(exp, 0, [(_ts(i), f"{i*0.1:.4f}", f"{0.1*i:.4f}")
+                           for i in range(30)])
+        _write_od(exp, 2, [(_ts(i), f"{i*0.1:.4f}", f"{0.2*i:.4f}")
+                           for i in range(5, 25)])
+        for hours in (None, 1.0, 0.5):
+            joined = "".join(dx.wide_csv_iter(exp, "od", [0, 2], hours))
+            assert joined == dx.wide_csv(exp, "od", [0, 2], hours), hours
+    print("PASS  wide_csv_iter and wide_csv produce the same bytes")
+
+
+def test_bundle_manifest_row_counts_survive_streaming() -> None:
+    """Row counts used to come from ``_row_count`` over a materialised string;
+    they are now tallied while streaming into the zip."""
+    import zipfile
+    with TmpRoot() as root:
+        exp = root / "Manifest"
+        _write_od(exp, 0, [(_ts(i), f"{i*0.1:.4f}", f"{0.1*i:.4f}")
+                           for i in range(12)])
+        with (exp / "vial00_temp.csv").open("w", encoding="utf-8", newline="") as f:
+            f.write("timestamp,elapsed_hours,raw_adc,calibrated_temp_c\r\n")
+            for i in range(12):
+                f.write(f"{_ts(i)},{i*0.1:.4f},430,37.0\r\n")
+        fname, payload = dx.build_bundle(
+            exp, name="Manifest", vials=[0], parameters=["od", "temp"])
+        with zipfile.ZipFile(io.BytesIO(payload)) as zf:
+            manifest = json.loads(zf.read("export_manifest.json"))
+            assert manifest["files"]["Manifest_OD.csv"]["data_rows"] == 12
+            assert manifest["files"]["Manifest_temp.csv"]["data_rows"] == 12
+            od_text = zf.read("Manifest_OD.csv").decode("utf-8")
+            assert len(od_text.strip().splitlines()) == 13   # + header
+    print("PASS  bundle manifest row counts survive the streaming write")
 
 
 if __name__ == "__main__":

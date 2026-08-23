@@ -46,6 +46,7 @@ from flask_socketio import SocketIO
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import data_export as dx  # noqa: E402
+import growth_rate as growth  # noqa: E402
 import event_log as evlog  # noqa: E402
 from calibration_service import (  # noqa: E402
     CalibrationConflict,
@@ -642,6 +643,19 @@ def create_app(use_mock: bool):
         except Exception:
             log.exception("failed to apply per-run OD blank for '%s'", name)
 
+    def _push_growth_context(name: str | None) -> None:
+        """Give the engine the calibration facts its growth estimator needs:
+        per-vial OD floors from this run's blank, the OD-calibration-suspect
+        vial list, and whether pump flow rates have been calibrated.
+
+        Called at start, at crash-resume, and after any blank or pump commit,
+        so the estimator never runs on a stale view of the calibration.
+        """
+        try:
+            state.engine.set_growth_context(cal_service.growth_context(name))
+        except Exception:
+            log.exception("failed to push growth context for '%s'", name)
+
     # ------------------------------ HTTP routes ------------------------------
 
     @flask_app.route("/")
@@ -1115,6 +1129,9 @@ def create_app(use_mock: bool):
             # Belt and braces: make sure the committed blank is live on the
             # manager (commit already applied it in this process lifetime).
             _apply_experiment_blank(name)
+        # After the blank is live, so the per-vial OD floors are derived from
+        # the calibration the run will actually use.
+        _push_growth_context(name)
         return jsonify(status="running", name=name)
 
     @flask_app.route("/api/experiments/<name>/stop", methods=["POST"])
@@ -1626,6 +1643,8 @@ def create_app(use_mock: bool):
             _sync_od_cal_from_manager()
         except Exception:
             log.exception("apply_od_blank after commit failed")
+        # A new blank changes the per-vial OD floors the growth estimator uses.
+        _push_growth_context(state.engine.loaded_experiment)
         # Provenance: the run must record which blank it used (§19.1).
         if name is not None:
             try:
@@ -1761,6 +1780,37 @@ def create_app(use_mock: bool):
         return jsonify(state.manager.collect_od_raw(int(power), n_samples))
 
     # --- post-run mass reconciliation (§19.4) --------------------------------
+
+    @flask_app.route("/api/growth_rate", methods=["GET"])
+    def api_growth_rate():
+        """Per-vial growth estimates (SPEC §17).
+
+        ONE reported estimator -- the windowed log-linear fit within
+        inter-dilution segments -- plus a gated ``dilution_check`` diagnostic.
+        SPEC §6's older example showed ``mu_dilution`` beside ``mu_per_hour``
+        as co-equal; GROWTH_RATE_METHOD.md §0 demoted the second to a
+        diagnostic that stays dark until pump calibration exists, so it is
+        nested rather than presented as an alternative answer.
+
+        ``r_squared`` never travels without ``windows_searched``: the window is
+        chosen by maximum R², which makes the reported R² an optimistic bound
+        rather than an unbiased fit statistic.
+        """
+        name = state.engine.loaded_experiment
+        if name is None or not state.engine.is_running:
+            return jsonify(
+                experiment=name,
+                running=False,
+                per_vial={},
+                message="no experiment is running",
+            )
+        return jsonify(
+            experiment=name,
+            running=True,
+            timestamp=_now_iso(),
+            recompute_interval_seconds=growth.RECOMPUTE_INTERVAL_SECONDS,
+            per_vial=state.engine.growth_snapshot(),
+        )
 
     @flask_app.route("/api/experiments/<name>/reconcile", methods=["POST"])
     def api_experiment_reconcile(name):
@@ -2094,6 +2144,11 @@ def create_app(use_mock: bool):
                             "flags": o.get("flags"),
                         },
                         "experiment": _experiment_summary(),
+                        # SPEC §17 growth estimates. Recomputed on a 60 s
+                        # throttle inside the engine, so most ticks re-send an
+                        # unchanged block -- cheap, and it keeps the dashboard
+                        # from needing a second poll.
+                        "growth": state.engine.growth_snapshot(),
                         # RS485 bus + per-vial sleeve health, so the dashboard
                         # indicators refresh at the sensor cadence rather than
                         # polling (SPEC §20.4).
@@ -2136,6 +2191,7 @@ def create_app(use_mock: bool):
             # The blank re-anchor lives in memory; a restart must re-apply it
             # or the resumed run's OD silently reverts to the offset curve.
             _apply_experiment_blank(resumed)
+            _push_growth_context(resumed)
     except Exception:
         log.exception("resume_on_startup failed")
 

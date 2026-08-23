@@ -24,6 +24,7 @@ Deliberately Flask-free: the API layer (app.py) maps
 
 from __future__ import annotations
 
+import bisect
 import csv
 import json
 import logging
@@ -60,6 +61,20 @@ PUMP_DEFAULT_REPLICATES = 3
 PUMP_CV_MAX = 0.05
 PUMP_PREV_DELTA_MAX = 0.15
 PUMP_MEDIAN_FACTOR = 2.0
+
+# --- Growth-rate service (SPEC §17 / GROWTH_RATE_METHOD.md §5, §8).
+# The per-vial low-OD floor is `max(GROWTH_OD_FLOOR_MIN, N x blank_sd_od)`.
+# Neither §17's single 0.1 nor Session N's 0.05 is right on its own: the
+# Session O audit found optical sensitivity varying FOUR-FOLD across sleeves
+# (92-375 counts per 0.01 OD), so the floor has to be per-vial and derived
+# from that run's own blank read noise.
+GROWTH_OD_FLOOR_MIN = 0.05
+GROWTH_OD_FLOOR_SD_MULTIPLE = 10.0
+# Above this fitted lower asymptote the OD curve diverges inside the range it
+# is used over (CALIBRATION_PROTOCOL §1.4). Same threshold `_od_domain_warnings`
+# uses to raise the human-readable warning; shared so the machine-readable
+# suspect-vial list and the printed warning can never disagree.
+OD_LOWER_ASYMPTOTE_SUSPECT = 40000.0
 
 # --- Staleness thresholds (CALIBRATION_PROTOCOL §13).
 PUMP_STALE_DAYS = 30.0
@@ -206,6 +221,8 @@ class CalibrationStore:
         self.sessions_dir = self.root / "_sessions"
         self.reconciliation_log_path = self.root / "reconciliation_log.json"
         self._lock = threading.RLock()
+        # Per-file pump-log index; see _pump_log_index. Keyed by path string.
+        self._pump_log_cache: dict[str, dict] = {}
 
     # -- layout helpers --------------------------------------------------
 
@@ -324,7 +341,7 @@ class CalibrationStore:
         the range it is used over. Vial 1 trips this on the 2016 files."""
         warnings: list[str] = []
         for v in range(N_VIALS):
-            if float(arr[0, v]) > 40000.0:
+            if float(arr[0, v]) > OD_LOWER_ASYMPTOTE_SUSPECT:
                 warnings.append(
                     f"vial {v} OD lower asymptote ({arr[0, v]:.0f}) sits inside "
                     "the working signal range — curve diverges above OD ~1 "
@@ -510,35 +527,135 @@ class CalibrationStore:
 
     # -- staleness (§13) -------------------------------------------------
 
+    def _pump_log_index(self, csv_path: Path) -> Optional[dict]:
+        """Cumulative pump-time index for one pump log, parsed incrementally.
+
+        Pump logs are append-only, which is the property this exploits: after
+        the first pass only newly-appended bytes are parsed, so the cost of a
+        staleness check stops growing with the length of the campaign. The
+        uncached scan was measured at 1.4 s over a 17-experiment tree and grew
+        without bound; it is dormant today only because ``current.json`` has
+        ``"pump": null``, and goes live on the dashboard banner the moment Tier
+        2 calibration lands.
+
+        Returns ``{"total_all", "epochs", "cum", "ordered"}``:
+
+        * ``total_all`` -- every row's duration, INCLUDING rows whose timestamp
+          does not parse. This is what the ``since=None`` query returns.
+        * ``epochs`` / ``cum`` -- ascending timestamps and their prefix sums,
+          over parseable rows only. A ``since`` query is a bisect plus one
+          subtraction.
+
+        The split preserves an asymmetry in the behaviour this replaces:
+        ``since=None`` counted unparseable-timestamp rows, ``since=<version>``
+        skipped them. Both are still true.
+        """
+        try:
+            st = csv_path.stat()
+        except OSError:
+            return None
+        key = str(csv_path)
+        entry = self._pump_log_cache.get(key)
+        if (
+            entry is None
+            or st.st_size < entry["parsed_to"]
+            or st.st_mtime < entry["mtime"]
+        ):
+            # Absent, truncated or replaced -> parse from the top.
+            entry = {"parsed_to": 0, "mtime": st.st_mtime, "total_all": 0.0,
+                     "epochs": [], "cum": [0.0], "ordered": True}
+        elif st.st_size == entry["parsed_to"]:
+            entry["mtime"] = st.st_mtime
+            self._pump_log_cache[key] = entry
+            return entry
+
+        try:
+            with csv_path.open("rb") as f:
+                if entry["parsed_to"]:
+                    f.seek(entry["parsed_to"])
+                blob = f.read()
+        except OSError:
+            log.exception("failed reading %s", csv_path)
+            return entry if entry["cum"] else None
+
+        # Only consume complete lines; a row half-flushed at EOF is left for
+        # the next call rather than being parsed as a truncated record.
+        cut = blob.rfind(b"\n")
+        if cut == -1:
+            entry["mtime"] = st.st_mtime
+            self._pump_log_cache[key] = entry
+            return entry
+        consumed = blob[:cut + 1]
+        lines = consumed.decode("utf-8", errors="replace").splitlines()
+        if entry["parsed_to"] == 0:
+            lines = lines[1:]                       # header
+        entry["parsed_to"] += len(consumed)
+        entry["mtime"] = st.st_mtime
+
+        epochs, cum = entry["epochs"], entry["cum"]
+        for line in lines:
+            if not line:
+                continue
+            parts = line.split(",")
+            if len(parts) < 4:
+                continue
+            try:
+                duration = float(parts[3] or 0.0)
+            except (TypeError, ValueError):
+                continue
+            entry["total_all"] += duration
+            try:
+                row_dt = datetime.fromisoformat(parts[0])
+            except ValueError:
+                continue
+            if row_dt.tzinfo is None:
+                row_dt = row_dt.replace(tzinfo=timezone.utc)
+            ts = row_dt.timestamp()
+            if epochs and ts < epochs[-1]:
+                # A clock step backwards would break the bisect; fall back to a
+                # linear scan for this file rather than returning a wrong number.
+                entry["ordered"] = False
+            epochs.append(ts)
+            cum.append(cum[-1] + duration)
+
+        self._pump_log_cache[key] = entry
+        return entry
+
     def pump_seconds_since(self, version: Optional[str]) -> Optional[float]:
         """Cumulative pump-on seconds across every experiment's pump logs
         since the given calibration version's timestamp (the tubing-wear
-        signal). Returns None when the experiments root is unknown."""
+        signal). Returns None when the experiments root is unknown.
+
+        Backed by a per-file incremental index (:meth:`_pump_log_index`), so
+        this is O(newly-appended rows) after the first call rather than O(every
+        pump event ever logged).
+        """
         if self.experiments_root is None or not self.experiments_root.is_dir():
             return None
         since = _parse_version(version) if version else None
+        since_ts = since.timestamp() if since is not None else None
         total = 0.0
-        for csv_path in self.experiments_root.glob("*/vial*_pump_log.csv"):
-            try:
-                with csv_path.open("r", encoding="utf-8", newline="") as f:
-                    reader = csv.DictReader(f)
-                    for row in reader:
-                        if since is not None:
-                            ts = row.get("timestamp", "")
-                            try:
-                                row_dt = datetime.fromisoformat(ts)
-                            except ValueError:
-                                continue
-                            if row_dt.tzinfo is None:
-                                row_dt = row_dt.replace(tzinfo=timezone.utc)
-                            if row_dt < since:
-                                continue
-                        try:
-                            total += float(row.get("duration_seconds") or 0.0)
-                        except (TypeError, ValueError):
-                            continue
-            except Exception:
-                log.exception("failed reading %s", csv_path)
+        with self._lock:
+            seen: set = set()
+            for csv_path in self.experiments_root.glob("*/vial*_pump_log.csv"):
+                entry = self._pump_log_index(csv_path)
+                if entry is None:
+                    continue
+                seen.add(str(csv_path))
+                if since_ts is None:
+                    total += entry["total_all"]
+                elif entry["ordered"]:
+                    i = bisect.bisect_left(entry["epochs"], since_ts)
+                    total += entry["cum"][-1] - entry["cum"][i]
+                else:
+                    total += sum(
+                        entry["cum"][j + 1] - entry["cum"][j]
+                        for j, ts in enumerate(entry["epochs"])
+                        if ts >= since_ts
+                    )
+            # Drop entries for files that have gone away (deleted experiments).
+            for stale in [k for k in self._pump_log_cache if k not in seen]:
+                del self._pump_log_cache[stale]
         return total
 
     def staleness(
@@ -1390,6 +1507,116 @@ class CalibrationService:
         except Exception:
             log.exception("failed to parse %s", path)
             return None
+
+    # -- growth-rate service context (SPEC §17) ---------------------------
+
+    @staticmethod
+    def _od_counts_to_od_sd(od_cal, vial: int, signal: float, sd_counts: float):
+        """Convert a blank SD in ADC counts to OD units for one vial.
+
+        The blank wizard records ``blank_sd`` in raw counts, but the growth
+        service needs a floor in OD. The four-parameter logistic
+
+            OD(S) = c - log10((b - a) / (S - a) - 1) / d
+
+        has the closed-form local slope
+
+            dOD/dS = (b - a) / (d * ln10 * (b - S) * (S - a))
+
+        evaluated at the blank signal. Multiplying the count-domain SD by that
+        slope is the correct first-order propagation, and it is what makes the
+        floor genuinely per-vial: the same count noise maps to a four-fold
+        range of OD noise across sleeves.
+
+        Returns ``None`` when the signal sits outside the calibration's
+        ``(a, b)`` domain, where the conversion has no meaning.
+        """
+        try:
+            a = float(od_cal[0][vial])
+            b = float(od_cal[1][vial])
+            d = float(od_cal[3][vial])
+        except Exception:
+            return None
+        if not (a < float(signal) < b) or d == 0:
+            return None
+        slope = (b - a) / (d * math.log(10.0) * (b - float(signal)) * (float(signal) - a))
+        return abs(slope) * float(sd_counts)
+
+    def growth_context(self, experiment: Optional[str]) -> dict:
+        """Everything the growth-rate estimator needs from the calibration
+        layer, in the shape ``ExperimentEngine.set_growth_context`` expects.
+
+        Three separate facts, each with its own failure mode:
+
+        * ``od_floor`` -- per-vial, from this run's committed blank. Absent a
+          blank (**the live case today: none has ever been committed**), every
+          vial gets the global fallback and ``blank_present`` is False, which
+          makes the engine flag every estimate ``uncalibrated_floor``.
+        * ``suspect_vials`` -- vials whose OD calibration the store's own QC
+          says to exclude from quantitative use. Derived from the envelope's
+          numbers, not by parsing its English warning text.
+        * ``pump_calibrated`` -- gates the dilution diagnostic (§4.4). False
+          today, because ``calibration/current.json`` has ``"pump": null``:
+          until the Tier 2 gravimetric bench work runs, every flow rate is a
+          hardcoded default and the diagnostic would false-alarm.
+        """
+        floors: dict = {}
+        blank_present = False
+        suspect: list = []
+
+        od_env = self.store.get_current("od")
+        od_rows = None
+        if od_env is not None:
+            rows = (od_env.get("data") or {}).get("rows")
+            if isinstance(rows, list) and len(rows) == 4:
+                od_rows = rows
+                for v in range(N_VIALS):
+                    try:
+                        if float(rows[0][v]) > OD_LOWER_ASYMPTOTE_SUSPECT:
+                            suspect.append(v)
+                    except Exception:
+                        continue
+
+        blank = (
+            self.store.experiments_root is not None and experiment
+            and self.load_experiment_blank(experiment)
+        ) or None
+        if blank:
+            data = blank.get("data") or {}
+            sd = data.get("blank_sd") or {}
+            median = data.get("blank_median") or {}
+            for key, sd_counts in sd.items():
+                try:
+                    v = int(key)
+                except (TypeError, ValueError):
+                    continue
+                signal = median.get(key, median.get(str(v)))
+                sd_od = None
+                if od_rows is not None and signal is not None:
+                    sd_od = self._od_counts_to_od_sd(
+                        od_rows, v, signal, sd_counts,
+                    )
+                if sd_od is None or not math.isfinite(sd_od):
+                    continue
+                floors[v] = max(
+                    GROWTH_OD_FLOOR_MIN, GROWTH_OD_FLOOR_SD_MULTIPLE * sd_od,
+                )
+            blank_present = bool(floors)
+
+        pump_rates = self.store.current_pump_rates()
+        return {
+            "od_floor": floors,
+            "blank_present": blank_present,
+            "suspect_vials": suspect,
+            "pump_calibrated": pump_rates is not None,
+            "pump_reason_unavailable": (
+                None if pump_rates is not None else
+                "pump flow rates have not been calibrated on this machine "
+                "(calibration/current.json has \"pump\": null) \u2014 the dilution "
+                "cross-check would compare growth against a hardcoded default "
+                "flow array. Run the gravimetric wizard to enable it."
+            ),
+        }
 
     # -- pump gravimetric (O3) -------------------------------------------
 

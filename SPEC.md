@@ -171,11 +171,15 @@ evolver-gui/
     serial_manager.py           # RS485 communication (real hardware)
     mock_serial_manager.py      # Simulated responses for development
     experiment_engine.py        # Control loop and experiment logic
+    growth_rate.py              # §17 growth estimation (pure, I/O-free)
     control_modes/
       turbidostat.py            # Turbidostat control logic
       chemostat.py              # Chemostat control logic (Phase 2)
       morbidostat.py            # Morbidostat control logic (Phase 2)
-      growth_rate.py            # Growth rate feedback control (Phase 2)
+      # NOTE: control_modes/growth_rate.py -- a growth-rate FEEDBACK CONTROL
+      # mode -- was listed here but has never existed and is still unbuilt.
+      # §17's estimator is server/growth_rate.py above; the control mode that
+      # would consume it is a separate, later piece of work.
     data_logger.py              # CSV file management
     watchdog.py                 # Safety watchdog timer
     calibration.py              # Calibration math (ADC <-> real units)
@@ -535,9 +539,26 @@ DELETE /api/templates/{name}
 GET  /api/experiments/{name}/events         # §20 — unified event log
   Query params: ?level=warning&category=pump&last_n=200
 GET  /api/growth_rate                       # §17 — current per-vial estimates
-  Response: {"vials": {"0": {"mu_per_hour": 0.43, "doubling_time_h": 1.61,
-                             "r_squared": 0.98, "method": "segment",
-                             "mu_dilution": 0.41, "diverged": false}}}
+  Response: {"experiment": "run1", "running": true,
+             "recompute_interval_seconds": 60.0,
+             "per_vial": {"0": {
+                "mu_per_hour": 0.43, "doubling_time_min": 96.7,
+                "r_squared": 0.98, "method": "segment", "regime": "continuous",
+                "n_points": 412, "span_seconds": 5400.0,
+                "window_start_od": 0.21, "window_end_od": 0.58,
+                "windows_searched": 37,
+                "flags": ["uncalibrated_floor"],
+                "lag_time_hours": null,
+                "dilution_check": {"enabled": false, "mu_per_hour": null,
+                                   "mixing_model": "perfusion_v_over_V",
+                                   "n_events": 4,
+                                   "disagreement_fraction": null,
+                                   "reason_unavailable": "pump flow rates
+                                     have not been calibrated ...",
+                                   "tautological": false}}}}
+  ONE reported estimator plus a gated diagnostic — `dilution_check` is nested,
+  not co-equal with `mu_per_hour`. `r_squared` never travels without
+  `windows_searched` beside it (see §17).
 ```
 
 ---
@@ -559,6 +580,14 @@ socket.emit('sensor_update', {
     od: {
         calibrated: [0.34, 0.42, 0.28, ...],   // OD600
         raw: [52341, 48211, 54102, ...]          // ADC
+    },
+    // §17 growth estimates, keyed by vial. Recomputed on a 60 s throttle
+    // inside the engine, so most ticks re-send an unchanged block.
+    growth: {
+        "0": {mu_per_hour: 0.43, doubling_time_min: 96.7, r_squared: 0.98,
+              regime: "continuous", windows_searched: 37,
+              flags: ["uncalibrated_floor"],
+              dilution_check: {enabled: false, reason_unavailable: "..."}}
     }
 });
 
@@ -662,6 +691,52 @@ Saved when experiment is created. Serves as a complete record of parameters used
     "notes": "Replicate adaptation experiment in LB, 8 vials"
 }
 ```
+
+### 8.1 Every read path is bounded by the request, not by the run
+
+**Status: IMPLEMENTED 2026-08-23.** The per-vial CSVs are append-only and ordered
+by `elapsed_hours`, and for a long run they are not small: 7 days at the 10 s
+sensor cadence is **60 480 rows and ~3.2 MB per vial**, 53 MB across sixteen.
+Three read paths were written against a "small-ish for Phase 1" assumption and
+scaled with run length rather than with what was asked for. On the deployment
+Pi — one core shared with Flask and the control loop, 512 MB on a Pi 1 Model B —
+that is the wrong failure mode for an instrument meant to run unattended for days.
+
+| Path | Before (7-day, 16-vial) | After |
+|---|---|---|
+| `get_data`, 1 h window | 1230 ms, 9.9 MB — read 60 480 rows to return 361 points | **~30 ms, 0.3 MB**, and flat in run length |
+| `build_bundle`, od+temp | 27.6 s, **190 MB peak** | **3.8 s, 5.3 MB peak** |
+| `pump_seconds_since` | 12.3 s on a 480 k-row campaign | **42 ms warm**, O(files) not O(rows) |
+
+Three mechanisms, each chosen so the observable output does not change:
+
+1. **Tail reads** (`data_export.read_tail_rows`). Seeks from EOF in doubling
+   chunks until the first buffered row is strictly older than the window's
+   cutoff. It is a **prefilter returning a superset** — `filter_rows_by_hours`
+   still does the exact trim, so the window semantics remain defined in exactly
+   one place and the equivalence is provable rather than hoped for. The Plots
+   tab's "All" range has no bound to exploit and deliberately stays O(n); it
+   still means *all*.
+2. **A streaming k-way merge** (`data_export.wide_csv_iter`), replacing a dict
+   join that held one `{timestamp: value}` entry per vial per row — 967 000
+   entries for a 7-day run. The files are already timestamp-ordered and the
+   DataLogger writes every active vial with the same timestamp each cycle, so
+   one row per vial in flight suffices. Output streams straight into the zip.
+3. **An incremental, mtime-keyed pump-log index**. Pump logs are append-only,
+   so after the first pass only newly-appended bytes are parsed and a query is
+   a bisect over prefix sums. This one was *dormant* — `staleness()`
+   short-circuits while `current.json` has `"pump": null` — and would have gone
+   live on the dashboard banner the moment Tier 2 calibration landed.
+
+Two behaviours that predate this and are now pinned by tests, because a
+reasonable rewrite silently changes both: consecutive rows sharing a timestamp
+collapse to the **last** one (the dict join did `d[ts] = val`), and a row whose
+`elapsed_hours`/timestamp does not parse is **kept** by the windowed filter but
+**skipped** by the pump index's windowed query while still counting toward its
+unwindowed total.
+
+`server/bench_read_paths.py` re-measures all three; run it on the Pi, since the
+figures above are from an x86 box and SD-card I/O does not extrapolate.
 
 ---
 
@@ -1258,7 +1333,7 @@ These decisions can be deferred but should be resolved before Phase 2:
 
 8. **Is bottle level worth measuring rather than inferring?** All volume tracking is open-loop: `duration × flow_rate`, accumulated. It cannot detect a disconnected tube, a kinked line, a pump that stalls, or an operator topping up a bottle without telling the software. A float switch or a load cell under each bottle would convert the interlock from an estimate into a measurement. This is the highest-value hardware addition currently on the table and should be costed.
 
-9. **What growth-rate estimate does the lab consider authoritative?** §17 proposes computing two (segment regression on OD, and dilution-rate) and reporting both. Before the analysis pipeline hardens around one of them, the lab should decide which is quoted in figures — they answer subtly different questions, and their disagreement is itself a useful diagnostic.
+9. ~~**What growth-rate estimate does the lab consider authoritative?**~~ **ANSWERED (2026-08-23, `GROWTH_RATE_METHOD.md` §0).** The Isaacs Lab algorithm — windowed log-linear regression within inter-dilution segments — is *the* growth rate, singly. The dilution-rate calculation survives only as a gated diagnostic and is never reported as a μ. Implemented in `server/growth_rate.py`. One question remains open but is not a software question: whether the doubling times already published from that script were intended as μ_max. They are not — the range gate makes them growth rates at the operating density, ~15 % below μ_max for a K ≈ 1.5 culture (`GROWTH_RATE_METHOD.md` §2 #2, §9).
 
 10. **Does the Pi have outbound internet?** Notifications (§22) and off-box backup (§24) both need egress. The Pi sits behind a dedicated Netgear router; Tailscale is deployed (`deploy/ts-keepalive/`), which suggests egress exists, but this has not been verified for arbitrary outbound HTTPS. Confirm before building either feature.
 
@@ -1438,8 +1513,11 @@ Consequences once overrun is engaged:
   supersedes the naive reading of §16.1 item 3.
 - **`volume_ml` becomes a measured geometric constant** — set by where the straw is cut —
   rather than the unverified `25.0` default in the config.
-- **The §17 dilution-rate growth estimator gets an honest `V`.** `μ ≈ Σ ln(1 + vᵢ/V)/Δt` is
-  biased by a drifting vial volume; pinning V removes that bias.
+- **The §17 dilution diagnostic gets an honest `V`.** `μ_diag = Σ (vᵢ/V)/Δt` is biased by a
+  drifting vial volume; pinning V removes that bias. (The factor is `v/V` — simultaneous
+  influx and efflux with volume pinned by the straw is continuous perfusion. The
+  `ln(1 + vᵢ/V)` written here previously is the bolus-add-then-overflow factor and reads
+  9–15 % low at a typical 5–8 mL bolus.)
 
 **Current state and the open gate.** `efflux_extra_seconds` defaults to **0.0** across all
 three control modes (commit `a7b408a`, "live-validated default from eVOLVER-001"), which
@@ -1454,63 +1532,186 @@ it gates `ROADMAP.md` Sessions K and L.
 
 ## 17. Growth rate estimation service
 
-**Status: partially implemented (private to `MorbidostatController`). Priority P0
-(`ROADMAP.md` Session N). Blocks: §22 detection rules, consumables forecasting, the
-growth-rate control mode, and the derived-statistics plots.**
+**Status: IMPLEMENTED 2026-08-23 (`ROADMAP.md` Session N).** `server/growth_rate.py`
+holds the estimator; `ExperimentEngine` owns the timestamped OD history and the dilution
+boundaries; output reaches `status()`, the `sensor_update` payload, `GET /api/growth_rate`,
+and a per-vial `vialNN_growth.csv`. Covered by `server/test_growth_rate.py`, with
+`server/verify_growth_rate.py` as the readable measurement report and
+`server/replay_growth.py` for replaying a logged run.
 
-New module `server/growth_rate.py`: pure, I/O-free, importable by any control mode. Output
-lands in `status()`, the WebSocket payload, and the existing `growth_rate_per_hour` column
-in the per-vial CSV.
+> **The design document is `GROWTH_RATE_METHOD.md`.** It states the source algorithm, what
+> was measured about it, what was deliberately not ported, and why. This section is the
+> specification; that document is the reasoning and the evidence. Where they disagree, it
+> wins — several claims in the older text of this section did not survive it, and are
+> corrected below.
 
-### Two estimators, both reported
+### One reported estimator, plus a gated diagnostic
 
 Naively fitting `ln(OD)` over a rolling window is **wrong in a turbidostat**: dilution
 events are step decreases in OD that have nothing to do with growth, and averaging across
-them biases μ toward zero.
+them biases μ toward zero. Measured at **−80 % / −94 % / −99 %** at μ = 0.35 / 0.70 /
+1.20 h⁻¹; splitting the series at dilution events and fitting within segments gives
+**−2.3 % / +0.2 % / −0.4 %** (`GROWTH_RATE_METHOD.md` §3.3).
 
-**1. Segment regression.** Split the OD series at dilution events; within each
-inter-dilution segment fit
+**The reported growth rate** is the Isaacs Lab algorithm — windowed log-linear regression,
+the window chosen by maximum R² — applied in one of three regimes:
+
+| Regime | When | Method |
+|---|---|---|
+| **A — batch** | inoculation to the first dilution | range gate, windowed max-R² fit, lag time by extrapolation |
+| **B — continuous** | after the first dilution | split at dilution events, windowed fit per segment, weighted mean over recent segments (weight = span × R²) |
+| **chemostat** | `mode == "chemostat"` | mass balance `μ = D + d(ln OD)/dt`, flagged `assumes_commanded_D` |
+
+Regime B does not apply to a chemostat: boli every `bolus_interval_seconds` leave segments
+a few samples long, so segmenting would return `None` indefinitely.
+
+The regime-A range gate is **derived per run**, not ported — the notebook's 0.1–0.5 band is
+specific to a plate reader's scale and to the lab's strains and media:
 
 ```
-ln(OD) = μ·t + c        (least squares)
+lo = max(od_lower_thresh[vial] * 0.5, per_vial_od_floor)
+hi = od_upper_thresh[vial] * 1.5
 ```
 
-and take a weighted mean of recent segments. Reflects instantaneous growth. Variance
-rises as dilutions become frequent, because segments become short.
+The window is likewise specified as a **duration**, not a sample count. The notebook's
+8 samples is 2 h at a plate reader's 15 min cadence and 80 s at eVOLVER's — measured at
+64–339 % μ error. `MIN_FIT_SPAN_SECONDS` is 600 (sd 2.4–11.6 %) and
+`PREFERRED_FIT_SPAN_SECONDS` 1800 (sd 0.4–2.2 %).
 
-**2. Dilution-rate estimator.** At turbidostat steady state, growth rate equals dilution
-rate. Over a window containing *k* dilution events delivering volumes *vᵢ* into vial
-volume *V*:
+**What the window search actually buys is transient rejection, not accuracy.** Inside a
+clean segment it is mildly harmful — it selects the luckiest noise realisation and pays
+~2.5 % bias and double the variance. Its value is finding the exponential stretch when you
+do not know how long mixing or sensor recovery contaminated the ends: at a 240 s
+post-dilution transient it reads +3.8 % where whole-segment OLS reads +12.6 %.
+
+**The dilution-rate calculation is a diagnostic, never a reported μ.** It is retained
+because it is the only independent check on the OD path — it depends on pump flow and
+elapsed time, not optics, so it is blind to the failure modes the OD fit is vulnerable to
+(a pump that is not actually pumping; biofilm or wall growth making the culture denser than
+the planktonic OD suggests).
 
 ```
-μ ≈ Σ ln(1 + vᵢ/V) / Δt_window
+μ_diag = Σ (vᵢ / V) / Δt        # over the span BETWEEN the first and last event
 ```
 
-Depends only on pump volumes and event times, not on OD noise — substantially lower
-variance — but inherits any error in the pump flow calibration (§19) and is valid only
-when OD is genuinely stationary.
+**The factor is `v/V`, not `ln(1 + vᵢ/V)`.** An earlier version of this section specified
+the latter, which is the factor for bolus-add-then-overflow mixing. This machine fires
+influx and efflux *simultaneously* with volume pinned by the efflux straw — continuous
+perfusion. At the turbidostat's typical 5–8 mL bolus into 25 mL the old formula reads
+**9–15 % low**.
 
-**Report both.** Persistent divergence is a physical signal, not a bug: biofilm or wall
-growth (culture denser than planktonic OD suggests), a mis-calibrated pump, or a culture
-not actually at steady state. §22 consumes this divergence as a detection rule.
+**Gated on calibration.** `enabled = CalibrationStore.current_pump_rates() is not None`,
+which is `False` today (`calibration/current.json` has `"pump": null`). While it is off no
+divergence warning may be raised, and the UI must show `reason_unavailable` rather than a
+blank. §22.1's divergence rule is dormant until it turns on.
 
-In chemostat mode μ is imposed by the operator at steady state, so the dilution estimator
-is close to tautological there; segment regression is the informative one.
+**Volume never touches the reported μ.** Dilution events feed it as *timestamps only*;
+`delivered_ml` is read solely by the diagnostic. A boundary is knowable exactly — the pump
+either fired or it did not — whereas a bolus volume is `duration × an unmeasured flow
+rate`. That separation is what makes the reported growth rate independent of the
+uncalibrated pump array, and it is asserted by a test that doubles every `delivered_ml` and
+requires the reported μ to be bit-identical.
+
+### What the reported number *is*
+
+A **growth rate at the operating density**, not μ_max. The range gate folds deceleration
+into the answer: on a logistic with K = 1.5 the notebook's own band reports 14.6 % below
+μ_max. That is the right quantity for comparing strains under a fixed protocol and the
+right quantity for eVOLVER control, but it must be labelled as such, which is why the
+fitted OD span (`window_start_od` / `window_end_od`) is recorded with every value.
+
+Report **doubling time** as `ln2 / μ` in **minutes**, matching the lab's plate-reader
+output so the two are comparable without arithmetic. The notebook fits log₂:
+`μ = slope_log2 · ln2`, equivalently `DT_min = 60 / slope_log2`.
 
 ### Required edge-case handling
 
 | Case | Behaviour |
 |---|---|
-| OD < 0.1 | Return `None` — the sigmoid calibration is at its noisy tail |
-| Fewer than N samples or shorter than the minimum span | Return `None` |
-| Lag or stationary phase | Report R² alongside μ so the UI can flag low confidence |
-| Turbidostat warmup (first 8 cycles, §9) | Dormant |
+| OD below the **per-vial** floor | `None`, flag `low_od`. Never clamp to a floor value — the notebook's clamp to 0.001 creates a plateau of identical values that a log-linear fit reads as zero growth |
+| No `od_blank.json` for the run | Floor falls back to a global 0.05 and every estimate is flagged `uncalibrated_floor`. **This is the live case today** — no blank has ever been committed |
+| Span < `MIN_FIT_SPAN_SECONDS` or fewer than `MIN_SAMPLES` | `None`, flag `short_span` |
+| Turbidostat warmup (first `min_samples_before_action` cycles, §9) | Dormant, flag `warmup` |
+| NaN / dropped OD reads | Drop the sample, never interpolate. Reject a window missing > 30 % of its expected samples |
+| Slope ≤ 0 | Report μ — a shrinking culture is real information — but `doubling_time_min = None` and flag `negative_slope`. **Never** return `60/slope` |
+| Reversed or empty regime-A range | `None`, flag `insufficient_range`. The notebook raises `TypeError` here, which is what a flat turbidostat-shaped series produces |
+| Culture never spans the regime-A range | Fit what exists, flag `band_not_spanned`. The notebook returns DT = 131 min at R² = 0.991 off a decelerating curve with no warning — the high R² *is* the problem |
+| R² below `MIN_R2_TRUST` (0.95) | Return μ **with** the flag `low_r2`; below `MIN_R2_REPORT` (0.90) add `low_confidence`, so a UI can grey the number out rather than merely annotate it. Never withhold the number — a value with a bad R² is still useful to a human |
+| Fewer than 2 usable segments | `None`, flag `insufficient_segments`. Do **not** fall back to a cross-dilution fit |
+| `pump_wait_minutes` < `MIN_FIT_SPAN_SECONDS/60` | Segmentation starves — every segment is too short to fit. Warn at experiment creation; do not refuse the run |
+| Vial 1 | Its committed OD envelope's own QC says "exclude from quantitative use". Flag `calibration_suspect` until Session AA |
+| Chemostat | Diagnostic is near-tautological — mark it and suppress the divergence signal |
 
-Never return a number without its R². A slope fitted through non-exponential data is
-meaningless, and presenting it unqualified is worse than presenting nothing.
+**Never return a number without its R², and never the R² without
+`windows_searched`.** Max-R² selection over *k* candidate windows inflates R² by +0.0008
+(k = 5) to +0.0022 (k = 200) on data that is *exactly* log-linear, so the reported R² is an
+optimistic bound rather than an unbiased fit statistic. §22.1's rules must not treat it as
+one.
 
-Also report **doubling time** (`ln2 / μ`), which most biologists read more fluently
-than μ.
+### Output surfaces
+
+- `status()` → `per_vial[v]`: `mu_per_hour`, `doubling_time_min`, `r_squared`, `regime`,
+  `growth_flags`, `dilution_check`.
+- `sensor_update` → a top-level `growth` block (§7).
+- `GET /api/growth_rate` → the full per-vial report (§6).
+- **`experiments/{name}/vialNN_growth.csv`** — a *parallel* file:
+
+  ```
+  timestamp,elapsed_hours,regime,growth_rate_per_hour,doubling_time_min,
+  r_squared,windows_searched,fit_span_s,fit_od_start,fit_od_end,flags
+  ```
+
+  Written at the engine's 60 s recompute cadence, not the 10 s sensor tick. `flags` is
+  **pipe-separated**, because `data_export`'s readers split on commas.
+
+  `vialNN_OD.csv`'s header is deliberately untouched. `data_export.py` carries no version
+  or schema marker at all, so any positional parser — including the lab's own analysis
+  scripts — would break silently on an inserted column. (An earlier version of this section
+  and of `ROADMAP.md` Session N both described a `growth_rate_per_hour` column as already
+  existing in the per-vial CSV. It exists only in `escalation_log.csv`, which is written in
+  morbidostat mode alone.)
+
+- A row is written even when `mu_per_hour` is `None`; the flags column is then the record of
+  *why* nothing was estimable, which is what an operator needs when a run reports no growth.
+
+### Cost, and why it is shaped the way it is
+
+The recompute runs **on the sensor-loop thread, inside the engine lock**, on a pre-2016
+Raspberry Pi that has a single ARM1176 core at 700 MHz (Pi 1 Model B / B+) or four
+Cortex-A7 at 900 MHz (Pi 2 Model B) to share between the control loop, Flask, socketio and
+the RS485 serial path. Scalar CPython there runs roughly 30–60× slower than a modern x86
+core, so a burst that measures in tens of milliseconds on a laptop measures in **seconds**
+on the target. Three things follow, and none of them are optional:
+
+1. **The window search is O(1) per candidate, not O(window).** Up to
+   `MAX_WINDOW_CANDIDATES` heavily overlapping windows are evaluated per segment.
+   Refitting each from scratch measured **55 ms per vial** for a full 3 h history — which
+   extrapolates to seconds per vial on a Pi 1, i.e. a stalled tick. Prefix sums over
+   recentred time reduce it to **5.4 ms per vial**, and inlining the per-sample
+   finiteness tests (below) to **3.9 ms**. Time is recentred first because
+   differencing prefix sums is a cancelling subtraction and epoch seconds square past 2⁵³.
+   The winning window is then **re-fitted with the direct implementation**, so the fast
+   path only ever chooses *which* samples to fit and every reported number comes from
+   `fit_log_linear`.
+2. **The sixteen vials are staggered across ticks**, `ceil(16/6) = 3` per tick, on per-vial
+   due times rather than a group counter — the loop's period is `max(10 s, work)` and a
+   counter would silently stretch the refresh interval on a loaded box.
+3. **The per-sample filters carry no function call.** `_is_finite` was called
+   ~16 700 times per tick across the sample filters. NaN compares False against
+   everything, so one chained comparison — `0.0 < od < inf`, `-inf < t < inf` —
+   is exact and needs no call. Worth 28 % on its own. `_is_finite` survives for the
+   cold paths; its docstring carries the equivalence so the two cannot drift.
+4. **The serialised payload is cached.** `growth_snapshot()` is called for every
+   `sensor_update`, i.e. every tick; rebuilding 16 reports with `dataclasses.asdict` cost
+   0.7 ms per tick here and ~30 ms on the Pi, for a value that changes once a minute.
+   `GrowthReport` is frozen, so the dict is built once per recompute.
+
+Retained history is ~1.5 MB for 16 vials × 3 h, which is comfortable even on a 512 MB
+Pi 1 B.
+
+**Do not extrapolate these figures to the Pi by guessing a factor.** Run
+`server/bench_growth_rate.py` on the actual machine; it reports a scalar-throughput
+calibration, the per-vial and per-tick cost, and a verdict against the tick budget.
 
 ---
 
@@ -1988,7 +2189,7 @@ and during the turbidostat's 8-cycle warmup.
 | Chemostat washout | OD monotonically falling > 2 h *while dilution is active* | critical |
 | Dilution-response failure | Influx fired but OD did not drop by the expected fraction | warning |
 | Runaway growth | OD above upper threshold for > 3 consecutive cycles despite dilution | warning |
-| Estimator divergence | Segment-regression μ and dilution-rate μ differ > 50 % for > 1 h (§17) | info |
+| Estimator divergence | Reported μ and the **gated** dilution diagnostic differ > 50 % for > 1 h (§17). **Dormant until pump calibration exists**: `dilution_check.enabled` is False while `calibration/current.json` has `"pump": null`, and the rule must stay silent rather than fire on a hardcoded default flow array | info |
 | Temperature excursion | \|T − setpoint\| > 2 °C for > 15 min | warning |
 | Pump over-cycling | Dilution interval below `pump_wait` floor repeatedly | warning |
 | Sensor degradation | Per-vial failure counter above threshold (§20) | warning |

@@ -10,10 +10,13 @@ Run from the project root:
 
 from __future__ import annotations
 
+import csv
 import json
 import math
+import shutil
 import sys
 import tempfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
@@ -29,6 +32,7 @@ from calibration_service import (  # noqa: E402
     PumpCalSession,
     QCRefusal,
     TempStabilityTracker,
+    _parse_version,
     make_envelope,
     reanchor_od_calibration,
 )
@@ -747,6 +751,173 @@ def test_staleness_legacy_import_never_verified():
         assert any("spectrophotometer" in r for r in stale["od"]["reasons"])
         assert stale["temperature"]["stale"] is True
         assert any("outlier" in r for r in stale["temperature"]["reasons"])
+
+
+# ---------------------------------------------------------------------------
+# pump_seconds_since: incremental, mtime-keyed cache
+# ---------------------------------------------------------------------------
+#
+# The uncached scan re-parsed every pump event ever logged on every call --
+# 12.3 s over a 480 000-row campaign, growing without bound. It is dormant
+# today only because current.json has "pump": null, and goes live on the
+# dashboard's staleness banner as soon as Tier 2 calibration lands. These
+# tests pin the equivalence, not the speed.
+
+_PUMP_HEADER = ["timestamp", "elapsed_hours", "direction",
+                "duration_seconds", "od_at_pump"]
+_BASE = datetime(2026, 7, 1, tzinfo=timezone.utc)
+
+
+def _write_pump_log(path: Path, rows, mode="w"):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open(mode, encoding="utf-8", newline="") as f:
+        w = csv.writer(f)
+        if mode == "w":
+            w.writerow(_PUMP_HEADER)
+        for ts, dur in rows:
+            w.writerow([ts, "0.0", "influx", dur, "0.5"])
+
+
+def _pump_rows(n, start=0, minutes=15):
+    return [((_BASE + timedelta(minutes=minutes * (start + i))).isoformat(
+        timespec="seconds"), "12.00") for i in range(n)]
+
+
+def _reference_pump_seconds(root: Path, since):
+    """The pre-cache implementation, verbatim in behaviour."""
+    total = 0.0
+    for p in root.glob("*/vial*_pump_log.csv"):
+        with p.open("r", encoding="utf-8", newline="") as f:
+            for row in csv.DictReader(f):
+                if since is not None:
+                    try:
+                        dt = datetime.fromisoformat(row.get("timestamp", ""))
+                    except ValueError:
+                        continue
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    if dt < since:
+                        continue
+                try:
+                    total += float(row.get("duration_seconds") or 0.0)
+                except (TypeError, ValueError):
+                    continue
+    return total
+
+
+def _pump_store(tmp: Path) -> CalibrationStore:
+    return CalibrationStore(REPO_CAL, tmp / "experiments")
+
+
+def test_pump_cache_matches_the_uncached_scan() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        exps = tmp / "experiments"
+        _write_pump_log(exps / "e1" / "vial00_pump_log.csv", _pump_rows(50))
+        _write_pump_log(exps / "e1" / "vial03_pump_log.csv", _pump_rows(30, start=5))
+        _write_pump_log(exps / "e2" / "vial00_pump_log.csv", _pump_rows(20, start=60))
+        store = _pump_store(tmp)
+        for version in (None, "2026-07-01T060000Z", "2026-07-15T000000Z",
+                        "2020-01-01T000000Z"):
+            since = None if version is None else _parse_version(version)
+            want = _reference_pump_seconds(exps, since)
+            assert store.pump_seconds_since(version) == want, version
+            # ...and again, this time from the warm cache.
+            assert store.pump_seconds_since(version) == want, version
+
+
+def test_pump_cache_picks_up_appended_rows() -> None:
+    """The point of keying on size+mtime: an active run keeps appending."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        exps = tmp / "experiments"
+        path = exps / "e1" / "vial00_pump_log.csv"
+        _write_pump_log(path, _pump_rows(10))
+        store = _pump_store(tmp)
+        assert store.pump_seconds_since(None) == 120.0          # 10 x 12 s
+        _write_pump_log(path, _pump_rows(5, start=10), mode="a")
+        assert store.pump_seconds_since(None) == 180.0          # 15 x 12 s
+        assert store.pump_seconds_since(None) == _reference_pump_seconds(exps, None)
+
+
+def test_pump_cache_reparses_a_truncated_or_replaced_file() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        exps = tmp / "experiments"
+        path = exps / "e1" / "vial00_pump_log.csv"
+        _write_pump_log(path, _pump_rows(40))
+        store = _pump_store(tmp)
+        assert store.pump_seconds_since(None) == 480.0
+        _write_pump_log(path, _pump_rows(3))                    # rewritten shorter
+        assert store.pump_seconds_since(None) == 36.0
+
+
+def test_pump_cache_preserves_the_unparseable_timestamp_asymmetry() -> None:
+    """Pins behaviour that predates the cache: a row whose timestamp does not
+    parse IS counted by a since=None query and is NOT counted by a windowed
+    one. Both readings survive the rewrite."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        exps = tmp / "experiments"
+        path = exps / "e1" / "vial00_pump_log.csv"
+        _write_pump_log(path, _pump_rows(4) + [("not-a-timestamp", "7.00")])
+        store = _pump_store(tmp)
+        assert store.pump_seconds_since(None) == 55.0           # 4x12 + 7
+        windowed = store.pump_seconds_since("2020-01-01T000000Z")
+        assert windowed == 48.0                                 # the 7 s is skipped
+        assert windowed == _reference_pump_seconds(
+            exps, _parse_version("2020-01-01T000000Z")
+        )
+
+
+def test_pump_cache_ignores_a_half_written_final_row() -> None:
+    """`_append_row` writes one row at a time, but a read can still land
+    mid-flush. A partial tail must be left for the next call, not parsed as a
+    truncated record."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        exps = tmp / "experiments"
+        path = exps / "e1" / "vial00_pump_log.csv"
+        _write_pump_log(path, _pump_rows(5))
+        store = _pump_store(tmp)
+        assert store.pump_seconds_since(None) == 60.0
+        with path.open("a", encoding="utf-8", newline="") as f:
+            f.write("2026-07-02T00:00:00+00:00,0.0,influx,99")   # no line ending
+        assert store.pump_seconds_since(None) == 60.0            # still ignored
+        with path.open("a", encoding="utf-8", newline="") as f:
+            f.write(".00,0.5" + chr(13) + chr(10))
+        assert store.pump_seconds_since(None) == 159.0           # now counted
+
+
+def test_pump_cache_drops_entries_for_deleted_experiments() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        exps = tmp / "experiments"
+        _write_pump_log(exps / "e1" / "vial00_pump_log.csv", _pump_rows(5))
+        _write_pump_log(exps / "e2" / "vial00_pump_log.csv", _pump_rows(5))
+        store = _pump_store(tmp)
+        assert store.pump_seconds_since(None) == 120.0
+        assert len(store._pump_log_cache) == 2
+        shutil.rmtree(exps / "e2")
+        assert store.pump_seconds_since(None) == 60.0
+        assert len(store._pump_log_cache) == 1
+
+
+def test_pump_cache_handles_timestamps_that_go_backwards() -> None:
+    """A clock step would break the bisect, so the index flags itself unordered
+    and falls back to a linear sum rather than returning a wrong number."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        exps = tmp / "experiments"
+        path = exps / "e1" / "vial00_pump_log.csv"
+        _write_pump_log(path, _pump_rows(5, start=10) + _pump_rows(5))
+        store = _pump_store(tmp)
+        entry = store._pump_log_index(path)
+        assert entry["ordered"] is False
+        version = "2026-07-01T020000Z"
+        assert store.pump_seconds_since(version) == _reference_pump_seconds(
+            exps, _parse_version(version)
+        )
 
 
 if __name__ == "__main__":
