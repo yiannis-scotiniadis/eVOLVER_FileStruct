@@ -71,10 +71,22 @@ that tip. Once the liquid level reaches the tip, the pump draws **air**, and fur
 running removes nothing. So if efflux is run *longer* than strictly needed, working volume
 is pinned to the straw height on every dilution — a closed loop implemented in hardware.
 
+**Measured / set geometry, as of 2026-09-23:**
+
+| Constant | Value | Where it comes from |
+|---|---|---|
+| Vial capacity | **40 mL** (all 16) | the vials themselves |
+| Working volume | **25 mL** | the operator sets it by cutting the straw; currently 25 mL on every vial |
+| Dead space (headroom) | **15 mL** | capacity − working volume |
+
+So `volume_ml: 25.0` is no longer a guess — it is the straw height, deliberately set. Straw
+height is an **operator-set parameter, not a per-vial measured constant**: the straws are
+cut to a common target, so a scalar config value is correct and per-vial arrays are not
+needed. If someone re-cuts a straw, they change `volume_ml` to match.
+
 Consequences:
 
-- **Vial volume is a geometric constant you can set by cutting the straw**, not the
-  `volume_ml: 25.0` guess currently in the config.
+- **Vial volume is a geometric constant you set by cutting the straw.**
 - **With adequate overrun, liquid removed per dilution equals liquid added.** Waste
   accumulation is therefore `waste += influx_volume`, exactly. Computing it as
   `efflux_seconds × efflux_flow_rate` is wrong twice over: wrong rate, and it counts the
@@ -83,11 +95,18 @@ Consequences:
   integral of the influx/efflux flow mismatch, drifting monotonically until the vial
   overflows or runs dry. Nothing in software can observe this — there is no level sensor.
 
-`efflux_extra_seconds` is what engages the mechanism. It currently defaults to **0.0**
-(commit `a7b408a`, "live-validated default from eVOLVER-001"), which disables it. **Before
-changing that default back, establish why it was set to 0** — if the straw currently sits
-too deep, overrun over-drains; if the concern was foaming or aerosol from drawing air
-through culture, that bounds how much overrun is safe.
+`efflux_extra_seconds` is what engages the mechanism. The repo default is **0.0** (commit
+`a7b408a`, "live-validated default from eVOLVER-001"), which disables it. **That gate is now
+closed:** the operator has run the rig with **2.0 s** of overrun against a 25 mL straw and it
+behaves. The value belongs in the experiment config — and needs a wizard field, because the
+creation wizard has never written this key at all, which is why every wizard-created run
+silently inherited the 0.0 default.
+
+**The straw pins the steady state, not the transient.** A correct overrun restores the level
+*after* a dilution; it does nothing about how high the level climbs *during* one. That
+distinction is what caused a pilot run to overflow, and the mechanism is in the next section:
+the server issues influx and efflux as two separate frames, the firmware runs frames strictly
+one at a time, so nothing drains for the whole influx phase. See `FLUIDICS_FIRMWARE_AUDIT.md`.
 
 Do **not** try to fix volume drift by computing a balancing efflux duration in software.
 `t_efflux = (F_in × t_in) / F_out` is generally non-integer, and the firmware accepts whole
@@ -124,19 +143,49 @@ All communication goes through /dev/ttyAMA0 at 9600 baud. The exp_manager (evolv
 
 The exp_manager parses responses by checking: `response[:4] == prefix` and `response[-3:] == 'end'`, then extracts the data as `response[4:-3]`.
 
-Stir and fluidics are write-only on the active code path — Arduinos may acknowledge but the exp_manager never reads a response for these. (A `Fluidic_status()` function exists in `evolver_UPD.py` but is only called from a commented-out "without queue" branch.)
+Stir and fluidics are write-only. **Measured 2026-09-23: the fluidics Arduino never transmits
+anything at all** — no receipt ack, no completion ack, and no reply to the `re !` readiness
+poll either idle or mid-pump. The `Fluidic_status()` function in `evolver_UPD.py` greps a
+reply for `'ready'`; it is called only from a commented-out branch, and now we know why — it
+never worked. `rpi_original/extras/pump_rs485.py` prints `"Completed Command:" + received`
+after a `readline()` with `timeout=1`, so that print was always empty.
 
 ### Fluidics sub-protocol
 
-The `st` address prefix is a namespace; the first character of the payload selects one of three sub-modes. Only `mac_original/` actually writes these — the legacy single-fire form is the only one that turbidostat experiments use.
+The `st` address prefix is a namespace; the first character of the payload selects a sub-mode.
+**Measured on the bench 2026-09-23 — `FLUIDICS_FIRMWARE_AUDIT.md` has the full protocol, the
+evidence for each claim, and what is still unmeasured.**
 
-| Sub-mode             | Wire format                                                   | Used by                                          |
-|----------------------|---------------------------------------------------------------|--------------------------------------------------|
-| Single fire          | `st<binary_pump_code>,0,<seconds>, !`                         | `custom_script.py` turbidostat (line 112)        |
-| Stop / multi-fire    | `stt,<32-bit pump mask>,<time0>,<time1>,…,<time15>, !`        | `eVOLVER_module.stop_all_pumps` (line 199)       |
-| Chemostat (rates)    | `stc,<rate0>,…,<rate15>,<bolus>, !`                           | `eVOLVER_module.update_chemo` (lines 92–101)     |
+| Sub-mode          | Wire format                                     | Status on this rig |
+|-------------------|-------------------------------------------------|--------------------|
+| Single fire       | `st<binary_pump_code>,0,<seconds>, !`           | **The only working form.** Fires every pump in the mask *simultaneously* for the commanded whole seconds. |
+| `t` sub-mode      | `stt,<32-bit pump mask>,<time0>,…,<time15>, !`  | **INERT — fires nothing and stops nothing.** Was documented here as "Stop / multi-fire"; both halves were inferences from the frame's shape and both are false (audit FW-10, FW-11). `eVOLVER_module.stop_all_pumps` and `SerialManager.stop_all_pumps()` both send this frame, so **neither stops anything.** |
+| Chemostat (rates) | `stc,<rate0>,…,<rate15>,<bolus>, !`             | Untested. Legacy `eVOLVER_module.update_chemo` (lines 92–101); not implemented in the current server. |
 
-Note: `extras/pump_rs485.py` also sends a bare `st !` between commands; its meaning isn't documented in the legacy and the Arduino firmware source is not available, so treat it as undefined behaviour.
+The measured firmware model, in one paragraph:
+
+> Frames are **queued** and executed **one at a time, in order, to completion**. Each frame
+> runs **every pump in its mask concurrently** (verified to 14 pumps at full speed) for
+> **exactly** the commanded whole seconds — no startup lag, no clamp. Durations are
+> **additive** across frames on the same pump. The firmware **never preempts, never transmits
+> anything, and cannot be stopped.**
+
+Three consequences for any new work:
+
+1. **`st<mask>,0,<sec>,` can fire influx and efflux together** by OR-ing both bits, exactly as
+   `mac_original/custom_script.py:114` did. `SerialManager.pump_command(vial, direction, …)`
+   cannot express this — it sets one bit — so the current server issues two frames that
+   *serialise*, and **nothing drains during the influx phase**. That is the vial-overflow
+   mechanism, and the 2016 client was safer here than the port.
+2. **There is no software stop.** The only real emergency stop is cutting power to the
+   auxiliary pump board. Command duration *is* the exposure window, which makes every
+   duration cap a safety parameter.
+3. **Because one frame drives any mask concurrently and durations are additive**, any
+   piecewise-constant pump schedule is expressible as a sequence of frames, at a bus cost of
+   the schedule's *span* rather than the sum of its durations (audit §4.2).
+
+Note: `extras/pump_rs485.py` also sends a bare `st !` between commands. It elicits no reply
+(the fluidics Arduino never transmits) and its meaning remains undocumented.
 
 ## Current software architecture (being replaced)
 
@@ -331,7 +380,7 @@ processes, owns `/dev/ttyAMA0` directly, and serves the dashboard at
 
 | Subsystem | Status | Where |
 |---|---|---|
-| Flask + socketio server, 10 s sensor loop, watchdog, shutdown handler | Built | `server/app.py`, `watchdog.py` |
+| Flask + socketio server, 10 s sensor loop (two-lane capable), watchdog, shutdown handler | Built | `server/app.py`, `watchdog.py` |
 | `SerialManager` + `MockSerialManager` (`--mock` runs with no hardware) | Built | `server/serial_manager.py`, `mock_serial_manager.py` |
 | Dashboard, 4×4 vial grid, per-vial modal with uPlot charts | Built | `frontend/templates/index.html` (single file) |
 | Manual controls (temperature in °C, stir, pump, emergency stop) | Built | `/api/actuators/*` |
@@ -376,6 +425,12 @@ backup, vial groups, multi-phase protocols, and authentication.
   meeting; triages every outstanding feature by urgency, utility, and difficulty, and
   records which items were deliberately deferred and why.
 - `SPEC.md` — technical specification. §15–§25 cover the subsystems listed as not-yet-built.
+  §16.3 is the overflow-safe delivery design.
+- `FLUIDICS_FIRMWARE_AUDIT.md` — **what the 2016 fluidics firmware actually does**, measured
+  on the bench 2026-09-23. Thirteen numbered facts with the test behind each, what they break
+  in the current codebase, and the design that follows. Read it before touching anything that
+  fires a pump. It supersedes inference from `mac_original/` and `rpi_original/`, two claims
+  of which turned out to be wrong.
 - `SESSION_MASTER_PLAN.md` — the original Session A–J plan. A/B/C/F/G are built; read the
   status header at the top before following any of its prompts.
 - `GROWTH_RATE_METHOD.md` — the growth-rate estimator: what the algorithm is, what was
@@ -386,9 +441,14 @@ backup, vial groups, multi-phase protocols, and authentication.
   chemostat (Aug 2026). All findings fixed as of 2026-08-21 except the `efflux_extra_seconds`
   bench decision (X-1, warning only) and the washout detector (C-5, deferred); the document
   is kept as the record of what was wrong.
-- `DEPLOY.md` — operator runbook for the RPi.
+- `DEPLOY.md` — operator runbook for the RPi: hardware validation, the pilot procedure,
+  update-by-tag and rollback, day-to-day operations.
+- `SETUP_FROM_SCRATCH.md` — building the Pi's SD card from a freshly flashed headless OS:
+  harvesting the old card, static IP on NetworkManager, the `disable-bt` UART configuration
+  and how to verify `/dev/ttyAMA0` is the PL011, restoring the state git does not carry,
+  Tailscale identity, and which parts of `DEPLOY.md` Phase 4 a rebuild may skip.
 
-### Six facts worth carrying into any new work
+### Nine facts worth carrying into any new work
 
 1. **`xr` is a closed-loop setpoint, not a PWM, and the slope is negative.** The Arduino
    already closes the temperature loop. `xr=0` requests ~82 °C. See the Testing warning
@@ -411,8 +471,11 @@ backup, vial groups, multi-phase protocols, and authentication.
    `run_cycle` must keep calling `decide()` for it even when OD is NaN or out of range —
    out-of-range means the culture is *denser* than the calibration covers, i.e. exactly when
    dilution must not stop. It sizes every bolus from elapsed wall time, never the nominal
-   interval, because the sensor loop's real period is `max(10 s, work)` and can only run
-   slow. It keeps a deficit accumulator, correctly, because what it accumulates is a
+   interval, because the sensor loop's real period is `max(tick, work)` and can only run
+   slow. Its `bolus_interval_seconds` must be **>= the control interval** (currently
+   10 s) — `decide()` is only called on an OD tick, so a shorter interval is not honoured
+   and every bolus clips against a cap sized from the nominal interval
+   (`validate_control_parameters` rejects it). It keeps a deficit accumulator, correctly, because what it accumulates is a
    per-interval increment. The turbidostat is the mirror image on all four counts. See
    `SPEC.md` §9 and `CONTROL_MODE_AUDIT.md`.
 
@@ -451,6 +514,69 @@ backup, vial groups, multi-phase protocols, and authentication.
    column in `vialNN_OD.csv` — `data_export.py` has no schema marker, so a positional
    parser (the lab's own scripts included) breaks silently on an inserted column.
 
+7. **Everything is on one 10 s cycle, and the stirrers never stop — but the loop is
+   two-lane *capable*, and that capability is a safety property.** `app.py` currently sets
+   `OD_EVERY_N_TICKS = 1`, so temperature and OD are read on the same tick and control
+   decides on it. `OD_SETTLE_SECONDS` must be **0**; `configure_cadence` rejects anything
+   else, because the settle has no implementation and the only way to honour one today
+   would be to block the sensor thread — which stalls the *temperature* lane too.
+
+   The decimation machinery is kept because slowing OD down is still wanted: it is what
+   buys time to stop the stirrers and let the vortex settle. If you raise
+   `OD_EVERY_N_TICKS`, know the four things that come with it:
+
+   - **Never slow the base tick instead.** Over-temperature is the one real-time guarantee
+     *not* delegated to firmware; `_handle_heater_safety_locked` needs three consecutive
+     over-critical reads, so detection latency is `3 x the FAST lane's period`. A flat 60 s
+     loop takes that from 30 s to **3 minutes**, on a rig where `xr=0` requests ~82 °C.
+     Temperature, heater safety, bus/sleeve health, the watchdog pet, the dashboard
+     broadcast and the growth recompute all belong on the fast lane.
+   - **`growth_rate.py`'s span constants are tuned to the OD cadence and must move with
+     it.** Measured: the cadence change alone cost 2.6× in μ dispersion until
+     `PREFERRED_FIT_SPAN_SECONDS` / `MIN_SAMPLES` / `HISTORY_WINDOW_SECONDS` were
+     re-derived. `MIN_FIT_SPAN_SECONDS` must *not* be raised past `pump_wait - 60` or fast
+     growers report no μ at all. See `GROWTH_RATE_METHOD.md` §5.1–5.2 and re-run
+     `server/verify_cadence_growth.py`.
+   - **Per-cycle counters are already split per lane** (`_temp_nan_streak`/`_od_nan_streak`,
+     `VialHealth._temp_dropped`/`_od_dropped`) — a fused counter lets the fast lane reset
+     the slow lane's streak before it can reach its threshold.
+   - **`sensor_update` re-sends the last OD on fast ticks**, so anything plotting it must
+     key off `msg.od.timestamp`, never `msg.timestamp`, or one real sample lands as N
+     identical points.
+
+   And before the stirrers actually stop: `_resend_stir_locked` re-sends stir every base
+   tick and would switch them back on mid-settle, and the OD calibration and per-run blank
+   were both taken with stir *on* — reading with it off reproduces the known "raw OD below
+   the dark floor → NaN" failure. `_acquire_od`'s docstring carries the full list.
+8. **The fluidics firmware queues frames, runs them one at a time, and cannot be stopped.**
+   Measured 2026-09-23, full evidence in `FLUIDICS_FIRMWARE_AUDIT.md`. Each frame drives
+   **every pump in its mask concurrently** (verified to 14 pumps at full speed) for
+   **exactly** the commanded whole seconds; durations are **additive** across frames on the
+   same pump; nothing preempts; the Arduino never transmits. Three consequences that bite
+   immediately:
+
+   - **`SerialManager.pump_command(vial, direction, seconds)` cannot express a combined
+     influx+efflux frame** — it sets one bit. So the server issues two frames that
+     *serialise*, nothing drains during the influx phase, and the level rises by the whole
+     bolus. That is the vial-overflow mechanism, and `mac_original/custom_script.py:114`
+     did it correctly with one OR'd mask.
+   - **`stop_all_pumps()` is inert.** It does not halt a running pump and does not flush the
+     queue; no frame shape tested stops anything. `emergency_stop`,
+     `watchdog.emergency_shutdown` and `_zero_experiment_actuators_locked` all rely on it.
+     The only real stop is cutting power to the aux pump board (`DEPLOY.md`). **Command
+     duration is the exposure window**, which makes every duration cap a safety parameter.
+   - **Any piecewise-constant pump schedule is expressible** as a sequence of frames, at a
+     bus cost of the schedule's *span* rather than the sum of its durations (`SPEC.md`
+     §16.3.3). This is what keeps 16-vial fluidics inside the control cycle.
+
+9. **Do not inject a fluidics frame into an open request-response transaction.** The bus is
+   half-duplex and shared. A pump frame sent between an `xr`/`we` request and its
+   `temp…end` / `turb…end` reply corrupts both — the read NaNs out **and** the pump command
+   is lost. This is the failure the eVOLVER community documents as "dropped fluidic
+   commands" and a candidate cause of this rig's NaN storms. Any threaded fluidics executor
+   must hold the `SerialManager` lock across the whole transaction, not just the write.
+
+
 ## Technical constraints
 
 - RPi runs Python 2.7 (Raspbian). The new server should use Python 3 if available, falling back to Python 2.7 if needed. Check with `python3 --version`.
@@ -487,7 +613,7 @@ python3 app.py  # or python app.py
 - Stir: send address `zv` + 16 comma-separated PWM values + ` !`. Values 0-15 typical. 0=off (this one really is a raw PWM).
 - Temperature: send address `xr` + 16 setpoint integers + ` !`. Practical operating range ≈ 400 (≈ 37 °C) to 700 (≈ 14 °C); 4095 = off; 0 = drive heater to ~82 °C (avoid). Read response with prefix `temp` (16 raw thermistor ADC values).
 - OD: send address `we` + 16 LED power values + ` !`. 2125 is standard. Read response with prefix `turb` (16 raw photodiode ADC values).
-- Fluidics: send address `st` + pump binary code + ` !`. Verify water flows. See "Fluidics sub-protocol" for the three command sub-modes.
+- Fluidics: send address `st` + pump binary code + ` !`. Verify water flows. OR bits together to run several pumps at once (influx vial N = bit N, efflux vial N = bit N+16). See "Fluidics sub-protocol"; only the single-fire form works, and there is **no way to stop a running pump** — bench with lines looped into one water beaker so nothing can overflow or run dry.
 - All 16 vials have been hardware-verified as functional (stir, temp, OD, fluidics all pass).
 
 ## Repository structure
@@ -497,6 +623,7 @@ eVOLVER_FileStruct/
   CLAUDE.md                  # This file — hardware facts and serial protocol
   SPEC.md                    # Technical specification (§15-§25 = planned subsystems)
   ROADMAP.md                 # Current prioritised work plan (Aug 2026 lab meeting)
+  FLUIDICS_FIRMWARE_AUDIT.md # Measured fluidics firmware behaviour (bench, Sep 2026)
   SESSION_MASTER_PLAN.md     # Original Session A-J plan; see its status header
   DEPLOY.md                  # RPi operator runbook
 
@@ -531,7 +658,8 @@ eVOLVER_FileStruct/
     growth_rate.py           # SPEC §17 growth estimation — pure, I/O-free, no engine imports
     replay_growth.py         #   replay a logged run through the estimator (read-only)
     verify_growth_rate.py    #   accuracy report + `--generate` for the 1x-time fixtures
-    bench_growth_rate.py     #   RUN ON THE PI: growth-service cost vs the 10 s tick budget
+    bench_growth_rate.py     #   RUN ON THE PI: growth-service cost vs the base tick budget
+    verify_cadence_growth.py #   before/after accuracy of mu at the 10 s vs 60 s OD cadence
     bench_read_paths.py      #   RUN ON THE PI: get_data / export / staleness read costs
     data_logger.py           # Per-vial CSV writers
     data_export.py           # ZIP bundles, filtering

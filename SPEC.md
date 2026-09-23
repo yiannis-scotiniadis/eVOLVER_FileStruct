@@ -565,12 +565,17 @@ GET  /api/growth_rate                       # §17 — current per-vial estimate
 
 ## 7. WebSocket events
 
-Real-time data pushed from server to all connected browsers every 10 seconds.
+Real-time data pushed from server to all connected browsers every tick (10 s).
+The OD block carries its own `od.timestamp` / `od.age_seconds`, and the payload carries
+an `intervals` block, so clients derive staleness thresholds rather than hardcoding a
+cadence — these matter only if the OD lane is decimated (§9), but are always present.
+The server also pushes the last cached payload to a socket on connect, and serves it from
+`GET /api/sensors/latest` (no serial I/O), so a page load paints immediately.
 
 ### Server -> Client
 
 ```javascript
-// Live sensor update (every 10 seconds)
+// Live sensor update (every 10 s; od.* refreshes on the OD lane's own cadence)
 socket.emit('sensor_update', {
     timestamp: "2026-05-12T14:30:00",
     temperature: {
@@ -744,7 +749,9 @@ figures above are from an x86 box and SD-card I/O does not extrapolate.
 
 ### Main loop
 
-Runs in a background thread, ticking every 10 seconds:
+Runs in a background thread, ticking every 10 seconds. The loop is two-lane capable
+(a fast safety lane and an optionally-decimated OD lane, `app.py OD_EVERY_N_TICKS`),
+but both currently run at 10 s and the stirrers are never stopped:
 
 ```
 every 10 seconds:
@@ -1519,14 +1526,156 @@ Consequences once overrun is engaged:
   `ln(1 + vᵢ/V)` written here previously is the bolus-add-then-overflow factor and reads
   9–15 % low at a typical 5–8 mL bolus.)
 
-**Current state and the open gate.** `efflux_extra_seconds` defaults to **0.0** across all
-three control modes (commit `a7b408a`, "live-validated default from eVOLVER-001"), which
-disables the mechanism entirely and makes level an open-loop integral of flow mismatch —
-undetectable in software, since there is no level sensor. **Establish why it was set to 0
-before restoring it**: if the straw currently sits too deep, overrun over-drains and the
-straw must be re-cut first; if the concern was foaming or aerosol from drawing air through
-culture, that bounds the safe overrun. This is a bench question, not a code question, and
-it gates `ROADMAP.md` Sessions K and L.
+**Gate closed, 2026-09-23.** The bench question is answered. The operator runs **2.0 s** of
+overrun against a straw cut for a **25 mL** working volume in a **40 mL** vial, leaving
+**15 mL** of dead space. Straw height is an operator-set parameter, not a per-vial measured
+constant — a scalar `volume_ml` is correct and per-vial arrays are unnecessary.
+
+The repo default remains `DEFAULT_EFFLUX_EXTRA_SECONDS = 0.0`. It should stay there (commit
+`a7b408a` was live-validated and should not be silently reverted); the value belongs in the
+experiment config instead. **The creation wizard has never written this key**
+(`frontend/templates/index.html`), which is why every wizard-created run inherited 0.0 and
+ran with volume regulation disengaged. Adding that field is part of §16.3.
+
+**What the straw does not do.** It pins the level *after* a dilution. It has no effect on how
+high the level climbs *during* one. That transient is what overflowed a pilot run, and it is
+a protocol-level problem rather than a fluidics-tuning one — see §16.3.
+
+### 16.3 Overflow-safe delivery
+
+**Status:** designed, not built. Firmware behaviour measured 2026-09-23; full evidence in
+`FLUIDICS_FIRMWARE_AUDIT.md`, which this section summarises.
+
+#### 16.3.1 The firmware model
+
+> Frames are **queued** and executed **one at a time, in order, to completion**. Each frame
+> runs **every pump in its mask concurrently** (verified to 14 pumps at full speed) for
+> **exactly** the commanded whole seconds — no startup lag, no clamp. Durations are
+> **additive** across frames on the same pump. The firmware **never preempts, never transmits
+> anything, and cannot be stopped.**
+
+#### 16.3.2 The overflow mechanism
+
+`SerialManager.pump_command(vial, direction, seconds)` sets one mask bit. `app.py`'s
+`_execute_pump_actions` therefore issues **two** frames per dilution — influx, then efflux —
+where `mac_original/custom_script.py:114` issued **one** frame with both bits OR'd. Because
+frames serialise, the efflux frame does not begin until the influx frame has finished.
+**Nothing drains during the influx phase**, so the level rises by the entire influx volume
+before a drop leaves the vial. At the 20 s controller cap and the maximum default flow rate
+that is 23 mL into 15 mL of dead space.
+
+The 2016 client was safer here than the port. Restoring the combined frame is the primary
+fix.
+
+#### 16.3.3 Schedule decomposition
+
+Because one frame drives any mask concurrently and durations are additive, **any
+piecewise-constant pump on/off schedule is expressible as a sequence of frames.** Split the
+schedule at every breakpoint; each interval becomes one frame whose mask is the set active
+during it. Bus cost is the schedule's **span**, not the sum of its durations:
+
+```
+efflux0 for 19 s; efflux1 starting at t=2 for 5 s
+
+  [0,2)   {0}     frame mask{eff0},      2 s
+  [2,7)   {0,1}   frame mask{eff0,eff1}, 5 s
+  [7,19)  {0}     frame mask{eff0},     12 s     -> 19 s of bus, not 24
+```
+
+N vials needing different durations cost `max(durations)`, not `sum(durations)` — the
+difference between fluidics fitting inside the 60 s control cycle and overrunning it.
+
+**Inter-frame gap: deliberately not compensated.** Each frame boundary carries a small pause
+and a pump start/stop transient. Neither was quantified; the decision (2026-09-23, operator)
+is to proceed without correction and accept the resulting bias in delivered volume. If
+post-run mass reconciliation (§19.4) starts showing a systematic shortfall that scales with
+frame count, this is the first thing to measure.
+
+#### 16.3.4 Headroom planner
+
+Stateless by design — **no per-vial liquid-level integrator, ever.** Each event assumes the
+level starts at the working volume, which the drain window at the end of the previous event
+is what makes true.
+
+```
+headroom_ml  = vial_capacity_ml − volume_ml − overflow_margin_ml
+peak_rate    = F_in − efflux_credit
+chunk_max_s  = floor(headroom_ml / peak_rate)
+n_frames     = ceil(requested_influx_s / chunk_max_s)
+```
+
+With the rig's geometry (40 / 25 / 2 mL margin → **13 mL headroom**) and zero efflux credit:
+
+| F_in (mL/s) | chunk_max_s | Frames for a 20 s bolus |
+|---|---|---|
+| 0.85 | 15 s | 2 |
+| 1.00 | 13 s | 2 |
+| 1.15 | 11 s | 2 |
+
+So the worst case is **two frames**, not the three-plus assumed before the geometry was
+known. Once a complete 32-pump calibration including efflux rates exists, crediting efflux
+collapses the peak to `(F_in − F_out) · t` and splitting stops being needed at all.
+
+> **The efflux-credit trap.** Default the credit to **zero** unless a calibration with real,
+> distinct efflux rates is installed. Where influx and efflux rates are broadcast from one
+> 16-value array, `F_efflux` is a literal copy of `F_influx`, so crediting it computes a
+> mismatch of exactly zero — and does so *because the numbers are not independent
+> measurements*.
+
+**Config schema** — two new keys in experiment `parameters`, both scalar-or-16 via the
+existing `_as_list_of_16`:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `vial_capacity_ml` | `None` = protection disabled, warned at create and start | physical capacity; 40.0 on this rig |
+| `overflow_margin_ml` | `2.0` | safety band below capacity |
+
+`volume_ml` keeps its meaning as the straw-pinned working volume and stays scalar (§16.2). Do
+**not** add a second `working_volume_ml` key — two sources of truth for one number.
+
+#### 16.3.5 There is no software stop
+
+`SerialManager.stop_all_pumps()` sends the `t`-sub-mode frame, which is inert: it does not
+halt a running pump, does not flush the queue, and a zero-duration frame does nothing either.
+`emergency_stop`, `watchdog.emergency_shutdown` and
+`ExperimentEngine._zero_experiment_actuators_locked` all rely on it and all currently claim a
+guarantee the hardware does not provide.
+
+What the software can offer instead:
+
+- **Bounded-latency stop.** Exposure equals the duration of the frame already on the wire.
+  Issuing each bolus as a train of short frames makes "stop" mean *stop enqueuing*, with
+  worst-case latency equal to the frame cap.
+- **Firmware queue depth ≤ 1.** The executor holds work in its own queue and dispatches one
+  frame at a time. Cancelling the server-side queue is then a near-real stop with a residual
+  of one frame. The firmware will happily buffer 15+ frames — the point of knowing that is to
+  stay below it.
+- **The real fix is hardware**: a relay on the auxiliary pump board's supply rail driven from
+  a Pi GPIO, plus a physical E-stop in series. See `DEPLOY.md`.
+
+#### 16.3.6 Executor requirements
+
+- Dedicated thread. **Not** the sensor loop — it carries heater safety on the 10 s lane and
+  must never block (§7.1).
+- **Hold the `SerialManager` lock across whole request-response transactions**, not just the
+  write, and stay out of the OD acquisition window. A fluidics frame injected between an
+  `xr`/`we` request and its `temp…end`/`turb…end` reply corrupts both: the read NaNs out *and*
+  the pump command is lost. This is the failure the eVOLVER community documents as "dropped
+  fluidic commands" and is a candidate cause of this rig's NaN storms.
+- One delivery in flight per vial; `run_cycle` skips `decide()` for a vial already delivering.
+  Both built-in modes absorb this unchanged — the chemostat sizes from actual elapsed time,
+  the turbidostat re-derives an absolute correction from fresh OD.
+- Cancel on emergency stop, watchdog trip, heater-safety park, `stop_experiment`,
+  `enter_maintenance`. With no hardware stop, **queue cancellation is the stop**.
+- Persist in-flight deliveries to `state.json`; on resume do **not** continue them — queue one
+  normalisation efflux per affected vial instead.
+
+#### 16.3.7 Coupled change: waste accounting
+
+`_debit_media_locked` books waste as `(pump_time + efflux_extra) × F_influx`. Any multi-frame
+scheme inflates total efflux seconds and therefore the waste books, driving runs into false
+`consumables` maintenance. Waste must become `waste += influx_ml` (§16.2) **in the same
+commit**, not as a later cleanup.
 
 ---
 
@@ -1536,8 +1685,18 @@ it gates `ROADMAP.md` Sessions K and L.
 holds the estimator; `ExperimentEngine` owns the timestamped OD history and the dilution
 boundaries; output reaches `status()`, the `sensor_update` payload, `GET /api/growth_rate`,
 and a per-vial `vialNN_growth.csv`. Covered by `server/test_growth_rate.py`, with
-`server/verify_growth_rate.py` as the readable measurement report and
-`server/replay_growth.py` for replaying a logged run.
+`server/verify_growth_rate.py` as the readable measurement report,
+`server/replay_growth.py` for replaying a logged run, and
+`server/verify_cadence_growth.py` for the before/after accuracy of μ at the 10 s
+versus 60 s OD cadence.
+
+> **Retuned for the 60 s OD lane.** The service was built against a 10 s OD cadence.
+> When OD acquisition moved to the slow lane (§7, CLAUDE.md fact 7) four constants were
+> re-derived against ground truth rather than left to drift: `PREFERRED_FIT_SPAN_SECONDS`
+> 1800 → 3600, `MIN_SAMPLES` 30 → 10, `HISTORY_WINDOW_SECONDS` 3 h → 6 h, and
+> `MIN_FIT_SPAN_SECONDS` re-justified and deliberately **kept** at 600. See
+> `GROWTH_RATE_METHOD.md` §5.1–§5.2 for the measurements. The numbers below are the
+> current ones.
 
 > **The design document is `GROWTH_RATE_METHOD.md`.** It states the source algorithm, what
 > was measured about it, what was deliberately not ported, and why. This section is the
@@ -1575,8 +1734,21 @@ hi = od_upper_thresh[vial] * 1.5
 
 The window is likewise specified as a **duration**, not a sample count. The notebook's
 8 samples is 2 h at a plate reader's 15 min cadence and 80 s at eVOLVER's — measured at
-64–339 % μ error. `MIN_FIT_SPAN_SECONDS` is 600 (sd 2.4–11.6 %) and
-`PREFERRED_FIT_SPAN_SECONDS` 1800 (sd 0.4–2.2 %).
+64–339 % μ error. `MIN_FIT_SPAN_SECONDS` is 600 and `PREFERRED_FIT_SPAN_SECONDS`
+3600.
+
+`MIN_FIT_SPAN_SECONDS` stayed at 600 across the cadence change even though that is only
+ten samples at 60 s (sd 5.8–30.8 %, against 2.4–11.6 % at 10 s). It is bounded above by
+the control config, not by taste: a turbidostat segment can never outlast `pump_wait`
+(default 900 s) and `POST_DILUTION_SKIP_SECONDS` takes 60 s off the front of it, so any
+value above ~840 s rejects every segment a default run produces and the service reports
+nothing for the whole run. `PREFERRED_FIT_SPAN_SECONDS` went 1800 → 3600 instead: 30 min
+is 31 samples at 60 s (sd 1.0–5.3 %) where it was 181 at 10 s (0.4–2.2 %), and 60 min
+restores the old quality (0.3–1.7 %). It costs nothing on short segments because the
+window is clamped to the segment span. `MIN_SAMPLES` went 30 → 10 for the same reason:
+30 samples is *30 minutes* at 60 s, which would have silently overridden both
+`MIN_FIT_SPAN_SECONDS` and `MAX_MISSING_FRACTION`. Read `span_seconds` and `n_points`
+off the estimate rather than assuming the floor is good enough.
 
 **What the window search actually buys is transient rejection, not accuracy.** Inside a
 clean segment it is mildly harmful — it selects the luckiest noise realisation and pays
@@ -1661,8 +1833,12 @@ one.
   r_squared,windows_searched,fit_span_s,fit_od_start,fit_od_end,flags
   ```
 
-  Written at the engine's 60 s recompute cadence, not the 10 s sensor tick. `flags` is
-  **pipe-separated**, because `data_export`'s readers split on commas.
+  Written at the engine's 60 s recompute cadence, on the 10 s **base** tick rather than
+  the 60 s OD tick — the recompute reads the engine's own timestamped OD history, never a
+  fresh sample, and riding the OD tick would spread sixteen vials over six OD ticks and
+  stretch each vial's refresh to six minutes. Now that OD acquisition is itself on a 60 s
+  cadence this file is one row per OD row; before the cadence change it was ~1/6 of the OD
+  file. `flags` is **pipe-separated**, because `data_export`'s readers split on commas.
 
   `vialNN_OD.csv`'s header is deliberately untouched. `data_export.py` carries no version
   or schema marker at all, so any positional parser — including the lab's own analysis
@@ -1685,8 +1861,10 @@ on the target. Three things follow, and none of them are optional:
 
 1. **The window search is O(1) per candidate, not O(window).** Up to
    `MAX_WINDOW_CANDIDATES` heavily overlapping windows are evaluated per segment.
-   Refitting each from scratch measured **55 ms per vial** for a full 3 h history — which
-   extrapolates to seconds per vial on a Pi 1, i.e. a stalled tick. Prefix sums over
+   Refitting each from scratch measured **55 ms per vial** for a full 3 h history at the
+   old 10 s OD cadence — the densest series this ever held, and a third more samples than
+   the current 6 h history at 60 s, so it remains the worst case. That extrapolates to
+   seconds per vial on a Pi 1, i.e. a stalled tick. Prefix sums over
    recentred time reduce it to **5.4 ms per vial**, and inlining the per-sample
    finiteness tests (below) to **3.9 ms**. Time is recentred first because
    differencing prefix sums is a cancelling subtraction and epoch seconds square past 2⁵³.
@@ -1694,7 +1872,7 @@ on the target. Three things follow, and none of them are optional:
    path only ever chooses *which* samples to fit and every reported number comes from
    `fit_log_linear`.
 2. **The sixteen vials are staggered across ticks**, `ceil(16/6) = 3` per tick, on per-vial
-   due times rather than a group counter — the loop's period is `max(10 s, work)` and a
+   due times rather than a group counter — the loop's period is `max(tick, work)` and a
    counter would silently stretch the refresh interval on a loaded box.
 3. **The per-sample filters carry no function call.** `_is_finite` was called
    ~16 700 times per tick across the sample filters. NaN compares False against
@@ -1706,8 +1884,11 @@ on the target. Three things follow, and none of them are optional:
    0.7 ms per tick here and ~30 ms on the Pi, for a value that changes once a minute.
    `GrowthReport` is frozen, so the dict is built once per recompute.
 
-Retained history is ~1.5 MB for 16 vials × 3 h, which is comfortable even on a 512 MB
-Pi 1 B.
+Retained history is ~0.5 MB for 16 vials × `HISTORY_WINDOW_SECONDS`, which is comfortable
+even on a 512 MB Pi 1 B. The window was widened 3 h → **6 h** with the 60 s OD lane so a
+`PREFERRED_FIT_SPAN_SECONDS` window still has somewhere to live alongside a couple of
+segment boundaries; memory nonetheless *fell*, because 6 h at 60 s is 360 samples per vial
+against 1080 at 10 s.
 
 **Do not extrapolate these figures to the Pi by guessing a factor.** Run
 `server/bench_growth_rate.py` on the actual machine; it reports a scalar-throughput

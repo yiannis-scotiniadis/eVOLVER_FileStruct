@@ -25,7 +25,7 @@ Reading the tree rather than the plan, the following is **built and in `main`**:
 
 | Subsystem | Status | Where |
 |---|---|---|
-| Flask + socketio server, 10 s sensor loop | Built | `server/app.py` |
+| Flask + socketio server, 10 s sensor loop (two-lane capable) | Built | `server/app.py` |
 | SerialManager + MockSerialManager + Watchdog | Built | `server/serial_manager.py`, `mock_serial_manager.py`, `watchdog.py` |
 | Dashboard, 4×4 vial grid, per-vial modal with OD/temp plots | Built | `frontend/templates/index.html` (single file, ~160 kB) |
 | Manual controls: temperature (°C), stir, pump, emergency stop | Built | `app.py` `/api/actuators/*` |
@@ -169,6 +169,51 @@ that; Session AB does true concurrency only if groups prove insufficient.
 ## 3. P0 — Prototype blockers
 
 These gate the next unattended run and the handoff to other lab members.
+
+### Session AF — Overflow-safe fluidics delivery ← **CURRENT PRIORITY**
+
+**STATUS: designed, not built.** Firmware behaviour measured on the bench 2026-09-23;
+evidence in `FLUIDICS_FIRMWARE_AUDIT.md`, specification in `SPEC.md` §16.3. All bench
+questions are closed — **no wet-lab work remains**.
+
+*Priority: P0, above everything else in this section. Effort: MEDIUM–HEAVY. Depends on:
+nothing.*
+
+**Why it is now first.** A pilot run overflowed vials. The cause was measured and is not
+what anyone assumed: the fluidics firmware executes command frames **strictly one at a
+time**, and the server issues influx and efflux as **two separate frames**, so nothing drains
+for the entire influx phase. The level rises by the whole bolus — up to 23 mL into 15 mL of
+dead space. The 2016 client fired a single frame with both bits OR'd and was therefore safer
+here than the port that replaced it.
+
+**Scope, in dependency order:**
+
+1. **Emergency-stop honesty (safety, do first).** `stop_all_pumps()` is inert — it does not
+   halt a running pump, does not flush the queue, and no frame shape tested stops anything.
+   `emergency_stop`, `watchdog.emergency_shutdown` and `_zero_experiment_actuators_locked` all
+   rely on it. Redocument, fix the dashboard copy, and keep the physical power-cut procedure
+   now in `DEPLOY.md` current. Recommend the GPIO relay + inline E-stop on the aux pump rail.
+2. **Mask-level serial API.** `pump_mask_command(mask, seconds)` and `pump_pair_command(vial,
+   seconds)` on `SerialManager` and `MockSerialManager`; `pump_command` stays as a wrapper so
+   manual pumping and the calibration wizard are untouched.
+3. **`server/fluidics.py`** — pure, I/O-free planner: schedule decomposition (§16.3.3) plus
+   the stateless headroom planner (§16.3.4). No per-vial level integrator, ever.
+4. **Executor thread** — one frame in flight, firmware queue depth ≤ 1, holds the
+   `SerialManager` lock across whole transactions, cancels on every stop path.
+5. **Engine integration** — `vial_capacity_ml` / `overflow_margin_ml` config keys, `run_cycle`
+   gating, dilution-boundary span, state persistence.
+6. **Waste-formula fix** — `waste += influx_ml`. **Coupled, same commit**: any multi-frame
+   scheme inflates efflux seconds and drives runs into false `consumables` maintenance.
+7. **Wizard fields** — vial capacity, overflow margin, and `efflux_extra_seconds`, which the
+   wizard has **never** written, so every wizard-created run silently ran with volume
+   regulation disengaged.
+
+**Geometry is settled:** 40 mL vials, straws cut for a 25 mL working volume, 2.0 s overrun,
+13 mL usable headroom after a 2 mL margin. Worst case is two frames per dilution.
+
+**Out of scope, deliberately:** manual pumping stays unguarded and unestimated — outside an
+experiment, researchers change vial contents and straw heights freely and must not have to
+tell the program.
 
 ### Session K — Consumables safety interlock
 
@@ -504,13 +549,15 @@ reported μ to come back bit-identical.
 **Performance on the deployment target.** The recompute runs on the sensor-loop thread
 inside the engine lock, and the Pi has one core (Pi 1 Model B) or four slow ones (Pi 2
 Model B) to share with Flask, socketio and the serial path. The first implementation
-refitted every candidate window from scratch: **55 ms per vial** for a full 3 h history on
-an x86 laptop, all sixteen vials in a single tick — which at the 30–60× scalar-CPython
+refitted every candidate window from scratch: **55 ms per vial** for a full 3 h history at
+the then-10 s OD cadence on an x86 laptop, all sixteen vials in a single tick — which at the 30–60× scalar-CPython
 penalty of an ARM1176 at 700 MHz is tens of seconds, i.e. a stalled loop and a frozen GUI.
 Fixed three ways: an O(1)-per-candidate prefix-sum window search (**5.4 ms per vial**,
 verified bit-equivalent to the brute-force fit), staggering the vials across ticks
-(`ceil(16/6) = 3` per tick, on per-vial due times), and caching the serialised payload that
-`growth_snapshot()` returns every tick. **`server/bench_growth_rate.py` is the arbiter** —
+(`ceil(16/6) = 3` per **base** tick, on per-vial due times), and caching the serialised
+payload that `growth_snapshot()` returns every tick. The 60 s OD lane later cut the sample
+density threefold even after the history window widened 3 h → 6 h, so that worst case still
+bounds the current one. **`server/bench_growth_rate.py` is the arbiter** —
 run it on the actual Pi rather than trusting the scaling factor; it prints a verdict
 against the 10 s budget.
 

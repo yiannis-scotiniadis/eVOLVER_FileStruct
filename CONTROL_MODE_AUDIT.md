@@ -23,7 +23,7 @@ current state.**
 | C-3 | Fixed — `bolus_interval < 2 s` rejected; `validate_control_parameters` added; cap binding alerts |
 | C-4 | Fixed — `total_volume_ml` books delivery, `total_volume_intended_ml` books intent, `boli_fired` / `bolus_cycles` split |
 | C-5 | **Partial** — `start_od` / `start_after_seconds` start gate implemented; the washout detector was deliberately deferred |
-| X-1 | **Warning only** — the bench decision on `efflux_extra_seconds` is still open; the run now warns at start instead of failing silently |
+| X-1 | **Bench decision closed 2026-09-23** — 2.0 s overrun against a 25 mL straw in a 40 mL vial. But the straw pins the *steady state*, not the transient: the real overflow cause was the firmware serialising influx and efflux into separate frames. See `FLUIDICS_FIRMWARE_AUDIT.md` and `SPEC.md` §16.3 |
 | X-2 | Fixed — `restore_state(state, now=...)` re-baselines a timestamp restored from the future |
 | X-3 | Unchanged — a note, not a defect |
 

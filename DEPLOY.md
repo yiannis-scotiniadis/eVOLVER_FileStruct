@@ -166,7 +166,8 @@ cd /home/pi/evolver-gui
 
 Hit `http://192.168.1.2:5000` from the lab Mac. Confirm:
 - Dashboard renders the 4×4 vial grid.
-- Sensor values update every ~10 s.
+- Sensor values update every ~10 s (temperature and OD together).
+  A fresh page load paints the last known values immediately rather than waiting.
 - Server log says `loaded calibration from /home/pi/evolver-gui/calibration` (not the warning fallback).
 
 `Ctrl+C` to stop. The mock proves install is good before we touch the serial port.
@@ -243,7 +244,18 @@ Pick one mapped, validated vial (e.g. vial 0). Fill to 25 ml with water. Connect
 
 Start the experiment. Watch for 15 minutes:
 
-- `experiments/<name>/vial00_OD.csv` should accumulate rows every 10 s.
+- `experiments/<name>/vial00_OD.csv` and `vial00_temp.csv` should both accumulate rows
+  every 10 s. (They are separate files, each with its own timestamp column, and nothing
+  joins them by row index — so if the OD lane is ever decimated, differing row counts
+  between them are expected rather than a fault.)
+- `vial00_growth.csv` (SPEC §17) also accumulates a row every 60 s. In *this* run every
+  row will have an empty `growth_rate_per_hour` and a `flags` column reading `low_od`
+  (plus `uncalibrated_floor` if no OD blank has been committed) — water is below the
+  estimator's OD floor, so there is nothing to fit. **That is the expected result, not a
+  fault**; the flags column existing and being populated is what you are checking. Note
+  also that `pump_wait: 1 minute` is below the estimator's 10 min minimum fit span, so
+  experiment creation returns a warning saying no growth rate will be reported for the
+  run. Expected here too — dilution itself is unaffected.
 - No pumps should fire (water OD stays well below upper threshold).
 - After confirming no-pump behavior, **manually trigger an influx for 5 s** via the manual control. Verify water actually moves through the tubing and the pump log records the event.
 
@@ -310,9 +322,48 @@ After the pilot, restore `WATCHDOG_TIMEOUT_MINUTES = 30` in `server/app.py:66`.
 - **Logs:** two sinks, both live. `sudo journalctl -u evolver -f` is the full stream (the unit no longer redirects stdout to a file). The server also writes rotating logs under `/home/pi/evolver-gui/logs/`: `evolver.log` (10 MB × 5) and `errors.log` (WARNING and above, 5 MB × 5) — tail with `tail -f /home/pi/evolver-gui/logs/evolver.log`. Both suspend themselves below a 128 MB free-space floor so logging can never fill the card the experiment data is on; `curl -s localhost:5000/api/health` reports `file_logging.suspended` if that happens.
 - **Event log:** every discrete occurrence (pump fires and *suppressed* attempts, alerts, maintenance, refills, sensor and serial faults) lands in `experiments/{name}/events.csv` and ships inside every export ZIP. The last 500 events are also served from memory at `GET /api/events/recent`, which is what the dashboard's Alerts drawer reads — so alerts survive a page reload and a second browser.
 - **Upgrading from a pre-Session-M deploy:** the unit changed from `StandardOutput=append:/var/log/evolver/app.log` to `journal`. Run `sudo systemctl daemon-reload && sudo systemctl restart evolver` after copying the new unit, then delete the stale `/var/log/evolver/app.log` — nothing rotates it and nothing writes to it any more.
-- **Clean shutdown / restart:** `sudo systemctl stop` (or `restart`) `evolver` fires the SIGTERM handler, which calls `stop_experiment(reason="shutdown")` — this **ends** any running experiment (marks it STOPPED; it cannot be re-`start`ed), zeros stir, parks heaters at 4095, and stops pumps. **A clean restart does NOT resume the experiment.**
+- **Clean shutdown / restart:** `sudo systemctl stop` (or `restart`) `evolver` fires the SIGTERM handler, which calls `stop_experiment(reason="shutdown")` — this **ends** any running experiment (marks it STOPPED; it cannot be re-`start`ed), zeros stir, and parks heaters at 4095. It also *attempts* to stop the pumps, but see "Emergency stop" below: **that call does nothing.** Any pump command already on the wire runs to completion. **A clean restart does NOT resume the experiment.**
 - **Crash recovery:** `resume_on_startup()` fires *only* after an **unclean** exit (power loss / crash that left `state.json` at RUNNING). On the next boot it rebuilds and resumes that experiment. A deliberate stop is never resumed.
 - **Source of truth for a running experiment:** `experiments/<name>/state.json`. Back this up before any risky operation.
+
+## Emergency stop — read this before you need it
+
+**There is no software emergency stop for the pumps.** Measured on the bench 2026-09-23; full
+evidence in `FLUIDICS_FIRMWARE_AUDIT.md`, summarised in `SPEC.md` §16.3.5.
+
+The 2016 fluidics firmware queues command frames and runs them **one at a time to
+completion**. It never preempts and it accepts no stop command. Specifically:
+
+- The all-stop frame `SerialManager.stop_all_pumps()` sends **does not halt a running pump**
+  and **does not flush the queue** — frames already sent still run.
+- A zero-duration command for the running pump does nothing.
+- The dashboard's emergency-stop control, `watchdog.emergency_shutdown`, and the shutdown
+  handler all call that same inert function.
+
+**Heaters and stir are not affected by this** — those subsystems accept a new setpoint
+immediately, so parking heaters at 4095 and zeroing stir both work. It is fluidics only.
+
+### What to actually do
+
+| Situation | Action |
+|---|---|
+| A pump is running and must stop **now** | **Cut power to the auxiliary pump board.** This is the only thing that works. |
+| Runaway dosing, pumps not currently mid-frame | `sudo systemctl stop evolver` — prevents any *further* frames being sent, which is the real mitigation |
+| Something is about to overflow | Cut power, then lift the efflux line or aspirate manually |
+
+Worst case exposure is the duration of the longest single pump command the server issues —
+today up to 20 s for an automatic dilution, more for a long manual pump.
+
+### Recommended hardware fix
+
+The correct fix is a **relay or solid-state contactor on the auxiliary pump board's supply
+rail, driven from a spare Pi GPIO**, plus a **physical E-stop button in series with the same
+rail**. Either a human or the watchdog can then kill the pumps regardless of firmware state,
+and `watchdog.py` finally gets something real to act on. The button also covers the case where
+the Pi itself is wedged — not hypothetical on this rig, given its NetworkManager history.
+
+Until that exists, **do not run unattended dilutions with a vial whose free headroom is
+smaller than the largest bolus the controller can request.**
 
 ## Installing updates
 
@@ -373,7 +424,21 @@ Restore `experiments/` and `calibration/` from your backup if a bad version alte
 
 ### Clean re-install (new SD card / new Pi)
 
-Use the full flow at the top of this runbook: flash current Raspberry Pi OS (64-bit) → static IP + UART (`disable-bt`) → `apt install python3-venv python3-pip git` → `git clone` → `git checkout <tag>` → `./install.sh` → mock test → Phase 4 hardware validation → `systemctl enable --now evolver`. On a modern OS the N1–N5 Python-build prerequisites do **not** apply — those exist only for the legacy Jessie escape path.
+**See [`SETUP_FROM_SCRATCH.md`](SETUP_FROM_SCRATCH.md)** — the full card-rebuild runbook, from a
+freshly flashed headless OS to an operational rig. It covers the parts this document assumes you
+already have: harvesting the old card (`experiments/` exists nowhere else), the static IP on
+NetworkManager rather than `dhcpcd`, the `disable-bt` UART configuration and how to verify
+`/dev/ttyAMA0` is actually the PL011, restoring the state git does not carry, Tailscale node
+identity, and which parts of Phase 4 a rebuild may skip.
+
+The shape of it: flash Raspberry Pi OS Lite (64-bit, ≥32 GB, username `pi`) → harvest the old
+card → static IP → UART (`enable_uart=1` + `dtoverlay=disable-bt`, serial console off) →
+`apt install python3-venv python3-pip git` → `git clone` → `git checkout <tag>` → restore
+`experiments/` + calibration runtime state → `./install.sh` → Tailscale → mock test → Phase 4
+hardware validation → `systemctl enable --now evolver`.
+
+On a modern OS the N1–N5 Python-build prerequisites do **not** apply — those exist only for the
+legacy Jessie escape path.
 
 ### ⚠ Calibration is not update-safe yet
 
