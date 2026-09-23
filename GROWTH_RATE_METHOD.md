@@ -326,9 +326,10 @@ default path.
 
 | Constant | Value | Provenance / basis |
 |---|---|---|
-| `MIN_FIT_SPAN_SECONDS` | 600 (10 min) | Measurement #6: 10 min gives μ sd 2.4–11.6 %; 80 s gives 64–339 %. |
-| `PREFERRED_FIT_SPAN_SECONDS` | 1800 (30 min) | Measurement #6: sd 0.4–2.2 %. Use when the segment is long enough. |
-| `MIN_SAMPLES` | 30 | 5 min at 10 s cadence; a floor under `MIN_FIT_SPAN` for lossy sleeves. |
+| `MIN_FIT_SPAN_SECONDS` | 600 (10 min) | Measurement #6: 10 min gives μ sd 2.4–11.6 %; 80 s gives 64–339 %. **Do not raise past `pump_wait − 60`** at any cadence — see §5.1. |
+| `PREFERRED_FIT_SPAN_SECONDS` | 1800 (30 min) | Measurement #6: sd 0.4–2.2 %. Use when the segment is long enough. **Cadence-tied** — §5.2. |
+| `MIN_SAMPLES` | 30 | 5 min at the 10 s OD cadence; a floor under `MIN_FIT_SPAN` for lossy sleeves. **Cadence-tied, and the first to bite** — §5.2. |
+| `HISTORY_WINDOW_SECONDS` | 10800 (3 h) | Must hold a `PREFERRED` window plus segment boundaries either side. 1080 samples/vial at 10 s. **Cadence-tied** — §5.2. |
 | `WINDOW_FRACTION` | 0.6 | Window = 60 % of segment span, floored at `MIN_FIT_SPAN`. Replaces the notebook's fixed 8 samples. |
 | `POST_DILUTION_SKIP_SECONDS` | 60, then let the window search refine | §4.1; a nominal skip plus the search beats either alone. |
 | `MIN_R2_REPORT` | 0.90 | Below this, return μ flagged `low_confidence`, never silently. |
@@ -337,6 +338,75 @@ default path.
 | Per-vial low-OD floor | `max(0.05, 10 × blank_sd_od[vial])` | Not the single 0.1 of §17 nor the 0.05 of Session N — the audit found four-fold optical-sensitivity variation across sleeves. Source: the run's `experiments/{name}/od_blank.json`. **No blank has ever been committed**, so implement the fallback in §8. |
 | Regime-A range gate | derived from `od_lower_thresh`/`od_upper_thresh` | §4.2. No ported constant. |
 | Dilution factor (diagnostic) | `v/V` | §4.4. |
+
+### 5.1 Why `MIN_FIT_SPAN_SECONDS` has a hard ceiling, at any cadence
+
+The obvious move, if the OD cadence is ever slowed, is to lengthen the minimum fit span to
+buy the samples back. It is wrong, and the reason is a coupling to the *control* config
+rather than to the estimator.
+
+A turbidostat segment can never be longer than the gap between dilutions, and can never
+be shorter than `pump_wait` (default 15 min = 900 s). `POST_DILUTION_SKIP_SECONDS` then
+takes 60 s off the front. So the shortest segment a default run produces is **~840 s of
+usable span** — and `MIN_FIT_SPAN_SECONDS` above that rejects *every* segment, at which
+point the service reports nothing at all for the whole run.
+
+Measured with `server/verify_cadence_growth.py` at a 60 s OD cadence, μ = 1.20 /h in a
+0.3–0.4 band (fast grower, dilutions pinned to the `pump_wait` floor):
+
+| `MIN_FIT_SPAN` | reported μ | flags |
+|---|---|---|
+| 600 | 1.2015 | — |
+| 900 | **no estimate** | `insufficient_segments` |
+| 1200 | **no estimate** | `insufficient_segments` |
+| 1800 | **no estimate** | `insufficient_segments` |
+
+The failure is silent from the estimator's point of view — `insufficient_segments` is
+the correct flag — and it lands hardest on exactly the cultures growth rate is most
+wanted for. `validate_control_parameters` already warns when `pump_wait_minutes` is below
+`MIN_FIT_SPAN_SECONDS`; raising the constant would have turned that warning on for the
+default configuration.
+
+The floor case is also the *stirred* noise column. The 60 s lane exists to make room for
+stopping the stirrers before the read, which should move the operating point from ~0.004
+toward ~0.002 OD noise sd — but nothing has measured that on the bench yet, so it is not
+assumed anywhere.
+
+### 5.2 What a slower OD lane costs, and what it takes to pay it back
+
+**Status: the OD lane is currently NOT decimated** — `app.py` runs OD and temperature on
+the same 10 s tick and the constants above are at their 10 s values. This section is the
+record of what was measured when the lane was briefly at 60 s, so that whoever re-enables
+it knows exactly which constants have to move and what happens if they do not.
+
+`server/verify_cadence_growth.py` measures it against ground truth, driving the real
+`TurbidostatController` and the real estimator over 8 h runs, 5 seeds per μ, band 0.2–0.6,
+`pump_wait` 15 min. Pooled over μ ∈ {0.35, 0.70, 1.20} /h, as mean signed bias / mean
+absolute error:
+
+| Configuration | stirred noise (0.004) | settled noise (0.002) |
+|---|---|---|
+| 10 s lane, the constants above (**current**) | +0.05 % / 0.53 % | −0.06 % / 0.34 % |
+| 60 s lane, constants left alone (**the trap**) | +0.23 % / **1.38 %** | −0.23 % / 0.40 % |
+| 60 s lane, constants re-derived | +0.07 % / **0.35 %** | −0.11 % / 0.23 % |
+
+The re-derived 60 s values, for whoever needs them: `PREFERRED_FIT_SPAN_SECONDS` 3600,
+`MIN_SAMPLES` 10, `HISTORY_WINDOW_SECONDS` 6 h, `MIN_FIT_SPAN_SECONDS` unchanged at 600.
+
+Three readings:
+
+1. **Slowing the cadence alone costs ~2.6x in dispersion** (0.53 % → 1.38 % MAE), worst
+   at low μ: sd goes 1.38 % → 3.47 % at μ = 0.35, and 1.80 % → 7.27 % in the batch regime.
+   That is the trap row — what ships if the span constants are left alone.
+2. **With the constants re-derived, accuracy is slightly *better* than the 10 s baseline**
+   (0.53 % → 0.35 % MAE). Longer windows in *time* more than compensate for the sparser
+   sampling, and the coarser candidate grid means fewer max-R² candidates and therefore
+   less selection inflation of R².
+3. **Bias is negligible in every configuration** (|bias| ≤ 0.23 %). The cadence affects
+   variance, not accuracy — which is what a regression-variance argument predicts.
+
+So a slower OD lane does not materially degrade the reported growth rate *provided* the
+span constants move with it — and materially does, otherwise.
 
 ---
 
@@ -409,7 +479,7 @@ everything required.
 2. **Engine-owned timestamped OD history.** `TurbidostatController.od_history` is a
    `deque[float]` with `maxlen=history_window` (default 5) and no timestamps — it cannot
    feed this service, and it is not to be changed. Instead add to `ExperimentEngine` a
-   per-vial `deque[(t, od)]` bounded by *time* (default 3 h), appended in `run_cycle` at
+   per-vial `deque[(t, od)]` bounded by *time* (3 h as built; **now 6 h**, §5), appended in `run_cycle` at
    the existing `push_od` dispatch site (~line 1410) using the `now` and `od` already in
    scope there. The controller call is left exactly as it is.
 
@@ -424,7 +494,11 @@ everything required.
 
 4. **Call site.** After the decide pass in `run_cycle`, call `growth_rate.estimate(...)`
    per vial and cache the `GrowthReport`. Recompute on a longer interval than the sensor
-   cadence (default 60 s) — the estimate does not change meaningfully in 10 s.
+   cadence (default 60 s) — the estimate does not change meaningfully in 10 s. Since the
+   60 s OD lane that is one recompute per new sample, which is what the throttle always
+   wanted to be; it stays on the 10 s **base** tick, because growth reads the engine's own
+   OD history rather than a fresh sample and riding the OD tick would stretch each vial's
+   staggered refresh to six minutes.
 
 5. **`status()`** — add to the `per_vial` block (~line 1550, beside `avg_od` and
    `sensor_health`): `mu_per_hour`, `doubling_time_min`, `r_squared`, `regime`,
@@ -444,10 +518,11 @@ everything required.
    r_squared,windows_searched,fit_span_s,fit_od_start,fit_od_end,flags
    ```
 
-   Written at the growth recompute interval (default 60 s), not the 10 s sensor cadence —
-   the estimate does not change meaningfully in 10 s, and this keeps the file ~1/6 the
-   size of the OD file. Add it to `data_export.py`'s bundle and to the `.gitignore`d
-   experiment tree exactly as the existing per-vial files are handled.
+   Written at the growth recompute interval (default 60 s), not the 10 s base tick — the
+   estimate does not change meaningfully in 10 s. That made the file ~1/6 the size of the
+   OD file when OD was acquired every 10 s; since the 60 s OD lane the two are one row for
+   one row. Add it to `data_export.py`'s bundle and to the `.gitignore`d experiment tree
+   exactly as the existing per-vial files are handled.
 
 8. **`GET /api/growth_rate`** — already specified in `SPEC.md` §6. Implement to the shape
    there, adjusted for the single-estimator decision (§11.1).

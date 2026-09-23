@@ -363,7 +363,7 @@ def test_out_of_range_flag_distinct_from_dropped() -> None:
                 f"2026-05-14T10:00:0{i}+00:00", [37.0] * N_VIALS, ods, od_flags=flags
             )
         assert engine._od_range_streak[0] == 3, engine._od_range_streak
-        assert engine._nan_streak[0] == 0, engine._nan_streak
+        assert engine._od_nan_streak[0] == 0, engine._od_nan_streak
         assert engine._vial_faults[0] is None
         range_warns = [a for a in alerts if a["level"] == "warning"
                        and "calibrated range" in a["message"].lower()]
@@ -380,7 +380,7 @@ def test_out_of_range_flag_distinct_from_dropped() -> None:
             engine.run_cycle(
                 f"2026-05-14T10:01:0{i}+00:00", [37.0] * N_VIALS, ods, od_flags=flags
             )
-        assert engine._nan_streak[1] == 3, engine._nan_streak
+        assert engine._od_nan_streak[1] == 3, engine._od_nan_streak
         assert engine._od_range_streak[1] == 0, engine._od_range_streak
 
         # An 'ok' read resets both streaks.
@@ -388,7 +388,7 @@ def test_out_of_range_flag_distinct_from_dropped() -> None:
             "2026-05-14T10:02:00+00:00", [37.0] * N_VIALS, [0.1] * N_VIALS,
             od_flags=["ok"] * N_VIALS,
         )
-        assert engine._od_range_streak[0] == 0 and engine._nan_streak[0] == 0
+        assert engine._od_range_streak[0] == 0 and engine._od_nan_streak[0] == 0
     print("PASS  out_of_range OD distinct from dropped (separate streak + alert)")
 
 
@@ -1581,6 +1581,10 @@ def _chemostat_params(**overrides) -> dict:
     p = {
         "temperature_c": 37, "stir_rate": 8,
         "dilution_rate_per_hour": 1.0,
+        # Must be >= the engine's control interval: decide() is only called
+        # once per control tick, so a shorter interval is not honoured and
+        # every bolus would clip against a safety cap sized from the nominal
+        # interval. DEFAULT_CYCLE_INTERVAL_SECONDS is 10 s.
         "bolus_interval_seconds": 10.0,
         "volume_ml": 25.0,
     }
@@ -1643,10 +1647,14 @@ def test_chemostat_run_cycle_returns_pump_action() -> None:
     with TmpRoot() as root:
         engine, *_ = _fresh(root)
         # D=20/h, V=25, T=10 -> per-bolus pump_time = 1.389 s (above 1 s so
-        # the deficit accumulator passes it straight through every cycle).
+        # the deficit accumulator passes it straight through every cycle,
+        # and under the safety cap of min(20, T-1) = 9 s).
         # A slower chemostat (per-bolus < 1 s) would accumulate into the
         # deficit instead of firing each cycle — see test_chemostat.py
         # for that path.
+        #
+        # T must be >= the engine's control interval (10 s): decide() is only
+        # called on a control tick, so a shorter interval is not honoured.
         engine.create_experiment(
             name="chem1", mode="chemostat", vials=[0, 1],
             parameters=_chemostat_params(
@@ -2126,9 +2134,13 @@ def test_dropped_temperature_does_not_suspend_dilution() -> None:
             ))
             clock_state["t"] += 60.0
         assert actions, "dilution suspended by a dropped temperature read"
-        # The dropped read is still counted and still warned about.
-        assert engine._nan_streak[0] == 3, engine._nan_streak
-        assert any("dropped sensor reads" in a["message"] for a in alerts), alerts
+        # The dropped read is still counted and still warned about. It is
+        # the TEMPERATURE streak: the lanes tick at different periods, so the
+        # counters are separate (three dropped temperature reads is 30 s,
+        # three dropped OD reads is 3 min).
+        assert engine._temp_nan_streak[0] == 3, engine._temp_nan_streak
+        assert engine._od_nan_streak[0] == 0, engine._od_nan_streak
+        assert any("dropped temperature reads" in a["message"] for a in alerts), alerts
     print("PASS  a dropped temperature read skips heater safety only")
 
 

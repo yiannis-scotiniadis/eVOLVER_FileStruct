@@ -73,15 +73,37 @@ from typing import Iterable, NamedTuple, Optional, Sequence
 # see the table there before changing one.
 # ---------------------------------------------------------------------------
 
-#: Shortest fit span that yields a usable μ. Measurement §2 #6: at eVOLVER's
-#: 10 s cadence a 10 min span gives μ sd 2.4–11.6 % across OD noise
-#: 0.002–0.010; the notebook's 8 *samples* (80 s here) gives 64–339 %.
+#: Shortest fit span that yields a usable μ. Measurement §2 #6: at the 10 s
+#: OD cadence a 10 min span gives μ sd 2.4–11.6 % across OD noise
+#: 0.002–0.010; the notebook's 8 *samples* (80 s) gives 64–339 %.
+#:
+#: **Bounded above by the control config, not by taste**, and that ceiling is
+#: cadence-independent: a turbidostat segment can never be shorter than
+#: ``pump_wait`` (default 900 s), and POST_DILUTION_SKIP_SECONDS takes 60 s
+#: off the front of it. Anything above ~840 s therefore rejects every segment
+#: a default fast-grower run produces, and the service reports nothing at all
+#: for the whole run -- ``validate_control_parameters`` already warns about
+#: exactly that pairing. Measured in GROWTH_RATE_METHOD.md §5.1.
 MIN_FIT_SPAN_SECONDS = 600.0
 
-#: Preferred fit span when the segment is long enough (sd 0.4–2.2 %).
+#: Preferred fit span when the segment is long enough. Measurement §2 #6:
+#: 30 min at the 10 s cadence is 181 samples, μ sd 0.4–2.2 %.
+#:
+#: **Tied to the OD cadence.** If the OD lane is ever decimated again
+#: (``app.py`` OD_EVERY_N_TICKS > 1) this must grow with it: at 60 s the same
+#: 30 min is only 31 samples (sd 1.0–5.3 %) and 3600 is the value that
+#: restores today's quality. Numbers and method in GROWTH_RATE_METHOD.md
+#: §5.2; re-measure with ``server/verify_cadence_growth.py``.
 PREFERRED_FIT_SPAN_SECONDS = 1800.0
 
-#: Floor under MIN_FIT_SPAN for lossy sleeves: 5 min at 10 s cadence.
+#: Absolute floor on sample count, under the *duration* floor above: 5 min at
+#: the 10 s cadence, a guard for lossy sleeves.
+#:
+#: **Tied to the OD cadence**, and it is the constant that bites first if the
+#: OD lane is decimated without re-deriving these: at 60 s, 30 samples is
+#: *30 minutes*, which would reject every segment MIN_FIT_SPAN_SECONDS
+#: accepts and silently override both that constant and MAX_MISSING_FRACTION.
+#: The 60 s value is 10. See GROWTH_RATE_METHOD.md §5.2.
 MIN_SAMPLES = 30
 
 #: Window width as a fraction of segment span, floored at MIN_FIT_SPAN.
@@ -91,6 +113,10 @@ WINDOW_FRACTION = 0.6
 #: Nominal post-dilution skip. The max-R² window search then trims whatever
 #: mixing transient survives it — §4.1 measured the pair beating either alone,
 #: which is why this can be a rough constant rather than a tuned one.
+#:
+#: A physical mixing constant, so it is NOT rescaled with the OD cadence.
+#: It is also why MIN_FIT_SPAN_SECONDS has to clear ``pump_wait - 60`` rather
+#: than ``pump_wait``.
 POST_DILUTION_SKIP_SECONDS = 60.0
 
 #: Below this, μ is returned flagged ``low_confidence`` -- a stronger signal
@@ -114,7 +140,9 @@ MAX_MISSING_FRACTION = 0.30
 #: Never fall back to a cross-dilution fit — that is §3.3's −94 % failure mode.
 MIN_SEGMENTS = 2
 
-#: How much timestamped OD history the engine retains per vial.
+#: How much timestamped OD history the engine retains per vial. Must hold a
+#: PREFERRED_FIT_SPAN_SECONDS window with room for segment boundaries either
+#: side; 3 h at the 10 s cadence is 1080 samples per vial.
 HISTORY_WINDOW_SECONDS = 3 * 3600.0
 
 #: How often the engine recomputes. The estimate does not change meaningfully
@@ -126,8 +154,8 @@ HISTORY_WINDOW_SECONDS = 3 * 3600.0
 #: Model B) or four slow ones (Pi 2 Model B) to share with Flask, socketio and
 #: the serial loop. Worst realistic case -- a full 3 h history at 10 s
 #: cadence, six segments -- measures 3.9 ms per vial on a development x86 box;
-#: the engine staggers the sixteen vials across ticks, so a tick carries three
-#: of them.
+#: the engine staggers the sixteen vials across base ticks, so a tick carries
+#: three of them.
 #:
 #: Do NOT extrapolate that to the Pi by guessing a factor. Run
 #: ``server/bench_growth_rate.py`` on the actual machine.
@@ -142,10 +170,17 @@ CHEMOSTAT_DRIFT_WINDOW_SECONDS = 3600.0
 #: cadence, a high R² becomes reachable by luck alone.
 MAX_WINDOW_CANDIDATES = 40
 
-#: The engine recomputes ``ceil(n_vials / this)`` vials per sensor tick,
+#: The engine recomputes ``ceil(n_vials / this)`` vials per **base** tick,
 #: round-robin, rather than all sixteen in one. Six is the number of 10 s
-#: ticks in the 60 s recompute interval, so every vial is still refreshed
-#: once per interval — the work is spread, not reduced.
+#: base ticks in the 60 s recompute interval, so every vial is still
+#: refreshed once per interval — the work is spread, not reduced.
+#:
+#: This is also why the recompute runs on the base tick and NOT on the 60 s
+#: OD tick. Growth reads the engine's own timestamped OD history, never a
+#: fresh sample, so it does not need the OD tick — and riding it would make
+#: this divisor spread sixteen vials over six OD ticks, silently stretching
+#: each vial's refresh to six MINUTES. Staying on the base tick also keeps a
+#: sixteen-vial burst off the tick that is already doing an OD acquisition.
 #:
 #: This exists for the deployment target, not for the developer laptop. On a
 #: pre-2016 Pi 1 Model B (single-core ARM1176 at 700 MHz) scalar CPython runs
@@ -357,7 +392,7 @@ _MIN_POSITIVE_OD = 1e-12
 def _is_finite(x) -> bool:
     """Readable predicate for the cold paths.
 
-    The per-sample filters do NOT call this: at 16 vials x a 3 h history it
+    The per-sample filters do NOT call this: at 16 vials x a full history it
     was measured at ~16 700 calls per sensor tick, and a Python-level call
     costs far more than the comparison it wraps. They inline the equivalent
     chained comparison instead, which is exact because NaN compares False
@@ -461,7 +496,8 @@ class _WindowScanner:
     The window search evaluates up to :data:`MAX_WINDOW_CANDIDATES` heavily
     overlapping windows. Refitting each from scratch is O(candidates x window)
     and was the single dominant cost of the whole service: measured at 55 ms
-    per vial on a developer laptop for a full 3 h history, which extrapolates
+    per vial on a developer laptop for a full 3 h history at the 10 s OD
+    cadence -- the densest series this can hold -- which extrapolates
     to *seconds* per vial on a pre-2016 Pi — stolen from the 10 s sensor tick,
     on a box with one core to share with Flask and the serial loop.
 
@@ -641,16 +677,37 @@ def best_window_fit(
     best_r2: float = -1.0
     best_bounds: Optional[tuple] = None
     searched = 0
-    start = times_s[0]
-    end_limit = times_s[-1] - window
+    t0 = times_s[0]
     # `times_s` is sorted, so each candidate window is a contiguous index
     # range found by binary search, and the fit over it is O(1) against the
     # prefix sums. Scanning and refitting per candidate instead is
     # O(candidates x window) and was measured at 55 ms per vial for a 3 h
     # history -- seconds per vial on the deployment Pi.
     scanner = _WindowScanner(times_s, [math.log(o) for o in ods])
-    # +1e-6 so a window that exactly fills the span is still visited.
-    while start <= end_limit + 1e-6:
+
+    # Candidate starts are generated as `t0 + k * step`, NOT by accumulating
+    # `start += step`, and the loop bound is compared in OFFSET space rather
+    # than absolute time. Both changes exist for the same reason the prefix
+    # sums are recentred: `times_s` carries epoch seconds (~1.79e9), where a
+    # float64 ulp is ~2.4e-7 s. Accumulating forty additions there drifts the
+    # grid by ~1e-5 s, which is enough to move a `bisect` boundary across a
+    # sample that sits on the grid -- and because the winner is chosen by
+    # max R2 over the candidates, gaining or losing one candidate can change
+    # which window wins outright. The same series shifted by an epoch then
+    # returns a different mu (measured: 0.8012 vs 0.8023, 41 candidates vs
+    # 40). One multiply plus one add is a single rounding regardless of
+    # magnitude, and `offset <= slack` compares small numbers to small ones.
+    slack_limit = (times_s[-1] - window) - t0
+    # Relative epsilon so a window that exactly fills the span is still
+    # visited at any timestamp magnitude; a bare 1e-6 is below the ulp of
+    # some absolute times and silently stops being an epsilon at all.
+    eps = max(1e-6, abs(slack_limit) * 1e-12)
+    k = 0
+    while True:
+        offset = k * step
+        if offset > slack_limit + eps:
+            break
+        start = t0 + offset
         lo_i = bisect.bisect_left(times_s, start)
         hi_i = bisect.bisect_right(times_s, start + window)
         if (hi_i - lo_i) >= min_window_samples:
@@ -660,7 +717,7 @@ def best_window_fit(
                 if r2 > best_r2:
                     best_r2 = r2
                     best_bounds = (lo_i, hi_i)
-        start += step
+        k += 1
 
     # The winning window is re-fitted with the direct implementation, so every
     # reported number comes from `fit_log_linear` and the fast path only ever
@@ -939,7 +996,7 @@ def lag_time_hours(
 
     ``origin_s`` must be the run's start on the caller's clock. Defaulting it
     to the first supplied sample would be wrong for the engine, which hands
-    over only a rolling 3 h window: a lag measured from the start of that
+    over only a rolling history window: a lag measured from the start of that
     window is a number about the window, not about the culture, and on a
     batch phase longer than 3 h it is off by however much history was
     dropped. Measured at -16.7 h against a true -8.6 h before this argument
@@ -1086,7 +1143,7 @@ def dilution_check(
         )
     # Rate over the span BETWEEN the first and last event, not over the
     # nominal window. A turbidostat dilutes in discrete boluses tens of
-    # minutes apart, so a 3 h window holds only two or three of them and
+    # minutes apart, so the history window holds only a handful of them and
     # dividing by the window length inherits the ~1/k edge effect of where
     # the window boundaries happen to fall -- measured at -24 % on a
     # steady-state simulation. Summing the k-1 boluses that *completed* an

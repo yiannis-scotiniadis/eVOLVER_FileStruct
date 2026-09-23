@@ -417,13 +417,31 @@ class DataLogger:
         timestamp_iso: str,
         temperature_calibrated: list,
         temperature_raw: list,
-        od_calibrated: list,
-        od_raw: list,
+        od_calibrated: Optional[list] = None,
+        od_raw: Optional[list] = None,
         od_n_valid: Optional[list] = None,
         od_flags: Optional[list] = None,
         od_dark: Optional[list] = None,
     ) -> None:
-        """Append one OD row and one temperature row per active vial.
+        """Append one temperature row per active vial, and one OD row when
+        OD was actually acquired this cycle.
+
+        The sensor loop can read temperature more often than OD (``app.py``
+        OD_EVERY_N_TICKS; currently 1, so both are on the same 10 s tick and
+        the two files gain rows together). If that lane is ever decimated,
+        **the two files legitimately have different row counts** -- pass
+        ``od_calibrated=None`` for a temperature-only tick and only the
+        temperature row is written. That is safe because ``vialNN_temp.csv``
+        and
+        ``vialNN_OD.csv`` are separate files, each carrying its own
+        timestamp and elapsed-hours column, and every reader
+        (``data_export``, ``get_data``, the lab's own scripts) opens them
+        independently. Nothing joins them positionally by row index.
+
+        No column is added to or removed from either file. ``data_export``
+        has no schema marker, so a positional parser breaks silently on an
+        inserted column (CLAUDE.md fact 6) -- changing the row *rate* is
+        invisible to such a parser, changing the row *shape* is not.
 
         ``od_n_valid`` / ``od_flags`` / ``od_dark`` are the optional
         enhanced-acquisition diagnostics; when omitted (naive read) the
@@ -435,12 +453,16 @@ class DataLogger:
         with self._lock:
             if self._active_name is None:
                 return
-            for series, label in (
+            has_od = od_calibrated is not None
+            if has_od and od_raw is None:
+                raise ValueError("'od_raw' is required when 'od_calibrated' is given")
+            required = [
                 (temperature_calibrated, "temperature_calibrated"),
                 (temperature_raw, "temperature_raw"),
-                (od_calibrated, "od_calibrated"),
-                (od_raw, "od_raw"),
-            ):
+            ]
+            if has_od:
+                required += [(od_calibrated, "od_calibrated"), (od_raw, "od_raw")]
+            for series, label in required:
                 if len(series) != N_VIALS:
                     raise ValueError(
                         f"'{label}' must have {N_VIALS} entries, got {len(series)}"
@@ -457,9 +479,14 @@ class DataLogger:
             exp_dir = self._active_dir
             vials = list(self._active_vials)
             elapsed_h = self._elapsed_hours_locked(timestamp_iso)
-            self._latest_od = [
-                float(x) if not _is_nan(x) else float("nan") for x in od_calibrated
-            ]
+            if has_od:
+                # Only refreshed on an OD tick, so this stays the last
+                # ACTUALLY measured OD rather than being reset by the five
+                # temperature-only ticks between acquisitions.
+                self._latest_od = [
+                    float(x) if not _is_nan(x) else float("nan")
+                    for x in od_calibrated
+                ]
 
             elapsed_str = f"{elapsed_h:.4f}"
             for v in vials:
@@ -472,6 +499,8 @@ class DataLogger:
                         _format_number(temperature_calibrated[v], 4),
                     ],
                 )
+                if not has_od:
+                    continue
                 self._append_row(
                     exp_dir / f"vial{v:02d}_OD.csv",
                     [

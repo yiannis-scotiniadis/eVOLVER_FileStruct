@@ -1375,6 +1375,20 @@
       color: var(--status-ok);
       background: rgba(22, 163, 74, 0.12);
     }
+/* OD can be acquired on a slower lane than the rest of the payload, in which
+       case a value on screen may legitimately be up to one OD period old.
+       These two rules are what keep an always-populated number honest: the age
+       is shown beside the label, and the value itself dims once it is older
+       than the lane should allow. Without them a cached reading is
+       indistinguishable from a fresh one.
+       Inert while OD and the base tick share a cadence — see renderOdAge. */
+    .od-age {
+      margin-left: 6px;
+      font-variant-numeric: tabular-nums;
+      opacity: 0.65;
+      font-weight: 400;
+    }
+    .metric-value.stale-od { opacity: 0.45; }
     .cal-badge.stale {
       color: var(--status-warn);
       background: rgba(249, 115, 22, 0.14);
@@ -2524,7 +2538,7 @@
           <div class="metric-value placeholder" id="temp-${i}">—<span class="unit">°C</span></div>
         </div>
         <div class="metric">
-          <span class="metric-label">Optical Density</span>
+          <span class="metric-label">Optical Density<span class="od-age" id="od-age-${i}"></span></span>
           <div class="metric-value placeholder" id="od-${i}">—</div>
         </div>
       `;
@@ -2559,6 +2573,50 @@
     }
 
     // --- Formatting ---
+    // The OD lane CAN run slower than the base tick, in which case updates
+    // re-send an OD reading that is already up to a full OD period old. Show
+    // that age rather than letting a stale value pass as live.
+    //
+    // When the two cadences are equal — the current configuration, one 10 s
+    // cycle for everything — every OD value on screen was measured on the
+    // tick that delivered it, so the age chip would read "now" forever. It is
+    // suppressed in that case rather than adding a column of noise. Both the
+    // period and the decision come from the server's `intervals` block, so
+    // the chip reappears by itself if the OD lane is ever decimated again.
+    function renderOdAge(msg) {
+      const od = msg.od || {};
+      const iv = msg.intervals || {};
+      const odPeriod = iv.od_seconds || null;
+      const basePeriod = iv.base_seconds || null;
+      const decimated = odPeriod != null && basePeriod != null
+        && odPeriod > basePeriod * 1.01;
+      if (!decimated) {
+        for (let i = 0; i < N_VIALS; i++) {
+          const ageEl = document.getElementById(`od-age-${i}`);
+          if (ageEl) ageEl.textContent = "";
+          const odEl = document.getElementById(`od-${i}`);
+          if (odEl) odEl.classList.remove("stale-od");
+        }
+        return;
+      }
+      let age = od.age_seconds;
+      if (age == null && od.timestamp) {
+        const t = tsToEpoch(od.timestamp);
+        if (t != null) age = Math.max(0, Date.now() / 1000 - t);
+      }
+      const stale = age != null && odPeriod != null && age > 1.5 * odPeriod;
+      const label = age == null ? ""
+        : age < 1.5 ? "now"
+        : age < 90 ? `${Math.round(age)}s ago`
+        : `${Math.round(age / 60)}m ago`;
+      for (let i = 0; i < N_VIALS; i++) {
+        const ageEl = document.getElementById(`od-age-${i}`);
+        if (ageEl) ageEl.textContent = label;
+        const odEl = document.getElementById(`od-${i}`);
+        if (odEl) odEl.classList.toggle("stale-od", stale);
+      }
+    }
+
     function formatTime(iso) {
       try {
         const d = new Date(iso);
@@ -2601,9 +2659,10 @@
         setStatus(i, temperatureStatus(t));
       }
       lastEl.textContent = formatTime(msg.timestamp);
-      // Bus + sleeve health ride the sensor tick, so the indicators refresh at
-      // the 10 s cadence without a second polling loop.
+      // Bus + sleeve health ride the base sensor tick, so the indicators
+      // refresh at the base cadence without a second polling loop.
       applyHealth(msg.health);
+      renderOdAge(msg);
       if (modalState.vial !== null) renderModalReadings();
 
       // Server includes a compact experiment summary on every sensor tick
@@ -2617,7 +2676,7 @@
         }
         // Authoritative maintenance state from the server keeps the banner
         // countdown drift-free (the client-side ticker just fills the gap
-        // between 10 s updates).
+        // between base-tick updates).
         if (msg.experiment.maintenance) {
           expState.maintenance = msg.experiment.maintenance;
         }
@@ -3432,7 +3491,7 @@
     }
 
     // Countdown ticks every second purely client-side. The authoritative
-    // value comes from the server on each sensor_update (every 10 s) and
+    // value comes from the server on each sensor_update (base tick) and
     // overrides any drift.
     let _maintCountdownTimer = null;
     function startMaintCountdown() {
@@ -4872,10 +4931,19 @@
       if (!plots._chartVials || !plots._chartVials.length) return;
       const epoch = tsToEpoch(msg.timestamp);
       if (epoch == null) return;
+      // The OD series is stamped with the tick OD was actually MEASURED on,
+      // not with this payload's timestamp. OD is re-sent on every base tick
+      // between acquisitions, so stamping it with `msg.timestamp` would plot
+      // one identical point per base tick — six points a minute for one real
+      // sample. appendLive drops a non-advancing timestamp, so keying off
+      // `msg.od.timestamp` is the whole fix.
+      const odEpoch = tsToEpoch((msg.od && msg.od.timestamp) || msg.timestamp);
       const hours = RANGE_TO_HOURS[plots.range];
       const odCal = (msg.od && msg.od.calibrated) || [];
       const tCal = (msg.temperature && msg.temperature.calibrated) || [];
-      appendLive(plots.od, plots._chartVials, epoch, odCal, hours);
+      if (odEpoch != null) {
+        appendLive(plots.od, plots._chartVials, odEpoch, odCal, hours);
+      }
       appendLive(plots.temp, plots._chartVials, epoch, tCal, hours);
     }
 
@@ -5005,10 +5073,16 @@
       if (!Array.isArray(expState.vials) || !expState.vials.includes(modalTrends.vial)) return;
       const epoch = tsToEpoch(msg.timestamp);
       if (epoch == null) return;
+      // Same as plotsOnSensorUpdate: the OD series is stamped with the tick
+      // OD was measured on, or a re-sent reading lands as a run of identical
+      // points between acquisitions.
+      const odEpoch = tsToEpoch((msg.od && msg.od.timestamp) || msg.timestamp);
       const hours = RANGE_TO_HOURS[modalTrends.range];
       const odCal = (msg.od && msg.od.calibrated) || [];
       const tCal = (msg.temperature && msg.temperature.calibrated) || [];
-      appendLive(modalTrends.od, [modalTrends.vial], epoch, odCal, hours);
+      if (odEpoch != null) {
+        appendLive(modalTrends.od, [modalTrends.vial], odEpoch, odCal, hours);
+      }
       appendLive(modalTrends.temp, [modalTrends.vial], epoch, tCal, hours);
     }
 
@@ -6068,7 +6142,24 @@
       }, 1000);
     }
 
+    // Paint the last known reading immediately rather than waiting for the
+    // next tick. The server also pushes this to a newly connected socket; both
+    // paths exist because either can be the slower one, and both funnel
+    // through updateVials, which is idempotent. /api/sensors/latest is served
+    // from cache and touches no serial I/O.
+    async function fetchLatestSensors() {
+      try {
+        const res = await fetch("/api/sensors/latest");
+        if (!res.ok) return;  // 503 until the loop completes its first tick
+        const msg = await res.json();
+        updateVials(msg);
+        plotsOnSensorUpdate(msg);
+        modalTrendsAppend(msg);
+      } catch (_e) { /* the socket push will cover it */ }
+    }
+
     // Kick off the state fetch immediately too, in case socket connect is slow.
+    fetchLatestSensors();
     fetchActuatorState();
     refreshExperimentStatus();
     renderExpBar();

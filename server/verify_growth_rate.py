@@ -141,7 +141,7 @@ def section_1(out):
     out("\n1b. Batch / regime A, range gate derived from the run's own band")
     out("    Each run is simulated until the culture reaches OD 1.0. `lag h`")
     out("    is the fitted crossing of OD 0.001 measured from t=0; at mu=0.35")
-    out("    the run is 11 h long, so the estimator's rolling 3 h window sees")
+    out("    the run is 11 h long, so the estimator's rolling history window sees")
     out("    only its tail and the extrapolation is correspondingly long-armed.")
     out(f"    {'mu true':>8} {'batch fit':>10} {'err':>8} {'R2':>7} "
         f"{'lag h':>7} {'expect':>7} {'windows':>8}")
@@ -494,7 +494,7 @@ def section_2(out) -> bool:
         gt = json.loads((exp_dir / "ground_truth.json").read_text(encoding="utf-8"))
         out(f"\n  {name}  ({gt['mode']}, {gt['hours']:g} h, seed {gt['seed']})")
         out("    Reported mu vs the mean of mu_true over the estimator's own "
-            "3 h window.")
+            "history window.")
         out(f"    {'vial':>4} {'rows':>5} {'est':>5} {'regime':>10} "
             f"{'mu rep':>8} {'mu true':>8} {'err':>8} {'R2':>7} {'flags'}")
         for v_str in sorted(gt["samples"], key=int):

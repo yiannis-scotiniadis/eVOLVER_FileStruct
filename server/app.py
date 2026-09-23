@@ -41,7 +41,7 @@ from flask import (
     send_from_directory,
 )
 from flask.json.provider import DefaultJSONProvider
-from flask_socketio import SocketIO
+from flask_socketio import SocketIO, emit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -89,14 +89,97 @@ EXPORTS_DIR = PROJECT_ROOT / "exports"
 # the disk floor that protects the data is the one that must protect the logs.
 LOGS_DIR = PROJECT_ROOT / "logs"
 
-SENSOR_LOOP_INTERVAL_SECONDS = 10.0
+# --- Sensor loop cadence --------------------------------------------------
+#
+# CURRENT CONFIGURATION: everything on one 10 s cycle. Temperature and OD are
+# read on the same tick, control decides on that tick, and THE STIRRERS NEVER
+# STOP. `OD_EVERY_N_TICKS = 1` collapses the two lanes onto each other.
+#
+# The two-lane machinery underneath is kept, not deleted, because slowing the
+# OD lane down is still wanted -- it is what buys time to stop the stirrers
+# and let the vortex settle before a read. Raising OD_EVERY_N_TICKS is all
+# that is needed to get that cadence back. What is NOT yet built is the stir
+# stop itself; see OD_SETTLE_SECONDS below.
+#
+# Why the machinery exists at all, so nobody re-collapses it by hand: the tick
+# is not only a measurement cadence, it is the SAFETY cadence. Over-temperature
+# is the one real-time guarantee NOT delegated to firmware --
+# ExperimentEngine._handle_heater_safety_locked needs three consecutive
+# over-critical reads before parking a heater, so detection latency is
+# `3 x whatever period the FAST lane runs at`. Slowing everything to 60 s
+# would take that from 30 s to 3 minutes on a rig where xr=0 requests ~82 C.
+# Bus-down detection (event_log.DEFAULT_BUS_FAILURE_THRESHOLD) has the same
+# shape. So a slower OD cadence must be bought by decimating the OD lane, and
+# never by slowing the base tick.
+#
+# Whoever raises OD_EVERY_N_TICKS again: growth_rate.py's span constants are
+# tuned to the OD cadence and MUST move with it. Measured before/after is in
+# GROWTH_RATE_METHOD.md 5.2 -- the cadence change alone cost 2.6x in mu
+# dispersion until those constants were re-derived. Re-run
+# server/verify_cadence_growth.py.
+SENSOR_LOOP_INTERVAL_SECONDS = 10.0   # base tick: temperature, safety, emit
+OD_EVERY_N_TICKS = 1                  # 1 = OD on every tick (10 s), no decimation
+OD_SETTLE_SECONDS = 0.0               # stir stop: NOT IMPLEMENTED, must stay 0
+OD_INTERVAL_SECONDS = SENSOR_LOOP_INTERVAL_SECONDS * OD_EVERY_N_TICKS
 OD_LED_POWER = 2125  # CLAUDE.md: standard LED power for OD reads
 
-# Low-disk monitor (sensor loop). The Pi's disk is finite and a multi-day run at
-# 10 s cadence accumulates many rows; warn before a run fills the disk and dies.
+
+def configure_cadence(
+    base_seconds: float | None = None,
+    od_every: int | None = None,
+    od_settle_seconds: float | None = None,
+) -> None:
+    """Override the sensor-loop cadence before ``create_app`` is called.
+
+    Server-level and process-wide, deliberately not per-experiment: the
+    growth-rate window constants, the chemostat bolus-interval guard and the
+    engine's streak wording all key off the control interval, and making the
+    cadence per-run would make every one of those per-run too.
+
+    Exists so settle time can be tuned on the bench without a redeploy --
+    ``main()`` wires it to ``--sensor-interval`` / ``--od-every`` /
+    ``--od-settle``.
+    """
+    global SENSOR_LOOP_INTERVAL_SECONDS, OD_EVERY_N_TICKS
+    global OD_SETTLE_SECONDS, OD_INTERVAL_SECONDS
+    if base_seconds is not None:
+        if base_seconds <= 0:
+            raise ValueError(f"base tick must be > 0, got {base_seconds}")
+        SENSOR_LOOP_INTERVAL_SECONDS = float(base_seconds)
+    if od_every is not None:
+        if od_every < 1:
+            raise ValueError(f"--od-every must be >= 1, got {od_every}")
+        OD_EVERY_N_TICKS = int(od_every)
+    if od_settle_seconds is not None:
+        if od_settle_seconds != 0:
+            # Refused rather than documented, because the failure is silent and
+            # lands on the safety lane. The settle has no implementation yet;
+            # the only way to honour a non-zero value here would be to block
+            # the sensor thread, which stalls TEMPERATURE too and takes
+            # overtemp detection from 3 x 10 s to 3 x (10 + settle). That is
+            # the exact regression the two-lane split exists to prevent.
+            #
+            # Implementing it properly means interleaving temperature reads
+            # through the settle -- a state machine across base ticks, not a
+            # sleep -- plus teaching _resend_stir_locked not to switch the
+            # stirrers back on mid-settle, plus a stir-off OD blank. See
+            # _acquire_od for the full list.
+            raise ValueError(
+                f"od_settle_seconds must be 0 (got {od_settle_seconds}): "
+                "stopping the stirrers before an OD read is not implemented. "
+                "A non-zero settle could only be honoured by blocking the "
+                "sensor thread, which would stall the temperature/heater-safety "
+                "lane as well and multiply over-temperature detection latency. "
+                "See _acquire_od for what implementing it requires."
+            )
+        OD_SETTLE_SECONDS = float(od_settle_seconds)
+    OD_INTERVAL_SECONDS = SENSOR_LOOP_INTERVAL_SECONDS * OD_EVERY_N_TICKS
+
+# Low-disk monitor (sensor loop). The Pi's disk is finite and a multi-day run
+# accumulates many rows; warn before a run fills the disk and dies.
 # Checked every N cycles (not every tick) and edge-triggered so it alerts once
 # per crossing. Thresholds fire on whichever of free-bytes / free-% trips first.
-DISK_CHECK_EVERY_CYCLES = 30  # ~5 min at a 10 s cadence
+DISK_CHECK_EVERY_CYCLES = 30  # ~5 min at the 10 s base tick
 DISK_WARN_FREE_BYTES = 1 * 1024 ** 3       # 1 GB
 DISK_WARN_FREE_PCT = 10.0
 DISK_CRITICAL_FREE_BYTES = 256 * 1024 ** 2  # 256 MB
@@ -213,6 +296,18 @@ class AppState:
         self.bus_health = evlog.BusHealth()
         self.vial_health = evlog.VialHealth(N_VIALS)
         self.log_writes_suspended = False
+        # Last broadcast `sensor_update`, verbatim, plus the OD half on its
+        # own. The dashboard is push-driven, so without this a page load or a
+        # reconnect renders empty until the next tick fires -- up to a full
+        # base period, and the OD numbers up to a full OD period. Served to a
+        # newly connected socket and by GET /api/sensors/latest, neither of
+        # which touches the serial bus.
+        self.last_sensor_update: dict | None = None
+        self.last_temperature: dict | None = None
+        self.last_od: dict | None = None
+        self.last_od_timestamp: str | None = None
+        self.last_od_monotonic: float | None = None
+        self.last_update_monotonic: float | None = None
 
 
 def _read_temperature_pair(state: AppState) -> dict:
@@ -255,6 +350,41 @@ def _read_od_pair(state: AppState) -> dict:
         "n_valid": [1] * N_VIALS,
         "flags": flags,
     }
+
+
+def _acquire_od(state: AppState) -> dict:
+    """One OD acquisition, including whatever has to happen around the read.
+
+    **Today this is exactly a bare read, and the stirrers never stop.** The
+    function exists as the seam where stopping them would go, and as the place
+    the requirements for doing so are written down.
+
+    Kept separate from ``_read_od_pair`` so the HTTP live-read routes
+    (``/api/sensors/*``) keep hitting the bare read: they are operator-driven
+    one-shots and must not stop the stirrers of a running experiment.
+
+    **What implementing the stir stop actually requires.** It is not a sleep
+    here. ``configure_cadence`` refuses a non-zero ``OD_SETTLE_SECONDS`` for
+    that reason: blocking this thread stalls the TEMPERATURE lane too, and
+    overtemp detection is three consecutive reads of that lane. The settle has
+    to be a state machine spanning several base ticks, with temperature still
+    being read through it.
+
+    **And a landmine on top of that.** The engine re-sends
+    stir setpoints on EVERY base tick, from ``_resend_stir_locked`` inside
+    ``run_cycle`` (step 5) -- that is deliberate drift protection against a
+    PWM board that has lost its setting. If the settle window is long enough
+    to span a base tick, that re-send will switch the stirrers back on in the
+    middle of it, and the OD read lands on a vortex that never settled. The
+    two mechanisms have to be made aware of each other: either the engine
+    learns a "stir suspended for OD acquisition" state that ``_resend_stir_locked``
+    honours, or the whole acquire runs inside the engine lock so no re-send can
+    interleave. The second question to settle at the same time is what the OD
+    calibration and the per-run blank mean once the read happens with stir off
+    -- both were taken with stir ON, and CalibrationService already warns when
+    a blank's ``stir_pwm`` differs from the run's ``stir_rate``.
+    """
+    return _read_od_pair(state)
 
 
 # --- NaN/Inf JSON safety ----------------------------------------------------
@@ -601,6 +731,12 @@ def create_app(use_mock: bool):
         on_event=_emit_event,
         on_alert=_emit_alert_payload,
         temp_cal=temp_cal,
+        # The engine needs both periods: the control lane's to validate a
+        # chemostat bolus interval it can actually honour and to describe OD
+        # streaks in minutes, the base tick's to describe temperature streaks
+        # in seconds.
+        cycle_interval_seconds=OD_INTERVAL_SECONDS,
+        base_tick_seconds=SENSOR_LOOP_INTERVAL_SECONDS,
     )
     state.engine = engine
 
@@ -694,6 +830,27 @@ def create_app(use_mock: bool):
         )
 
     # ------------------------------ Actuator routes --------------------------
+
+    @flask_app.route("/api/sensors/latest")
+    def api_sensor_latest():
+        """Last broadcast reading, from cache. Touches NO serial I/O.
+
+        This is the endpoint a client should poll or fetch on load. The three
+        routes above each perform a live bus read: they contend with the
+        sensor loop for the SerialManager lock, and once the OD lane stops the
+        stirrers before its read they will also fire the LED mid-vortex,
+        against a calibration taken under stir. They remain available as
+        deliberate operator-driven one-shots; they are not a refresh path.
+        """
+        payload = state.last_sensor_update
+        if payload is None:
+            return jsonify(
+                error="no sensor reading yet; the loop has not completed a tick"
+            ), 503
+        age = None
+        if state.last_update_monotonic is not None:
+            age = round(time.monotonic() - state.last_update_monotonic, 1)
+        return jsonify(**payload, age_seconds=age)
 
     @flask_app.route("/api/actuators/state")
     def api_actuator_state():
@@ -1900,6 +2057,59 @@ def create_app(use_mock: bool):
             "escalation_pending_vials": escalation_pending,
         }
 
+    def _sensor_update_payload(ts_iso: str) -> dict:
+        """Build one `sensor_update` broadcast.
+
+        The OD block is ALWAYS populated, from `state.last_od` when this tick
+        did not acquire. Five of every six ticks re-send an OD reading that is
+        up to a minute old, so the payload carries `od.timestamp` and
+        `od.age_seconds` beside the values: a number the dashboard can render
+        continuously, plus the two fields that say how old it is. Without them
+        a re-sent value is indistinguishable from a fresh one.
+
+        `intervals` is included so clients derive their own staleness
+        thresholds instead of hardcoding a cadence the server can change from
+        the command line.
+        """
+        o = state.last_od
+        od_age = None
+        if state.last_od_monotonic is not None:
+            od_age = round(time.monotonic() - state.last_od_monotonic, 1)
+        return {
+            "timestamp": ts_iso,
+            "temperature": {
+                "calibrated": state.last_temperature.get("calibrated") if state.last_temperature else [],
+                "raw": state.last_temperature.get("raw") if state.last_temperature else [],
+            },
+            "od": {
+                "calibrated": o.get("calibrated") if o else [],
+                "raw": o.get("raw") if o else [],
+                "dark": o.get("dark") if o else None,
+                "n_valid": o.get("n_valid") if o else None,
+                "flags": o.get("flags") if o else None,
+                # The tick the OD values were actually measured on -- NOT
+                # `timestamp`. Charts must key off this or a re-sent reading
+                # lands as OD_EVERY_N_TICKS identical points per OD period.
+                "timestamp": state.last_od_timestamp,
+                "age_seconds": od_age,
+            },
+            "experiment": _experiment_summary(),
+            # SPEC 17 growth estimates. Recomputed on a 60 s throttle inside
+            # the engine, so most ticks re-send an unchanged block -- cheap,
+            # and it keeps the dashboard from needing a second poll.
+            "growth": state.engine.growth_snapshot(),
+            # RS485 bus + per-vial sleeve health, so the dashboard indicators
+            # refresh at the base cadence rather than polling (SPEC 20.4).
+            "health": {
+                "bus": state.bus_health.snapshot(),
+                "vials": state.vial_health.snapshot(),
+            },
+            "intervals": {
+                "base_seconds": SENSOR_LOOP_INTERVAL_SECONDS,
+                "od_seconds": OD_INTERVAL_SECONDS,
+            },
+        }
+
     def _execute_pump_actions(actions, ts_iso: str) -> None:
         """Fire each (vial, PumpAction) tuple via SerialManager, log to
         the DataLogger, and broadcast experiment_event over socketio.
@@ -1962,21 +2172,27 @@ def create_app(use_mock: bool):
         for vial, action, captured_ts in queued:
             _execute_pump_actions([(vial, action)], captured_ts)
 
-    def _classify_bus_reads(t: dict, o: dict) -> None:
+    def _classify_bus_reads(t: dict, o: dict | None) -> None:
         """Feed one cycle's reads into the health trackers and alert on the
         transitions that matter (SPEC §20.3).
 
         TRANSIENT is deliberately silent: the RS485 bus drops frames by design
         and commit b9b135a already tolerates it. Only a bus that has gone quiet
         for `failure_threshold` consecutive cycles is worth waking someone for.
+
+        ``o=None`` is a temperature-only tick: the OD subsystem is not
+        classified at all, rather than classified as a failure. Feeding it a
+        miss on every fast tick would drive the OD bus straight to "down" and
+        keep it there, which is the opposite of what the tracker is for.
         """
         transitions = evlog.classify_cycle(
             state.bus_health,
             state.vial_health,
             temperature=t.get("calibrated"),
-            od_calibrated=o.get("calibrated"),
-            od_flags=o.get("flags"),
-            od_n_valid=o.get("n_valid"),
+            od_calibrated=o.get("calibrated") if o else None,
+            od_flags=o.get("flags") if o else None,
+            od_n_valid=o.get("n_valid") if o else None,
+            od_acquired=o is not None,
         )
         for subsystem, outcome in transitions:
             if outcome == evlog.ErrorClass.PERSISTENT:
@@ -2038,37 +2254,96 @@ def create_app(use_mock: bool):
                 dedup_key="log_suspension",
             )
 
+    @socketio.on("connect")
+    def _on_connect():
+        """Push the last known reading to the client that just connected.
+
+        The dashboard is push-driven, so without this a page load or a
+        reconnect shows placeholders until the next tick -- up to a full base
+        period for temperature and a full OD period for OD. A bare `emit`
+        inside a connect handler targets only the requesting client, so this
+        costs nothing for anyone already connected.
+        """
+        if state.last_sensor_update is not None:
+            emit("sensor_update", state.last_sensor_update)
+
     def sensor_loop():
-        log.info("sensor loop started (interval=%.1fs)", SENSOR_LOOP_INTERVAL_SECONDS)
+        """One thread, two lanes: a fast safety lane and an OD lane that can
+        be decimated below it.
+
+        **Currently both run at the base 10 s tick** (OD_EVERY_N_TICKS = 1),
+        so every tick reads temperature AND OD, control decides on it, and the
+        stirrers are never touched. The decimation path below stays live
+        because slowing OD is what would buy time to stop them.
+
+        One thread, not two, on purpose. Both lanes serialize on the same
+        SerialManager lock, so a second thread would buy no parallelism and
+        would double the concurrency surface around the engine lock and the
+        stir state -- for a bus that is half-duplex anyway.
+
+        The OD lane is scheduled by DUE TIME rather than by ``tick % N``. The
+        loop's real period is ``max(interval, work)`` and can only ever run
+        slow, so a counter would silently stretch the OD interval on a loaded
+        box -- the same reason the growth service schedules by due time.
+        """
+        log.info(
+            "sensor loop started (base tick %.1fs, OD every %d ticks = %.1fs, "
+            "settle %.1fs)",
+            SENSOR_LOOP_INTERVAL_SECONDS, OD_EVERY_N_TICKS,
+            OD_INTERVAL_SECONDS, OD_SETTLE_SECONDS,
+        )
+        # Acquire OD on the very first tick so a fresh start has a reading
+        # immediately rather than after a full OD period.
+        next_od_due = time.monotonic()
         while not state.sensor_thread_stop.is_set():
             tick_start = time.monotonic()
             try:
                 ts_iso = _now_iso()
-                t = _read_temperature_pair(state)
-                o = _read_od_pair(state)
+                od_tick = tick_start >= next_od_due
 
-                # Feed the calibration thermal-settling tracker (SPEC §19.2's
+                # --- fast lane: every tick -----------------------------
+                t = _read_temperature_pair(state)
+                state.last_temperature = t
+
+                # Feed the calibration thermal-settling tracker (SPEC 19.2's
                 # "held >=10 min" guard is enforced from what this loop saw).
                 cal_service.note_temperatures(t["calibrated"])
 
-                # SPEC §20.3 classification. Done here rather than inside
+                # --- OD lane: every OD_EVERY_N_TICKS ticks -------------
+                o = None
+                if od_tick:
+                    # Advance from the due time, not from now, so a slow tick
+                    # does not permanently push the OD cadence later.
+                    next_od_due = max(
+                        tick_start + 1e-9, next_od_due + OD_INTERVAL_SECONDS
+                    )
+                    o = _acquire_od(state)
+                    state.last_od = o
+                    state.last_od_timestamp = ts_iso
+                    state.last_od_monotonic = time.monotonic()
+
+                # SPEC 20.3 classification. Done here rather than inside
                 # SerialManager because this is where both subsystems' results
                 # are visible in one place, and it works while idle too.
+                # `o is None` marks OD not-attempted, which is not a failure.
                 _classify_bus_reads(t, o)
 
                 # log_sensor_cycle is a no-op when no experiment is running;
                 # we still call it every tick so the active-vs-idle decision
-                # lives in one place (the DataLogger).
+                # lives in one place (the DataLogger). On a fast tick it
+                # writes the temperature row only -- vialNN_temp.csv and
+                # vialNN_OD.csv are separate files read independently, so
+                # differing row counts are fine.
                 try:
                     state.data_logger.log_sensor_cycle(
                         timestamp_iso=ts_iso,
                         temperature_calibrated=t["calibrated"],
                         temperature_raw=t["raw"],
-                        od_calibrated=o["calibrated"],
-                        od_raw=o["raw"],
-                        od_n_valid=o.get("n_valid"),
-                        od_flags=o.get("flags"),
-                        od_dark=o.get("dark"),
+                        od_calibrated=o["calibrated"] if o else None,
+                        od_raw=o["raw"] if o else None,
+                        od_n_valid=o.get("n_valid") if o else None,
+                        od_flags=o.get("flags") if o else None,
+                        od_dark=o.get("dark") if o else None,
                     )
                 except Exception:
                     log.exception("data_logger.log_sensor_cycle failed")
@@ -2080,12 +2355,18 @@ def create_app(use_mock: bool):
                         dedup_key="log_sensor_cycle_failed",
                     )
 
-                # Run the experiment control loop (returns [] when not RUNNING).
+                # Run the experiment control loop (returns [] when not
+                # RUNNING). Called on BOTH lanes: heater safety, the
+                # temperature dropped-read streak, the stir re-send and the
+                # growth recompute all live on the fast lane, and only the
+                # OD-dependent half is gated on od_calibrated being present.
                 pump_actions: list = []
                 try:
                     pump_actions = state.engine.run_cycle(
-                        ts_iso, t["calibrated"], o["calibrated"],
-                        od_flags=o.get("flags"),
+                        ts_iso,
+                        t["calibrated"],
+                        o["calibrated"] if o else None,
+                        od_flags=o.get("flags") if o else None,
                     )
                 except Exception as exc:
                     log.exception("engine.run_cycle failed")
@@ -2121,46 +2402,30 @@ def create_app(use_mock: bool):
                     log.exception("maintenance timeout check failed")
 
                 # Low-disk monitor: throttled (~every 5 min) so we don't stat
-                # the filesystem every tick. Runs regardless of experiment state.
+                # the filesystem every tick. Runs regardless of experiment
+                # state.
                 state.disk_check_counter += 1
                 if state.disk_check_counter % DISK_CHECK_EVERY_CYCLES == 1:
                     _check_disk_space()
 
                 # Broadcast sensor update WITH experiment status so the
                 # dashboard can keep its status bar fresh without polling.
-                socketio.emit(
-                    "sensor_update",
-                    {
-                        "timestamp": ts_iso,
-                        "temperature": {
-                            "calibrated": t["calibrated"],
-                            "raw": t["raw"],
-                        },
-                        "od": {
-                            "calibrated": o["calibrated"],
-                            "raw": o["raw"],
-                            "dark": o.get("dark"),
-                            "n_valid": o.get("n_valid"),
-                            "flags": o.get("flags"),
-                        },
-                        "experiment": _experiment_summary(),
-                        # SPEC §17 growth estimates. Recomputed on a 60 s
-                        # throttle inside the engine, so most ticks re-send an
-                        # unchanged block -- cheap, and it keeps the dashboard
-                        # from needing a second poll.
-                        "growth": state.engine.growth_snapshot(),
-                        # RS485 bus + per-vial sleeve health, so the dashboard
-                        # indicators refresh at the sensor cadence rather than
-                        # polling (SPEC §20.4).
-                        "health": {
-                            "bus": state.bus_health.snapshot(),
-                            "vials": state.vial_health.snapshot(),
-                        },
-                    },
-                )
+                # Cached verbatim so a newly connected socket and
+                # GET /api/sensors/latest can be served without touching the
+                # bus -- otherwise a page load renders empty for up to a full
+                # tick, and its OD for up to a full OD period.
+                payload = _sensor_update_payload(ts_iso)
+                state.last_sensor_update = payload
+                state.last_update_monotonic = time.monotonic()
+                socketio.emit("sensor_update", payload)
 
-                # Only pet on a successful sensor read — if the bus is stuck
+                # Only pet on a successful sensor read -- if the bus is stuck
                 # we want the watchdog to actually fire.
+                #
+                # Deliberately on the FAST lane. A temperature response proves
+                # the bus is alive, and gating the pet on OD would arm the
+                # watchdog against the settle window the OD lane exists to
+                # make room for.
                 state.watchdog.pet()
             except Exception as exc:
                 log.exception("sensor loop tick failed")
@@ -2257,7 +2522,35 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--host", default=DEFAULT_HOST, help="Bind host.")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="Bind port.")
     parser.add_argument("--log-level", default="INFO", help="Logging level.")
+    parser.add_argument(
+        "--sensor-interval", type=float, default=None, metavar="SECONDS",
+        help=(
+            "Base sensor tick (default %(default)s -> "
+            f"{SENSOR_LOOP_INTERVAL_SECONDS:g} s). Temperature, heater "
+            "safety and the dashboard broadcast run at this rate. Raising it "
+            "multiplies over-temperature detection latency by 3."
+        ),
+    )
+    parser.add_argument(
+        "--od-every", type=int, default=None, metavar="N",
+        help=(
+            "Acquire OD (and run control decisions) every Nth base tick "
+            f"(default {OD_EVERY_N_TICKS} = every tick). Raising this slows "
+            "the OD cadence without slowing heater safety -- but the "
+            "growth_rate.py span constants are tuned to the OD cadence and "
+            "must be re-derived alongside it (GROWTH_RATE_METHOD.md 5.2)."
+        ),
+    )
+    parser.add_argument(
+        "--od-settle", type=float, default=None, metavar="SECONDS",
+        help=(
+            "Reserved for stopping the stirrers before an OD read. NOT "
+            "IMPLEMENTED -- must be 0; any other value is rejected. The "
+            "stirrers currently never stop."
+        ),
+    )
     args = parser.parse_args(argv)
+    configure_cadence(args.sensor_interval, args.od_every, args.od_settle)
 
     logging.basicConfig(
         level=args.log_level.upper(),
@@ -2273,6 +2566,12 @@ def main(argv: list[str] | None = None) -> int:
     except Exception:
         log.exception("could not set up file logging in %s", LOGS_DIR)
 
+    log.info(
+        "sensor cadence: base tick %.1f s, OD every %d ticks (%.1f s), "
+        "settle %.1f s",
+        SENSOR_LOOP_INTERVAL_SECONDS, OD_EVERY_N_TICKS,
+        OD_INTERVAL_SECONDS, OD_SETTLE_SECONDS,
+    )
     flask_app, socketio = create_app(use_mock=args.mock)
     socketio.run(
         flask_app,

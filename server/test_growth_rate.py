@@ -340,7 +340,7 @@ def test_windows_searched_present_in_every_estimate():
 
 
 def test_lag_time_is_measured_from_the_supplied_origin():
-    """The engine hands over a rolling 3 h window, so a lag measured from the
+    """The engine hands over a rolling history window, so a lag measured from the
     first supplied sample is a number about the window, not the culture."""
     mu, od0 = 0.7, 0.02
     samples = exponential(mu, hours=4.0, od0=od0, noise=0.0)
@@ -904,9 +904,23 @@ def _reference_best_window(times, ods, *, window_seconds=None):
     min_n = max(g.MIN_SAMPLES,
                 int(math.ceil((1 - g.MAX_MISSING_FRACTION) * expected)))
     best, best_bounds, searched = None, None, 0
-    start = times[0]
-    while start <= times[-1] - window + 1e-6:
-        import bisect as _b
+    # Candidate starts are generated exactly as best_window_fit generates
+    # them: `t0 + k * step` in offset space, never by accumulating
+    # `start += step`. This reference exists to check the prefix-sum FIT
+    # arithmetic against a direct fit, so both sides must walk an identical
+    # grid -- if the grids drift apart by one candidate the max-R2 winner can
+    # differ and the test fails for a reason that has nothing to do with the
+    # arithmetic it is testing.
+    import bisect as _b
+    t0 = times[0]
+    slack_limit = (times[-1] - window) - t0
+    eps = max(1e-6, abs(slack_limit) * 1e-12)
+    k = 0
+    while True:
+        offset = k * step
+        if offset > slack_limit + eps:
+            break
+        start = t0 + offset
         lo = _b.bisect_left(times, start)
         hi = _b.bisect_right(times, start + window)
         if hi - lo >= min_n:
@@ -915,7 +929,7 @@ def _reference_best_window(times, ods, *, window_seconds=None):
                 searched += 1
                 if best is None or fit.r_squared > best.r_squared:
                     best, best_bounds = fit, (lo, hi)
-        start += step
+        k += 1
     return best, best_bounds, searched
 
 

@@ -701,6 +701,7 @@ def classify_cycle(
     od_calibrated=None,
     od_flags=None,
     od_n_valid=None,
+    od_acquired: bool = True,
 ) -> list:
     """Feed one sensor cycle into both health trackers (SPEC §20.3).
 
@@ -712,18 +713,22 @@ def classify_cycle(
     home and can be tested without a Flask app.
     """
     transitions = []
-    checks = (
-        ("temperature", temperature_read_ok(temperature)),
-        ("od", od_read_ok(
+    checks = [("temperature", temperature_read_ok(temperature))]
+    # `od_acquired=False` is a temperature-only tick of the split sensor loop
+    # (app.py): OD was not attempted, so it is neither a success nor a
+    # failure. Recording it as a miss would drive the OD bus to "down" within
+    # three fast ticks and pin it there forever.
+    if od_acquired:
+        checks.append(("od", od_read_ok(
             flags=od_flags, n_valid=od_n_valid, calibrated=od_calibrated,
-        )),
-    )
+        )))
     for subsystem, ok in checks:
         outcome = bus_health.record(subsystem, ok)
         if outcome is not None:
             transitions.append((subsystem, outcome))
     vial_health.record_cycle(
         temperature=temperature, od_flags=od_flags, od_n_valid=od_n_valid,
+        od_acquired=od_acquired,
     )
     return transitions
 
@@ -755,7 +760,12 @@ class VialHealth:
         self.n_vials = int(n_vials)
         self.degraded_threshold = max(1, int(degraded_threshold))
         self._lock = threading.RLock()
-        self._dropped = [0] * self.n_vials
+        # Split per lane, for the same reason ExperimentEngine splits its
+        # streaks: temperature ticks ~6x more often than OD, so a single fused
+        # counter would be reset by a good temperature read on a fast tick and
+        # an OD dropout streak could never reach the threshold.
+        self._temp_dropped = [0] * self.n_vials
+        self._od_dropped = [0] * self.n_vials
         self._out_of_range = [0] * self.n_vials
 
     def record_cycle(
@@ -764,7 +774,16 @@ class VialHealth:
         temperature=None,
         od_flags=None,
         od_n_valid=None,
+        od_acquired: bool = True,
     ) -> None:
+        """Fold one cycle into the per-vial streaks.
+
+        ``od_acquired=False`` marks a temperature-only tick: the OD counters
+        are left exactly as they were rather than being advanced or reset.
+        Resetting them would be the more tempting bug -- five fast ticks
+        between OD acquisitions would clear every OD streak before it could
+        reach the degraded threshold.
+        """
         with self._lock:
             for v in range(self.n_vials):
                 temp_bad = (
@@ -772,6 +791,14 @@ class VialHealth:
                     and v < len(temperature)
                     and not _is_finite(temperature[v])
                 )
+                if temp_bad:
+                    self._temp_dropped[v] += 1
+                else:
+                    self._temp_dropped[v] = 0
+
+                if not od_acquired:
+                    continue
+
                 flag = (
                     od_flags[v]
                     if od_flags is not None and v < len(od_flags)
@@ -790,16 +817,20 @@ class VialHealth:
                 else:
                     self._out_of_range[v] = 0
 
-                if temp_bad or od_dropped:
-                    self._dropped[v] += 1
+                if od_dropped:
+                    self._od_dropped[v] += 1
                 else:
-                    self._dropped[v] = 0
+                    self._od_dropped[v] = 0
 
     def snapshot(self) -> list[dict]:
         with self._lock:
             out = []
             for v in range(self.n_vials):
-                streak = self._dropped[v]
+                # Worst lane wins. `dropped_streak` stays a single number in
+                # the payload the dashboard already renders; the per-lane
+                # counts ride alongside so a reader can tell WHICH sensor is
+                # failing, and how long that streak actually is in seconds.
+                streak = max(self._temp_dropped[v], self._od_dropped[v])
                 oor = self._out_of_range[v]
                 if streak >= self.degraded_threshold:
                     state = "degraded"
@@ -813,6 +844,8 @@ class VialHealth:
                     "vial": v,
                     "state": state,
                     "dropped_streak": streak,
+                    "temp_dropped_streak": self._temp_dropped[v],
+                    "od_dropped_streak": self._od_dropped[v],
                     "out_of_range_streak": oor,
                 })
             return out

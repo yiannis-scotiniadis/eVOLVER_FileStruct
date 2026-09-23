@@ -89,7 +89,19 @@ DEFAULT_HEATER_OVERRUN_C = 5.0
 DEFAULT_HEATER_CRITICAL_C = 50.0
 DEFAULT_HEATER_STEP_DOWN_C = 2.0  # SPEC.md §10: per-cycle target reduction on overrun
 DEFAULT_SENSOR_FAILURE_THRESHOLD = 3
+# The control lane's period: how often run_cycle is handed a fresh OD sample
+# and calls controller.decide(). Equal to app.py's OD_INTERVAL_SECONDS, which
+# is currently the base tick (OD is acquired every tick).
+#
+# Doubles as the chemostat's default bolus interval, and must track the OD
+# lane wherever that goes: decide() is only called on an OD tick, so a bolus
+# interval shorter than the OD period cannot be honoured -- see the guard in
+# validate_control_parameters. app.py passes the real value into the engine,
+# so this default only governs direct construction.
 DEFAULT_CYCLE_INTERVAL_SECONDS = 10.0
+# The safety lane's period (app.py SENSOR_LOOP_INTERVAL_SECONDS). Temperature,
+# heater safety and the growth stagger run at this rate, not the control rate.
+DEFAULT_BASE_TICK_SECONDS = 10.0
 PUMP_DURATION_HARD_CAP_SECONDS = 30.0  # engine-level safety cap (SPEC §10)
 DEFAULT_MAINTENANCE_TIMEOUT_MINUTES = 30.0  # auto-resume failsafe
 
@@ -223,6 +235,7 @@ def validate_control_parameters(
     parameters: dict,
     flow_rates: list[float],
     vials: list[int],
+    control_interval_seconds: float = DEFAULT_CYCLE_INTERVAL_SECONDS,
 ) -> list[str]:
     """Validate the control parameters for `mode` at experiment-creation
     time (CONTROL_MODE_AUDIT.md C-3, and the precondition for T-3).
@@ -326,6 +339,25 @@ def validate_control_parameters(
         if bolus_interval is None:
             bolus_interval = DEFAULT_CYCLE_INTERVAL_SECONDS
         bolus_interval = float(bolus_interval)
+        # The control lane calls decide() once per control tick, so a bolus
+        # interval below it cannot be honoured -- the interval silently
+        # becomes the tick. That alone would be harmless (boli are sized from
+        # elapsed time, so D is preserved), but `safety_cap` is derived from
+        # the NOMINAL interval while the bolus is sized from the ACTUAL
+        # elapsed time: ask for a 5 s interval against a 10 s tick and every
+        # single bolus clips to 4 s, emits `bolus_cap_clipped`, and the run
+        # under-delivers for its whole length while booking the full rate.
+        if bolus_interval < control_interval_seconds:
+            raise ValueError(
+                f"'bolus_interval_seconds' must be >= the control interval "
+                f"({control_interval_seconds:g} s), got {bolus_interval:g}: "
+                "the controller only decides once per control tick, so a "
+                "shorter interval is not honoured -- and because each bolus "
+                "is sized from elapsed time while the overlap safety cap is "
+                "sized from the nominal interval, every bolus would be "
+                "clipped and the delivered dilution rate would fall short of "
+                "the requested one for the entire run"
+            )
         if bolus_interval < MIN_BOLUS_INTERVAL_SECONDS:
             raise ValueError(
                 f"'bolus_interval_seconds' must be >= "
@@ -541,6 +573,7 @@ class ExperimentEngine:
         temp_cal: Optional[np.ndarray] = None,
         clock: Callable[[], float] = time.time,
         cycle_interval_seconds: float = DEFAULT_CYCLE_INTERVAL_SECONDS,
+        base_tick_seconds: float = DEFAULT_BASE_TICK_SECONDS,
         sensor_failure_threshold: int = DEFAULT_SENSOR_FAILURE_THRESHOLD,
         heater_overrun_C: float = DEFAULT_HEATER_OVERRUN_C,
         heater_critical_C: float = DEFAULT_HEATER_CRITICAL_C,
@@ -553,7 +586,11 @@ class ExperimentEngine:
         self._on_alert = on_alert
         self._temp_cal = temp_cal
         self._clock = clock
+        # The control (OD) lane's period and the safety lane's period. Only
+        # used to put wall-clock durations into streak alerts and to validate
+        # a chemostat's bolus interval against the lane that honours it.
         self._cycle_interval_seconds = float(cycle_interval_seconds)
+        self._base_tick_seconds = float(base_tick_seconds)
         self._sensor_failure_threshold = int(sensor_failure_threshold)
         self._heater_overrun_C = float(heater_overrun_C)
         self._heater_critical_C = float(heater_critical_C)
@@ -569,8 +606,18 @@ class ExperimentEngine:
         self._controllers: dict[int, ControllerType] = {}
         self._setpoint_raw: dict[int, int] = {}
         self._setpoint_stir: int = 0
-        self._nan_streak: dict[int, int] = {}
+        # Dropped-read streaks, one per lane. Split because the two lanes
+        # tick at different periods: three consecutive dropped TEMPERATURE
+        # reads is 30 s, three consecutive dropped OD reads is 3 min, and a
+        # single fused counter made both the latch semantics and the operator
+        # alert ambiguous about which it meant.
+        self._temp_nan_streak: dict[int, int] = {}
+        self._od_nan_streak: dict[int, int] = {}
         self._od_range_streak: dict[int, int] = {}
+        # Set by anything that changes persisted state on a fast tick, so the
+        # every-tick fsync in _save_state_locked can be skipped when nothing
+        # actually moved. OD ticks persist unconditionally.
+        self._state_dirty: bool = False
         self._vial_faults: dict[int, Optional[str]] = {}
 
         # Growth-rate service (SPEC §17 / GROWTH_RATE_METHOD.md §7). All of
@@ -742,6 +789,7 @@ class ExperimentEngine:
         control_warnings = validate_control_parameters(
             mode, parameters or {}, flow_rates,
             sorted(int(v) for v in vials),
+            control_interval_seconds=self._cycle_interval_seconds,
         )
 
         with self._lock:
@@ -768,7 +816,8 @@ class ExperimentEngine:
             # these with the target temperatures derived from config parameters.
             self._setpoint_raw = {v: HEATER_OFF_SETPOINT for v in self._vials}
             self._setpoint_stir = 0
-            self._nan_streak = {v: 0 for v in self._vials}
+            self._temp_nan_streak = {v: 0 for v in self._vials}
+            self._od_nan_streak = {v: 0 for v in self._vials}
             self._od_range_streak = {v: 0 for v in self._vials}
             self._vial_faults = {v: None for v in self._vials}
             self._reset_growth_state_locked()
@@ -1333,10 +1382,10 @@ class ExperimentEngine:
         self,
         timestamp_iso: str,
         temperature_calibrated: list[float],
-        od_calibrated: list[float],
+        od_calibrated: Optional[list[float]] = None,
         od_flags: Optional[list[str]] = None,
     ) -> list[tuple[int, PumpAction]]:
-        """Run one control-loop tick. Returns pump actions the caller
+        """Run one sensor-loop tick. Returns pump actions the caller
         should execute (each as a ``(vial, PumpAction)`` tuple). Returns
         ``[]`` when the engine isn't RUNNING or no vial wants a pump.
 
@@ -1349,6 +1398,37 @@ class ExperimentEngine:
         fault latching, stir re-send, and state.json persistence —
         those are pure engine concerns that don't need the caller.
 
+        **Two lanes.** The sensor loop can read temperature more often than
+        OD, because over-temperature safety is not delegated to firmware:
+        ``_handle_heater_safety_locked`` needs three consecutive over-critical
+        reads, so its detection latency is ``3 x`` whatever period it is
+        called at, and it must never be slowed just to give OD more time.
+        ``od_calibrated=None`` marks a **temperature-only tick** and runs
+        exactly the lane that does not need a fresh OD sample.
+
+        *Currently both lanes run at 10 s* (``app.py`` OD_EVERY_N_TICKS = 1),
+        so every tick is an OD tick and the None path is exercised only by
+        tests. It is kept working because decimating the OD lane again is
+        what buys time to stop the stirrers before a read:
+
+        =========================================  =========  ========
+        step                                       fast tick  OD tick
+        =========================================  =========  ========
+        temperature dropped-read streak + warn     yes        yes
+        _handle_heater_safety_locked               yes        yes
+        OD dropped / out-of-range streaks          -          yes
+        push_od / decide / pump actions            -          yes
+        consumables, media debit, boundaries       -          yes
+        _maybe_update_growth_locked                yes        -
+        _resend_stir_locked                        yes        yes
+        _save_state_locked                         if dirty   yes
+        =========================================  =========  ========
+
+        Growth is on the FAST lane deliberately: it reads this engine's own
+        timestamped OD history rather than a fresh sample, and its per-tick
+        vial stagger is sized in base ticks (see
+        ``growth.VIALS_PER_RECOMPUTE_GROUP_DIVISOR``).
+
         ``od_flags`` is the optional per-vial flag list from the enhanced OD
         reader (``"ok" | "out_of_range" | "dropped"``). When provided, an
         ``out_of_range`` reading (OD past the calibrated domain — likely
@@ -1356,12 +1436,15 @@ class ExperimentEngine:
         rather than being counted as a lossy-bus dropped read. ``None``
         preserves the legacy behavior (all NaN OD treated as dropped).
         """
-        if len(temperature_calibrated) != N_VIALS or len(od_calibrated) != N_VIALS:
+        od_tick = od_calibrated is not None
+        if len(temperature_calibrated) != N_VIALS or (
+            od_tick and len(od_calibrated) != N_VIALS
+        ):
             log.warning(
-                "run_cycle: sensor arrays must be length %d; got %d / %d",
+                "run_cycle: sensor arrays must be length %d; got %d / %s",
                 N_VIALS,
                 len(temperature_calibrated),
-                len(od_calibrated),
+                len(od_calibrated) if od_tick else "no-od",
             )
             return []
 
@@ -1375,9 +1458,9 @@ class ExperimentEngine:
                 if self._vial_faults.get(vial) is not None:
                     continue  # latched fault — skip
                 temp_c = temperature_calibrated[vial]
-                od = od_calibrated[vial]
                 temp_nan = _is_nan(temp_c)
-                od_nan = _is_nan(od)
+                od = od_calibrated[vial] if od_tick else None
+                od_nan = od_tick and _is_nan(od)
 
                 # (1a) OD out-of-range: a DISTINCT condition from a lossy
                 # dropped read. The OD is NaN (range guard rejected it), but
@@ -1386,11 +1469,14 @@ class ExperimentEngine:
                 # warn once on crossing the threshold, and skip OD control —
                 # but let heater safety still run if the temperature is valid.
                 od_out_of_range = (
-                    od_flags is not None
+                    od_tick
+                    and od_flags is not None
                     and vial < len(od_flags)
                     and od_flags[vial] == "out_of_range"
                 )
-                if od_out_of_range:
+                if not od_tick:
+                    pass  # OD streaks are the OD lane's business
+                elif od_out_of_range:
                     self._od_range_streak[vial] = self._od_range_streak.get(vial, 0) + 1
                     if self._od_range_streak[vial] == self._sensor_failure_threshold:
                         _msg = (
@@ -1414,13 +1500,14 @@ class ExperimentEngine:
                 # keeps regulating temperature on its own thermistor whether or
                 # not the Pi got this sample. Warn once on crossing the
                 # threshold so a genuinely dead sensor stays visible.
-                if temp_nan or (od_nan and not od_out_of_range):
-                    self._nan_streak[vial] = self._nan_streak.get(vial, 0) + 1
-                    if self._nan_streak[vial] == self._sensor_failure_threshold:
+                if temp_nan:
+                    self._temp_nan_streak[vial] = self._temp_nan_streak.get(vial, 0) + 1
+                    if self._temp_nan_streak[vial] == self._sensor_failure_threshold:
                         _msg = (
-                            f"Vial {vial}: {self._nan_streak[vial]} consecutive "
-                            "dropped sensor reads (continuing -- lossy bus; "
-                            "heater unaffected)"
+                            f"Vial {vial}: {self._temp_nan_streak[vial]} consecutive "
+                            f"dropped temperature reads "
+                            f"({self._temp_nan_streak[vial] * self._base_tick_seconds:.0f} s) "
+                            "(continuing -- lossy bus; heater unaffected)"
                         )
                         log.warning(_msg)
                         self._broadcast_alert(
@@ -1428,7 +1515,30 @@ class ExperimentEngine:
                             category="sensor",
                         )
                 else:
-                    self._nan_streak[vial] = 0
+                    self._temp_nan_streak[vial] = 0
+
+                # The OD streak advances only on OD ticks, so its count is in
+                # OD-lane periods, which need not equal base ticks. Spell the
+                # wall-clock duration out in the alert: at a 60 s OD lane
+                # "3 consecutive" would be three MINUTES, and an operator
+                # reading a bare count will assume otherwise.
+                if od_tick:
+                    if od_nan and not od_out_of_range:
+                        self._od_nan_streak[vial] = self._od_nan_streak.get(vial, 0) + 1
+                        if self._od_nan_streak[vial] == self._sensor_failure_threshold:
+                            _msg = (
+                                f"Vial {vial}: {self._od_nan_streak[vial]} consecutive "
+                                f"dropped OD reads "
+                                f"({self._od_nan_streak[vial] * self._cycle_interval_seconds / 60.0:.1f} min) "
+                                "(continuing -- lossy bus; heater unaffected)"
+                            )
+                            log.warning(_msg)
+                            self._broadcast_alert(
+                                level="warning", message=_msg, vial=vial,
+                                category="sensor",
+                            )
+                    else:
+                        self._od_nan_streak[vial] = 0
 
                 # (2) heater safety. Needs a real temperature, so it is
                 # skipped -- and only it is skipped -- on a dropped temp
@@ -1454,6 +1564,11 @@ class ExperimentEngine:
                 # OD are suspended.
                 controller = self._controllers.get(vial)
                 if controller is None:
+                    continue
+                if not od_tick:
+                    # Temperature-only tick: heater safety has run, and there
+                    # is no new OD to push or decide on. Growth still updates
+                    # below -- it reads history, not this tick's sample.
                     continue
                 if od_nan:
                     if getattr(controller, "requires_od", True):
@@ -1486,62 +1601,72 @@ class ExperimentEngine:
             # (4a) Morbidostat: poll each controller for escalation events
             # and reminder-due flags. Emitted as experiment_event + alert,
             # and logged to escalation_log.csv for provenance.
-            self._broadcast_morbidostat_events_locked(now, timestamp_iso)
+            #
+            # Everything from here to (4c) is OD-lane work: it either reads a
+            # decision this tick produced or debits a pump this tick fired,
+            # and on a temperature-only tick there are neither.
+            if od_tick:
+                self._broadcast_morbidostat_events_locked(now, timestamp_iso)
 
-            # (4a1) Drain one-shot controller events (chemostat start gate,
-            # bolus cap clipping). Controllers stay pure -- they record, the
-            # engine funnels. Per CLAUDE.md fact 3 everything goes through
-            # _broadcast_alert / _broadcast_event, never a bare emit.
-            self._broadcast_controller_events_locked()
+                # (4a1) Drain one-shot controller events (chemostat start gate,
+                # bolus cap clipping). Controllers stay pure -- they record, the
+                # engine funnels. Per CLAUDE.md fact 3 everything goes through
+                # _broadcast_alert / _broadcast_event, never a bare emit.
+                self._broadcast_controller_events_locked()
 
-            # (4a2) Consumables safety interlock (SPEC §15). Runs BEFORE
-            # debit so a suppressed pump is never counted as consumed/wasted
-            # volume. A low-media bottle suppresses the WHOLE dilution event
-            # for its vials (influx + efflux together) -- suppressing influx
-            # alone while efflux keeps running would reproduce the exact
-            # vial-drain bug this gate exists to prevent. A full waste
-            # container suppresses every vial's pump action, since an influx
-            # without a matching efflux overflows the vial.
-            if self._media_bottles:
-                allowed: list[tuple[int, PumpAction]] = []
-                suppressed: list[tuple[int, PumpAction, str]] = []
-                for vial, action in pump_actions:
-                    reason = self._vial_consumables_blocked_locked(vial)
-                    if reason is None:
-                        allowed.append((vial, action))
-                    else:
-                        suppressed.append((vial, action, reason))
-                pump_actions = allowed
-                if suppressed:
-                    self._handle_suppressed_pumps_locked(suppressed)
-                if (
-                    not self._maintenance_active
-                    and self._vials
-                    and all(
-                        self._vial_consumables_blocked_locked(v) is not None
-                        for v in self._vials
-                    )
-                ):
-                    self._enter_maintenance_locked(reason="consumables")
+                # (4a2) Consumables safety interlock (SPEC §15). Runs BEFORE
+                # debit so a suppressed pump is never counted as consumed/wasted
+                # volume. A low-media bottle suppresses the WHOLE dilution event
+                # for its vials (influx + efflux together) -- suppressing influx
+                # alone while efflux keeps running would reproduce the exact
+                # vial-drain bug this gate exists to prevent. A full waste
+                # container suppresses every vial's pump action, since an influx
+                # without a matching efflux overflows the vial.
+                if self._media_bottles:
+                    allowed: list[tuple[int, PumpAction]] = []
+                    suppressed: list[tuple[int, PumpAction, str]] = []
+                    for vial, action in pump_actions:
+                        reason = self._vial_consumables_blocked_locked(vial)
+                        if reason is None:
+                            allowed.append((vial, action))
+                        else:
+                            suppressed.append((vial, action, reason))
+                    pump_actions = allowed
+                    if suppressed:
+                        self._handle_suppressed_pumps_locked(suppressed)
+                    if (
+                        not self._maintenance_active
+                        and self._vials
+                        and all(
+                            self._vial_consumables_blocked_locked(v) is not None
+                            for v in self._vials
+                        )
+                    ):
+                        self._enter_maintenance_locked(reason="consumables")
 
-            # (4a3) Record dilution boundaries for the growth-rate service
-            # (§7.3). Runs AFTER the §15 consumables gate, so a suppressed
-            # pump correctly creates no boundary -- and, unlike the media
-            # debit below, is NOT conditional on `self._media_bottles`: a run
-            # configured without media still needs its segment boundaries.
-            self._record_dilution_events_locked(pump_actions, now)
+                # (4a3) Record dilution boundaries for the growth-rate service
+                # (§7.3). Runs AFTER the §15 consumables gate, so a suppressed
+                # pump correctly creates no boundary -- and, unlike the media
+                # debit below, is NOT conditional on `self._media_bottles`: a run
+                # configured without media still needs its segment boundaries.
+                self._record_dilution_events_locked(pump_actions, now)
 
-            # (4b) debit media consumption + waste accumulation and
-            # edge-trigger threshold alerts. Bookkeeping is optimistic
-            # (assumes the caller's pump_command will succeed); for Phase 1
-            # the sub-percent error is acceptable.
-            if self._media_bottles:
-                self._debit_media_locked(pump_actions)
+                # (4b) debit media consumption + waste accumulation and
+                # edge-trigger threshold alerts. Bookkeeping is optimistic
+                # (assumes the caller's pump_command will succeed); for Phase 1
+                # the sub-percent error is acceptable.
+                if self._media_bottles:
+                    self._debit_media_locked(pump_actions)
 
-            # (4d) Growth-rate estimates, throttled well below the sensor
-            # cadence -- the estimate does not change meaningfully in 10 s
-            # (§7.4), and this keeps vialNN_growth.csv ~1/6 the size of the
-            # OD file.
+            # (4d) Growth-rate estimates. Runs on the FAST lane, not the OD
+            # lane: the estimator reads this engine's rolling OD history
+            # rather than this tick's sample, and its per-vial stagger is
+            # sized in base ticks (growth.VIALS_PER_RECOMPUTE_GROUP_DIVISOR
+            # = 6 = the number of 10 s base ticks in the 60 s recompute
+            # interval). Riding the OD tick instead would spread sixteen
+            # vials over six OD ticks and stretch each vial's refresh to six
+            # minutes -- and would pile a sixteen-vial burst onto the tick
+            # that is already paying for an OD acquisition.
             try:
                 self._maybe_update_growth_locked(now, timestamp_iso)
             except Exception:
@@ -1563,11 +1688,27 @@ class ExperimentEngine:
             else:
                 pump_actions_to_return = pump_actions
 
-            # (6) persist
-            try:
-                self._save_state_locked()
-            except Exception:
-                log.exception("state.json persist failed")
+            # (6) persist. Unconditional on an OD tick; on a fast tick only
+            # when something that matters to a resume actually moved (a heater
+            # setpoint stepped down, a fault latched).
+            #
+            # _save_state_locked is a full JSON serialise at indent=4 followed
+            # by an fsync, inside this lock -- PI3B_HEADED_OS_ASSESSMENT.md
+            # §5.1 names it as what breaks first under memory pressure on an
+            # SD card. Running it on all six base ticks per minute rather than
+            # one would have made the split a 6x REGRESSION in write
+            # amplification instead of the reduction it should be.
+            #
+            # What a fast tick can lose by skipping: at most two ticks of
+            # dropped-read streak counters, which are advisory. Setpoints,
+            # faults, controller state and media books are all either
+            # OD-tick-driven or explicitly marked dirty.
+            if od_tick or self._state_dirty:
+                try:
+                    self._save_state_locked()
+                    self._state_dirty = False
+                except Exception:
+                    log.exception("state.json persist failed")
 
         return pump_actions_to_return
 
@@ -1613,7 +1754,10 @@ class ExperimentEngine:
                 # SPEC §20.3 DEGRADED: these streaks have been tracked since
                 # b9b135a but never surfaced, so a single failing sleeve was
                 # only visible by reading the journal.
-                nan_streak = self._nan_streak.get(vial, 0)
+                nan_streak = max(
+                    self._temp_nan_streak.get(vial, 0),
+                    self._od_nan_streak.get(vial, 0),
+                )
                 od_range_streak = self._od_range_streak.get(vial, 0)
                 if nan_streak >= self._sensor_failure_threshold:
                     sensor_health = "degraded"
@@ -1986,7 +2130,7 @@ class ExperimentEngine:
         # wall-clock datetime and `self._clock()` need not be wall time, so the
         # two are not interchangeable. Only the lag extrapolation reads this,
         # and it needs an origin at inoculation rather than at the start of
-        # the rolling 3 h window.
+        # the rolling history window.
         self._growth_run_start = self._clock()
 
     def _push_od_history_locked(self, vial: int, now: float, od: float) -> None:
@@ -2679,6 +2823,7 @@ class ExperimentEngine:
             new_target_c = max(22.0, setpoint_c - DEFAULT_HEATER_STEP_DOWN_C)
             new_raw = self._C_to_raw(new_target_c, vial)
             self._setpoint_raw[vial] = new_raw
+            self._state_dirty = True  # must survive a resume; see run_cycle (6)
             self._apply_temperature_locked()
             log.warning(
                 "vial %d overtemp: %.2f C > target %.2f C + %.1f; "
@@ -2691,6 +2836,7 @@ class ExperimentEngine:
         if self._vial_faults.get(vial) is not None:
             return  # already latched
         self._vial_faults[vial] = kind
+        self._state_dirty = True  # must survive a resume; see run_cycle (6)
         # Park this vial's heater OFF. Under the inverted convention "off"
         # is HEATER_OFF_SETPOINT (an unreachably cold target), NOT zero —
         # zero would pin the heater at maximum, which is what the safety
@@ -3088,7 +3234,8 @@ class ExperimentEngine:
                 str(v): c.to_state() for v, c in self._controllers.items()
             },
             "vial_faults": {str(k): v for k, v in self._vial_faults.items()},
-            "nan_streak": {str(k): v for k, v in self._nan_streak.items()},
+            "temp_nan_streak": {str(k): v for k, v in self._temp_nan_streak.items()},
+            "od_nan_streak": {str(k): v for k, v in self._od_nan_streak.items()},
             "od_range_streak": {str(k): v for k, v in self._od_range_streak.items()},
             "media_state": self._media_runtime_state_locked(),
             "maintenance": {
@@ -3191,18 +3338,30 @@ class ExperimentEngine:
             }
             for vial in self._vials:
                 self._vial_faults.setdefault(vial, None)
-            self._nan_streak = {
-                int(k): int(v) for k, v in (state.get("nan_streak") or {}).items()
+            # Back-compat: state.json written before the lanes were split
+            # carries a single fused "nan_streak". It counted a cycle in which
+            # EITHER sensor dropped, so seeding both lanes from it is the
+            # conservative recovery -- it can only make a warning fire sooner,
+            # never later.
+            legacy_streak = state.get("nan_streak") or {}
+            self._temp_nan_streak = {
+                int(k): int(v) for k, v in
+                (state.get("temp_nan_streak") or legacy_streak).items()
+            }
+            self._od_nan_streak = {
+                int(k): int(v) for k, v in
+                (state.get("od_nan_streak") or legacy_streak).items()
             }
             for vial in self._vials:
-                self._nan_streak.setdefault(vial, 0)
+                self._temp_nan_streak.setdefault(vial, 0)
+                self._od_nan_streak.setdefault(vial, 0)
             self._od_range_streak = {
                 int(k): int(v)
                 for k, v in (state.get("od_range_streak") or {}).items()
             }
             for vial in self._vials:
                 self._od_range_streak.setdefault(vial, 0)
-            # Growth history is NOT persisted: it is a rolling 3 h window of
+            # Growth history is NOT persisted: it is a rolling 6 h window of
             # raw OD, cheap to refill from the live sensor loop and
             # meaningless across a restart gap of unknown length. The service
             # simply reports `short_span` until the window refills.
