@@ -25,7 +25,10 @@ Dynamics
   the standard range for E. coli in rich media at 37 °C (doubling time
   ~25 min, μ ≈ 1.4–1.8 /hr).
 - Pumps: influx events dilute OD by exp(-F·t/V) once the pump finishes;
-  efflux is tracked but does not change OD.
+  efflux is tracked but does not change OD. Frames queue and run one at a
+  time, like the firmware (FLUIDICS_FIRMWARE_AUDIT.md FW-1): a frame starts
+  when the previous one ends, and every pump in its mask starts together
+  (FW-2). ``pump_log`` holds one entry per pump per frame.
 - Stir: stored as plain integer state; the only dynamical effect is
   gating growth.
 """
@@ -39,6 +42,7 @@ from typing import Optional
 
 import numpy as np
 
+from fluidics import Frame, FluidicsDispatchError, check_mask, pump_index
 from serial_manager import (
     DEFAULT_RAW_FLOOR,
     HEATER_OFF_SETPOINT,
@@ -164,6 +168,8 @@ class MockSerialManager:
 
         self.pump_log: list[dict] = []
         self._pump_cursor = 0
+        # Sim time at which the firmware's frame queue drains (FW-1).
+        self._fluidics_free_at = 0.0
         self.flow_rate = DEFAULT_FLOW_RATES_ML_PER_SEC.copy()
         self.volume_ml = DEFAULT_VOLUME_ML
 
@@ -458,12 +464,11 @@ class MockSerialManager:
             self.stir_speed = speeds
 
     def pump_command(self, vial: int, direction: str, seconds: float) -> None:
-        if not (0 <= vial < N_VIALS):
-            raise ValueError(f"vial must be in 0..{N_VIALS - 1}, got {vial}")
-        if direction not in ("influx", "efflux"):
-            raise ValueError(
-                f"direction must be 'influx' or 'efflux', got {direction!r}"
-            )
+        self.pump_mask_command(1 << pump_index(vial, direction), seconds)
+
+    def pump_mask_command(self, mask: int, seconds: float) -> None:
+        """Parity with SerialManager.pump_mask_command."""
+        check_mask(mask)
         if seconds < 0:
             raise ValueError(f"seconds must be >= 0, got {seconds}")
         # Mirror the real SerialManager's sub-second handling so mock-backed
@@ -471,42 +476,63 @@ class MockSerialManager:
         whole_seconds = int(round(seconds))
         if seconds > 0 and whole_seconds == 0:
             logging.getLogger(__name__).warning(
-                "pump_command vial=%d %s: %.3fs rounds to 0s — no pump will fire. "
+                "pump frame mask=%s: %.3fs rounds to 0s — no pump will fire. "
                 "Sub-second pump times are not supported by the legacy firmware.",
-                vial, direction, seconds,
+                format(mask, "b"), seconds,
             )
             return
         with self._lock:
-            self.pump_log.append(
-                {
-                    "sim_time": self.sim_time,
-                    "vial": int(vial),
-                    "direction": direction,
-                    "seconds": float(whole_seconds),
-                }
-            )
+            self._enqueue_frame_locked(mask, whole_seconds)
+
+    def pump_frames(self, frames) -> None:
+        """Parity with SerialManager.pump_frames (all frames validated first,
+        then queued back-to-back)."""
+        frames = [f if isinstance(f, Frame) else Frame(*f) for f in frames]
+        with self._lock:
+            for sent, frame in enumerate(frames):
+                try:
+                    self._enqueue_frame_locked(frame.mask, frame.seconds)
+                except Exception as exc:
+                    raise FluidicsDispatchError(
+                        f"pump frame {sent + 1}/{len(frames)} failed: {exc}",
+                        frames_sent=sent,
+                    ) from exc
+
+    def _enqueue_frame_locked(self, mask: int, whole_seconds: int) -> None:
+        """Queue one frame behind whatever is still running (FW-1); every pump
+        in it starts at the same sim time (FW-2)."""
+        start = max(self.sim_time, self._fluidics_free_at)
+        for pump in range(2 * N_VIALS):
+            if mask >> pump & 1:
+                self.pump_log.append(
+                    {
+                        "sim_time": start,
+                        "vial": pump % N_VIALS,
+                        "direction": "influx" if pump < N_VIALS else "efflux",
+                        "seconds": float(whole_seconds),
+                    }
+                )
+        self._fluidics_free_at = start + whole_seconds
+
+    def _log_stop_all_locked(self) -> None:
+        # The real stop frame is inert (FW-10/FW-11): it queues and does
+        # nothing. Queued here too, so pump_log end times stay monotone.
+        self.pump_log.append(
+            {
+                "sim_time": max(self.sim_time, self._fluidics_free_at),
+                "vial": -1,
+                "direction": "stop_all",
+                "seconds": 0.0,
+            }
+        )
 
     def stop_all_pumps(self) -> None:
         with self._lock:
-            self.pump_log.append(
-                {
-                    "sim_time": self.sim_time,
-                    "vial": -1,
-                    "direction": "stop_all",
-                    "seconds": 0.0,
-                }
-            )
+            self._log_stop_all_locked()
 
     def emergency_shutdown(self) -> None:
         """Stop all pumps, zero stir, park heaters OFF (HEATER_OFF_SETPOINT, not 0)."""
         with self._lock:
             self.temp_setpoint_raw = np.full(N_VIALS, HEATER_OFF_SETPOINT, dtype=int)
             self.stir_speed = np.zeros(N_VIALS, dtype=int)
-            self.pump_log.append(
-                {
-                    "sim_time": self.sim_time,
-                    "vial": -1,
-                    "direction": "stop_all",
-                    "seconds": 0.0,
-                }
-            )
+            self._log_stop_all_locked()

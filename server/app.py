@@ -46,6 +46,7 @@ from flask_socketio import SocketIO, emit
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import data_export as dx  # noqa: E402
+import fluidics  # noqa: E402
 import growth_rate as growth  # noqa: E402
 import event_log as evlog  # noqa: E402
 from calibration_service import (  # noqa: E402
@@ -457,6 +458,13 @@ def _event_message(kind: str, payload: dict) -> str:
             f"Pump {payload.get('direction', '?')} vial {vial} for "
             f"{payload.get('duration_seconds', 0):.1f}s"
         )
+    if kind == "pump_batch":
+        vials = ", ".join(str(v) for v in payload.get("vials") or []) or "?"
+        return (
+            f"Pump schedule for vial(s) {vials}: "
+            f"{len(payload.get('frames') or [])} frame(s), "
+            f"{payload.get('span_seconds', 0)}s span"
+        )
     if kind == "pump_suppressed":
         return (
             f"Pump suppressed for vial {vial}: "
@@ -629,6 +637,7 @@ def create_app(use_mock: bool):
         "renamed": (evlog.LEVEL_INFO, evlog.CATEGORY_LIFECYCLE),
         "metadata_updated": (evlog.LEVEL_INFO, evlog.CATEGORY_LIFECYCLE),
         "pump": (evlog.LEVEL_INFO, evlog.CATEGORY_PUMP),
+        "pump_batch": (evlog.LEVEL_INFO, evlog.CATEGORY_PUMP),
         "pump_suppressed": (evlog.LEVEL_WARNING, evlog.CATEGORY_PUMP),
         "maintenance_entered": (evlog.LEVEL_INFO, evlog.CATEGORY_MAINTENANCE),
         "maintenance_exited": (evlog.LEVEL_INFO, evlog.CATEGORY_MAINTENANCE),
@@ -2111,66 +2120,129 @@ def create_app(use_mock: bool):
         }
 
     def _execute_pump_actions(actions, ts_iso: str) -> None:
-        """Fire each (vial, PumpAction) tuple via SerialManager, log to
-        the DataLogger, and broadcast experiment_event over socketio.
-
-        Called from the sensor_loop with whatever engine.run_cycle returned.
-        Each PumpAction maps to two physical pump_command calls (influx
-        for pump_time, efflux for pump_time + efflux_extra_seconds)."""
-        for vial, action in actions:
-            pump_time = action.pump_time
-            efflux_time = action.pump_time + action.efflux_extra_seconds
-            try:
-                state.manager.pump_command(int(vial), "influx", pump_time)
-                state.manager.pump_command(int(vial), "efflux", efflux_time)
-            except Exception as exc:
-                log.exception("pump firing failed for vial %d", vial)
-                _emit_alert(
-                    "critical",
-                    f"Automatic dilution failed for vial {vial}: {exc}",
-                    category=evlog.CATEGORY_PUMP, vial=int(vial),
-                    dedup_key=("pump_fire_failed", int(vial)),
-                )
-                continue
-            for direction, seconds in (("influx", pump_time), ("efflux", efflux_time)):
-                try:
-                    state.data_logger.log_pump_event(
-                        timestamp_iso=ts_iso,
-                        vial=int(vial),
-                        direction=direction,
-                        duration_seconds=float(seconds),
-                        od_at_pump=action.average_od,
-                    )
-                except Exception:
-                    log.exception(
-                        "log_pump_event %s failed (vial=%d)", direction, vial
-                    )
-                    _emit_alert(
-                        "critical",
-                        f"Dilution fired but was NOT logged to CSV (vial {vial}, "
-                        f"{direction}) -- the run record is now incomplete",
-                        category=evlog.CATEGORY_PUMP, vial=int(vial),
-                        dedup_key="log_pump_event_failed",
-                    )
-                _emit_event({
-                    "type": "pump",
-                    "vial": int(vial),
-                    "direction": direction,
-                    "duration_seconds": float(seconds),
-                    "average_od": action.average_od,
-                    "timestamp": ts_iso,
-                })
+        """Fire one cycle's ``(vial, PumpAction)`` tuples, as returned by
+        engine.run_cycle, all stamped with the cycle's ``ts_iso``."""
+        _dispatch_dilutions([(vial, action, ts_iso) for vial, action in actions])
 
     def _execute_queued_pump_actions(queued) -> None:
         """Variant of _execute_pump_actions for actions returned by
         engine.exit_maintenance() / engine.check_maintenance_timeout().
         Each entry is (vial, PumpAction, original_ts_iso) — we use the
         original timestamp so the pump_log reflects when the controller
-        actually decided to fire, not when the user clicked Resume."""
-        # Reshape to the (vial, action) form _execute_pump_actions expects,
-        # but call once per entry so each uses its own captured timestamp.
-        for vial, action, captured_ts in queued:
-            _execute_pump_actions([(vial, action)], captured_ts)
+        actually decided to fire, not when the user clicked Resume. The
+        backlog still goes out as one concurrent schedule."""
+        _dispatch_dilutions(list(queued))
+
+    def _dispatch_dilutions(entries) -> None:
+        """Fire ``(vial, PumpAction, ts_iso)`` entries as ONE concurrent pump
+        schedule, log them to the DataLogger, and broadcast experiment_event.
+
+        Every diluting vial's influx and efflux start together in the first
+        frame, all vials run in parallel, and each vial's efflux runs its
+        ``efflux_extra_seconds`` overrun past the influx
+        (``fluidics.plan_dilution_frames``). Bus time is the longest vial's,
+        not the sum. Firing influx and efflux as separate frames instead
+        serialises them and nothing drains during influx -- the overflow in
+        FLUIDICS_FIRMWARE_AUDIT.md §3.3.
+
+        pump_log.csv keeps exactly two rows per dilution (influx total,
+        efflux total): the CSV has no schema marker and is parsed
+        positionally, so frame detail goes to events.csv only, as one
+        ``pump_batch`` event."""
+        planned = []
+        for vial, action, ts_iso in entries:
+            influx_s, efflux_s = fluidics.quantise_dilution(
+                action.pump_time, action.efflux_extra_seconds
+            )
+            planned.append(
+                (fluidics.Dilution(int(vial), influx_s, efflux_s), action, ts_iso)
+            )
+        frames = fluidics.plan_dilution_frames(d for d, _, _ in planned)
+        if not frames:
+            return
+        vials = [d.vial for d, _, _ in planned if d.influx_s > 0]
+        alert_vial = vials[0] if len(vials) == 1 else None
+
+        if len(frames) > fluidics.FIRMWARE_QUEUE_VERIFIED_FRAMES:
+            _emit_alert(
+                "warning",
+                f"Pump schedule for vials {vials} needs {len(frames)} frames, "
+                f"more than the {fluidics.FIRMWARE_QUEUE_VERIFIED_FRAMES} the "
+                "fluidics firmware queue was verified to hold -- sent anyway",
+                category=evlog.CATEGORY_PUMP,
+                dedup_key="pump_batch_over_verified_depth",
+            )
+
+        sent = len(frames)
+        try:
+            state.manager.pump_frames(frames)
+        except fluidics.FluidicsDispatchError as exc:
+            sent = exc.frames_sent
+            log.exception("pump schedule failed after %d/%d frames", sent, len(frames))
+            _emit_alert(
+                "critical",
+                f"Automatic dilution failed for vial(s) {vials} after "
+                f"{sent}/{len(frames)} pump frame(s): {exc}. Frames already "
+                "sent cannot be recalled; the rest were not sent",
+                category=evlog.CATEGORY_PUMP, vial=alert_vial,
+                dedup_key="pump_batch_failed",
+            )
+        except Exception as exc:
+            sent = 0
+            log.exception("pump schedule failed before any frame was sent")
+            _emit_alert(
+                "critical",
+                f"Automatic dilution failed for vial(s) {vials}: {exc}",
+                category=evlog.CATEGORY_PUMP, vial=alert_vial,
+                dedup_key="pump_batch_failed",
+            )
+        if sent == 0:
+            return
+
+        fired = frames[:sent]
+        _emit_event({
+            "type": "pump_batch",
+            "vials": vials,
+            "frames": [{"mask": f.mask_bits, "seconds": f.seconds} for f in fired],
+            "frames_planned": len(frames),
+            "span_seconds": fluidics.span_seconds(fired),
+        })
+
+        # Log what actually reached the wire -- all of it, unless a write
+        # failed part-way.
+        dispatched = fluidics.seconds_per_pump(fired)
+        for d, action, ts_iso in planned:
+            for direction in ("influx", "efflux"):
+                seconds = dispatched.get(fluidics.pump_index(d.vial, direction), 0)
+                if seconds <= 0:
+                    continue
+                try:
+                    state.data_logger.log_pump_event(
+                        timestamp_iso=ts_iso,
+                        vial=d.vial,
+                        direction=direction,
+                        duration_seconds=float(seconds),
+                        od_at_pump=action.average_od,
+                    )
+                except Exception:
+                    log.exception(
+                        "log_pump_event %s failed (vial=%d)", direction, d.vial
+                    )
+                    _emit_alert(
+                        "critical",
+                        f"Dilution fired but was NOT logged to CSV (vial {d.vial}, "
+                        f"{direction}) -- the run record is now incomplete",
+                        category=evlog.CATEGORY_PUMP, vial=d.vial,
+                        dedup_key="log_pump_event_failed",
+                    )
+                _emit_event({
+                    "type": "pump",
+                    "vial": d.vial,
+                    "direction": direction,
+                    "duration_seconds": float(seconds),
+                    "average_od": action.average_od,
+                    "timestamp": ts_iso,
+                })
 
     def _classify_bus_reads(t: dict, o: dict | None) -> None:
         """Feed one cycle's reads into the health trackers and alert on the

@@ -146,6 +146,13 @@ OR'd mask really did drain concurrently — a capability the port lost.
 
 **Fix:** restore the combined mask (§4.1).
 
+**Status: fixed 2026-09-23.** `SerialManager.pump_mask_command` / `pump_frames` (mirrored in
+the mock), with each cycle's dilutions planned as one schedule by
+`server/fluidics.py:plan_dilution_frames` (§4.1 plus the §4.2 decomposition across vials) and
+sent from `app.py:_dispatch_dilutions`. Influx and efflux start together, all vials run in
+parallel, and the efflux overrun is kept as the tail. The headroom planner (§4.3) and the
+executor thread (§4.5) are not built.
+
 ### 3.4 The experiment wizard has never set `efflux_extra_seconds`
 
 `frontend/templates/index.html:4498-4522` builds the parameter payload without it, so every
@@ -156,6 +163,10 @@ configs ever had it.
 **Fix:** add the field to the Parameters step with a UI default of 2.0 s (the value the
 operator established on the bench). Leave `DEFAULT_EFFLUX_EXTRA_SECONDS = 0.0` in the engine
 so commit `a7b408a` is not silently reverted.
+
+**Status: fixed 2026-09-23.** "Efflux overrun" slider (0–10 s, default 2) on the Parameters
+step and the Review step, sent as `efflux_extra_seconds` for every mode. The engine default
+is unchanged.
 
 ### 3.5 Waste accounting will break under any multi-frame scheme
 

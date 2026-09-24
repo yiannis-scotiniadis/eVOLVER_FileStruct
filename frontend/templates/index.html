@@ -2250,6 +2250,11 @@
               <div class="pv" id="pv-vol">25 mL</div>
               <input type="range" id="p-vol" min="10" max="40" step="1" value="25">
             </div>
+            <div class="param-row" title="Seconds the efflux pump keeps running after each dilution's influx stops, so the efflux straw pins the working volume (SPEC §16.2). 0 disables volume regulation.">
+              <div class="pl">Efflux overrun</div>
+              <div class="pv" id="pv-effx">2 s</div>
+              <input type="range" id="p-effx" min="0" max="10" step="1" value="2">
+            </div>
           </div>
           <div class="params-mode" data-params-mode="turbidostat">
             <div class="param-row">
@@ -4061,6 +4066,7 @@
         temperature: 37,
         stir: 10,
         volume: 25,         // mL
+        efflux_extra: 2,    // s of efflux past influx (straw pins volume)
         // Turbidostat
         lower: 0.20,
         upper: 0.40,
@@ -4423,6 +4429,7 @@
     bindParamSlider("temp", "temperature", v => `${v.toFixed(1)} °C`);
     bindParamSlider("stir", "stir", v => `${v}`);
     bindParamSlider("vol", "volume", v => `${v} mL`);
+    bindParamSlider("effx", "efflux_extra", v => `${v} s`);
     // Turbidostat
     bindParamSlider("lower", "lower", v => v.toFixed(2));
     bindParamSlider("upper", "upper", v => v.toFixed(2));
@@ -4469,6 +4476,7 @@
         <dt>Temperature</dt><dd>${p.temperature.toFixed(1)} °C</dd>
         <dt>Stir</dt><dd>${p.stir}</dd>
         <dt>Volume</dt><dd>${p.volume} mL</dd>
+        <dt>Efflux overrun</dt><dd>${p.efflux_extra} s</dd>
       `;
       const modeRows = {
         turbidostat: () => `
@@ -4499,6 +4507,7 @@
         temperature_c: p.temperature,
         stir_rate: p.stir,
         volume_ml: p.volume,
+        efflux_extra_seconds: p.efflux_extra,
       };
       const modeParams = ({
         turbidostat: () => ({

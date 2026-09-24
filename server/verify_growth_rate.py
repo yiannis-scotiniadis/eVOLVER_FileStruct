@@ -39,6 +39,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import fluidics                                                # noqa: E402
 import growth_rate as g                                        # noqa: E402
 import replay_growth                                           # noqa: E402
 from control_modes.turbidostat import TurbidostatController    # noqa: E402
@@ -379,9 +380,14 @@ def _generate(name: str, mode: str, parameters: dict, hours: float,
             od_calibrated=ods,
             od_raw=[float("nan")] * 16,
         )
-        for vial, action in engine.run_cycle(ts, temps, ods):
-            mgr.pump_command(int(vial), "influx", action.pump_time)
-            mgr.pump_command(int(vial), "efflux", action.efflux_seconds)
+        actions = engine.run_cycle(ts, temps, ods)
+        # One concurrent schedule per cycle, as app.py dispatches it.
+        mgr.pump_frames(fluidics.plan_dilution_frames(
+            fluidics.Dilution(int(v), *fluidics.quantise_dilution(
+                a.pump_time, a.efflux_extra_seconds))
+            for v, a in actions
+        ))
+        for vial, action in actions:
             pending.append((now + action.pump_time, int(vial), action.pump_time))
             for direction, secs in (("influx", action.pump_time),
                                     ("efflux", action.efflux_seconds)):

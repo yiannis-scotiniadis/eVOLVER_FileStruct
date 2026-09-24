@@ -17,6 +17,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from fluidics import Dilution, Frame, FluidicsDispatchError, plan_dilution_frames  # noqa: E402
 from serial_manager import (  # noqa: E402
     COMMAND_TERMINATOR,
     DEFAULT_RAW_FLOOR,
@@ -173,6 +174,75 @@ def test_pump_address_encoding() -> None:
     expected_efflux_v15 = b"st" + format(1 << 31, "b").encode("ascii") + b",0,2, !"
     assert fake.write_log[-1] == expected_efflux_v15, f"vial15 efflux: {fake.write_log[-1]!r}"
     print("PASS  pump address encoding (influx 2^N, efflux 2^(N+16))")
+
+
+def test_pump_mask_pair_frame() -> None:
+    """Influx + efflux for vial 0 in ONE frame -- the exact example in
+    CLAUDE.md's "Pump command format" and mac_original/custom_script.py:114."""
+    sm, fake = fresh(calibrated=False)
+    sm.pump_mask_command((1 << 0) | (1 << 16), 10)
+    assert fake.write_log == [b"st10000000000000001,0,10, !"], fake.write_log
+    print("PASS  pump_mask_command pair frame")
+
+
+def test_pump_mask_command_rejects_bad_mask() -> None:
+    sm, fake = fresh(calibrated=False)
+    for mask in (0, 1 << 32, -1):
+        try:
+            sm.pump_mask_command(mask, 5)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"mask {mask} accepted")
+    assert fake.write_log == []
+    print("PASS  pump_mask_command rejects out-of-range masks")
+
+
+def test_pump_frames_writes_schedule_in_order() -> None:
+    """A two-vial dilution schedule goes out as consecutive st frames, with
+    both of each vial's pumps in the first one."""
+    sm, fake = fresh(calibrated=False)
+    frames = plan_dilution_frames([Dilution(0, 3, 5), Dilution(1, 5, 7)])
+    sm.pump_frames(frames)
+    assert fake.write_log == [
+        b"st110000000000000011,0,3, !",   # vials 0, 1: influx + efflux
+        b"st110000000000000010,0,2, !",   # vial 0 efflux overrun; vial 1 still both
+        b"st100000000000000000,0,2, !",   # vial 1 efflux overrun
+    ], fake.write_log
+    print("PASS  pump_frames writes the schedule in order")
+
+
+def test_pump_frames_validates_before_writing() -> None:
+    sm, fake = fresh(calibrated=False)
+    try:
+        sm.pump_frames([Frame(1, 5), (0, 5)])
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("invalid frame accepted")
+    assert fake.write_log == [], "nothing may reach the wire if any frame is invalid"
+    print("PASS  pump_frames validates every frame before writing")
+
+
+def test_pump_frames_partial_failure_reports_frames_sent() -> None:
+    class FailsOnSecondWrite(FakeSerial):
+        def write(self, data: bytes) -> int:
+            if len(self.write_log) == 1:
+                raise OSError("RS485 I/O error")
+            return super().write(data)
+
+    fake = FailsOnSecondWrite()
+    sm = SerialManager(ser=fake)
+    frames = [Frame(1, 3), Frame(2, 2), Frame(4, 1)]
+    try:
+        sm.pump_frames(frames)
+    except FluidicsDispatchError as exc:
+        assert exc.frames_sent == 1, exc.frames_sent
+        assert isinstance(exc.__cause__, OSError)
+    else:
+        raise AssertionError("write failure not raised")
+    assert fake.write_log == [b"st1,0,3, !"], fake.write_log
+    print("PASS  pump_frames reports frames already sent on failure")
 
 
 def test_stop_all_pumps_body() -> None:
@@ -596,6 +666,11 @@ def main() -> int:
     test_od_command_format()
     test_stir_command_format()
     test_pump_address_encoding()
+    test_pump_mask_pair_frame()
+    test_pump_mask_command_rejects_bad_mask()
+    test_pump_frames_writes_schedule_in_order()
+    test_pump_frames_validates_before_writing()
+    test_pump_frames_partial_failure_reports_frames_sent()
     test_stop_all_pumps_body()
     test_temperature_response_parse_and_calibration()
     test_od_response_parse_and_calibration()

@@ -27,6 +27,8 @@ from typing import Optional
 
 import numpy as np
 
+from fluidics import Frame, FluidicsDispatchError, check_mask, pump_index
+
 try:
     import serial as _pyserial
 except ImportError:  # allows the module to be imported on dev machines without pyserial
@@ -602,31 +604,59 @@ class SerialManager:
             self._write(PREFIX_STIR, self._format_csv(speeds))
 
     def pump_command(self, vial: int, direction: str, seconds: float) -> None:
-        if not (0 <= vial < N_VIALS):
-            raise ValueError(f"vial must be in 0..{N_VIALS - 1}, got {vial}")
-        if direction not in ("influx", "efflux"):
-            raise ValueError(
-                f"direction must be 'influx' or 'efflux', got {direction!r}"
-            )
+        """Fire one pump. A single-bit :meth:`pump_mask_command`; manual
+        pumping and the calibration wizard use this."""
+        # CLAUDE.md: influx vial N -> bit N (2^N), efflux vial N -> bit N+16 (2^(N+16)).
+        self.pump_mask_command(1 << pump_index(vial, direction), seconds)
+
+    def pump_mask_command(self, mask: int, seconds: float) -> None:
+        """One ``st<mask>,0,<seconds>, !`` frame: every pump in ``mask`` runs
+        concurrently for ``seconds`` (FLUIDICS_FIRMWARE_AUDIT.md FW-2)."""
+        check_mask(mask)
         if seconds < 0:
             raise ValueError(f"seconds must be >= 0, got {seconds}")
-        # CLAUDE.md: influx vial N -> bit N (2^N), efflux vial N -> bit N+16 (2^(N+16)).
-        bit = vial if direction == "influx" else vial + 16
-        addr = 1 << bit
         # 2016 firmware accepts integer seconds (mac_original used %d).
         # round() preserves 0.5+ -> 1; sub-half-second requests round to 0
         # and would silently no-op, so warn the caller rather than fire blind.
         whole_seconds = int(round(seconds))
         if seconds > 0 and whole_seconds == 0:
             log.warning(
-                "pump_command vial=%d %s: %.3fs rounds to 0s — no pump will fire. "
+                "pump frame mask=%s: %.3fs rounds to 0s — no pump will fire. "
                 "Sub-second pump times are not supported by the legacy firmware.",
-                vial, direction, seconds,
+                format(mask, "b"), seconds,
             )
             return
-        body = f"{addr:b},0,{whole_seconds},"
         with self._lock:
-            self._write(PREFIX_FLUIDICS, body)
+            self._write(PREFIX_FLUIDICS, self._pump_frame_body(mask, whole_seconds))
+
+    def pump_frames(self, frames) -> None:
+        """Write a pump schedule (``fluidics.plan_dilution_frames``) as
+        consecutive frames under one hold of the bus lock, so no other
+        command -- a manual pump from another thread -- lands mid-schedule.
+
+        Every frame is validated before the first is written. On a write
+        failure at frame k, raises ``FluidicsDispatchError(frames_sent=k)``:
+        frames 0..k-1 are already queued in the firmware and cannot be
+        recalled (FW-11)."""
+        frames = [f if isinstance(f, Frame) else Frame(*f) for f in frames]
+        with self._lock:
+            for sent, frame in enumerate(frames):
+                try:
+                    self._write(
+                        PREFIX_FLUIDICS,
+                        self._pump_frame_body(frame.mask, frame.seconds),
+                    )
+                except Exception as exc:
+                    raise FluidicsDispatchError(
+                        f"pump frame {sent + 1}/{len(frames)} failed: {exc}",
+                        frames_sent=sent,
+                    ) from exc
+
+    @staticmethod
+    def _pump_frame_body(mask: int, whole_seconds: int) -> str:
+        # The middle field is always 0: FW-8 found it inert over 12 s, and
+        # probing it risks an unstoppable repeating pump (audit §6.4).
+        return f"{mask:b},0,{whole_seconds},"
 
     def stop_all_pumps(self) -> None:
         with self._lock:

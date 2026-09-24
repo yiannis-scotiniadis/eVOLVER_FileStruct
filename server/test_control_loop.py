@@ -318,6 +318,30 @@ def test_validation_warns_when_efflux_overrun_is_disabled() -> None:
     assert any("efflux_extra_seconds" in w for w in warnings), warnings
 
 
+def test_validation_efflux_overrun_quantisation() -> None:
+    """The firmware takes whole seconds: a fractional overrun is applied
+    rounded up (fluidics.quantise_dilution), and that is said at create
+    time. A whole-second overrun raises no overrun warning; a negative one
+    is rejected."""
+    base = {"od_lower_thresh": 0.2, "od_upper_thresh": 0.4, "volume_ml": 25.0}
+    warnings = validate_control_parameters(
+        "turbidostat", {**base, "efflux_extra_seconds": 2.5}, _RATES_32, [0],
+    )
+    assert any("applied as 3 s" in w for w in warnings), warnings
+    warnings = validate_control_parameters(
+        "turbidostat", {**base, "efflux_extra_seconds": 2.0}, _RATES_32, [0],
+    )
+    assert not any("efflux_extra_seconds" in w for w in warnings), warnings
+    try:
+        validate_control_parameters(
+            "turbidostat", {**base, "efflux_extra_seconds": -1.0}, _RATES_32, [0],
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("negative efflux_extra_seconds accepted")
+
+
 def main() -> int:
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

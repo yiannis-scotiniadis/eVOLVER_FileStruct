@@ -15,6 +15,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from fluidics import Dilution, Frame, plan_dilution_frames  # noqa: E402
 from mock_serial_manager import (  # noqa: E402
     CARRYING_CAPACITY_OD,
     DEFAULT_FLOW_RATES_ML_PER_SEC,
@@ -161,6 +162,70 @@ def test_pump_dilutes_od() -> None:
     print(f"PASS  pump dilutes OD ({pre:.3f} -> {post:.3f}, expected {expected_post:.3f})")
 
 
+def _starts(m: MockSerialManager) -> dict:
+    """(vial, direction) -> list of start sim_times, in pump_log order."""
+    out: dict = {}
+    for e in m.pump_log:
+        out.setdefault((e["vial"], e["direction"]), []).append(e["sim_time"])
+    return out
+
+
+def test_pair_frame_starts_influx_and_efflux_together() -> None:
+    """FW-2: one frame drives every pump in its mask at once."""
+    m = fresh()
+    t0 = m.sim_time
+    m.pump_mask_command((1 << 0) | (1 << 16), 10)
+    assert _starts(m) == {(0, "influx"): [t0], (0, "efflux"): [t0]}
+    print("PASS  pair frame starts influx and efflux together")
+
+
+def test_frames_queue_one_at_a_time() -> None:
+    """FW-1: a frame starts only when the previous one ends -- which is why
+    separate influx and efflux frames never drain concurrently."""
+    m = fresh()
+    t0 = m.sim_time
+    m.pump_command(0, "influx", 10)
+    m.pump_command(0, "efflux", 12)
+    assert _starts(m) == {(0, "influx"): [t0], (0, "efflux"): [t0 + 10]}
+
+    m = fresh()
+    t0 = m.sim_time
+    m.pump_frames(plan_dilution_frames([Dilution(0, 10, 12), Dilution(1, 4, 6)]))
+    starts = _starts(m)
+    # Every pump starts in frame 0; the tails are continuation frames.
+    assert starts[(0, "influx")][0] == starts[(0, "efflux")][0] == t0
+    assert starts[(1, "influx")][0] == starts[(1, "efflux")][0] == t0
+    ends = [e["sim_time"] + e["seconds"] for e in m.pump_log]
+    assert ends == sorted(ends), "pump_log end times must be monotone for _advance"
+    assert max(ends) == t0 + 12                    # span = longest vial
+    # A frame sent while the schedule runs waits for it.
+    m.pump_command(5, "influx", 1)
+    assert m.pump_log[-1]["sim_time"] == t0 + 12
+    print("PASS  frames queue one at a time (FW-1)")
+
+
+def test_schedule_dilutes_like_a_single_bolus() -> None:
+    """A dilution split across frames washes out exactly like one bolus:
+    prod exp(-F*c_i/V) = exp(-F*sum(c_i)/V) (audit §4.6)."""
+    m = fresh(time_multiplier=60.0)
+    m.set_stir([10] * N_VIALS)
+    m.set_temperature_celsius([T_GROWTH_OPT_C] * N_VIALS)
+    for _ in range(180):
+        m.read_od()
+    pre = float(m.od_abs[1])
+    assert pre > 1.0, f"expected near-saturated OD before dilution, got {pre}"
+    # Vial 1's 10 s influx is cut at vial 0's influx end (4 s) and efflux
+    # end (6 s): three frames, 4 + 2 + 4 s.
+    frames = plan_dilution_frames([Dilution(0, 4, 6), Dilution(1, 10, 12)])
+    assert [f.seconds for f in frames if f.mask & (1 << 1)] == [4, 2, 4]
+    m.pump_frames(frames)
+    m.read_od()                                    # one 60 s tick > 12 s span
+    F = float(DEFAULT_FLOW_RATES_ML_PER_SEC[1])
+    expected = pre * math.exp(-F * 10 / DEFAULT_VOLUME_ML)
+    assert abs(float(m.od_abs[1]) - expected) / pre < 0.15, (pre, float(m.od_abs[1]), expected)
+    print("PASS  split schedule dilutes like a single bolus")
+
+
 def test_turbidostat_loop() -> None:
     """Hand-run the custom_script.py turbidostat algorithm and verify oscillation."""
     m = fresh(time_multiplier=60.0)
@@ -300,6 +365,9 @@ def main() -> int:
     test_heater_off_setpoint_decays_to_ambient()
     test_od_grows_logistically()
     test_pump_dilutes_od()
+    test_pair_frame_starts_influx_and_efflux_together()
+    test_frames_queue_one_at_a_time()
+    test_schedule_dilutes_like_a_single_bolus()
     test_turbidostat_loop()
     test_uncalibrated_mode()
     test_thread_safety()

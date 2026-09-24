@@ -279,7 +279,16 @@ class SerialManager:
         """Send 16 stir speed values (0-15). No response."""
 
     def pump_command(self, vial: int, direction: str, seconds: float) -> None:
-        """Activate pump. direction = 'influx' or 'efflux'."""
+        """Activate one pump. direction = 'influx' or 'efflux'. A single-bit
+        pump_mask_command; used by manual pumping and the calibration wizard."""
+
+    def pump_mask_command(self, mask: int, seconds: float) -> None:
+        """One frame: every pump in the 32-bit mask runs concurrently."""
+
+    def pump_frames(self, frames: list[fluidics.Frame]) -> None:
+        """Write a pump schedule (fluidics.plan_dilution_frames) as consecutive
+        frames under one bus-lock hold. Raises FluidicsDispatchError(frames_sent)
+        on a mid-batch write failure. Automatic dilutions use this (§16.3.2)."""
 
     def stop_all_pumps(self) -> None:
         """Emergency stop all pumps."""
@@ -301,6 +310,8 @@ All commands are ASCII strings sent over serial. Format: `{prefix}{values} !`
 | `read_od`                  | `we{16 LED values, comma-separated} !`                         | `turb{16 ADC values, comma-separated}end` |
 | `set_stir`                 | `zv{16 speed values, comma-separated} !`                       | (none)                                    |
 | `pump_command` (single)    | `st{binary_address},0,{seconds}, !`                            | (none, write-only)                        |
+| `pump_mask_command`        | `st{binary_mask},0,{seconds}, !` — any set of pumps at once    | (none, write-only)                        |
+| `pump_frames`              | one `st{mask},0,{seconds}, !` per schedule frame, back to back | (none, write-only)                        |
 | `stop_all_pumps`           | `stt,{32 ones — the pump mask},{16 zeros — the per-vial times}, !` | (none)                                    |
 | `chemostat_command` (P2+)  | `stc,{16 rates},{bolus}, !`                                    | (none)                                    |
 
@@ -1533,9 +1544,11 @@ constant — a scalar `volume_ml` is correct and per-vial arrays are unnecessary
 
 The repo default remains `DEFAULT_EFFLUX_EXTRA_SECONDS = 0.0`. It should stay there (commit
 `a7b408a` was live-validated and should not be silently reverted); the value belongs in the
-experiment config instead. **The creation wizard has never written this key**
-(`frontend/templates/index.html`), which is why every wizard-created run inherited 0.0 and
-ran with volume regulation disengaged. Adding that field is part of §16.3.
+experiment config instead. **The creation wizard never wrote this key** before 2026-09-23
+(`frontend/templates/index.html`), which is why every wizard-created run until then inherited
+0.0 and ran with volume regulation disengaged. It now has an "Efflux overrun" field on the
+Parameters step, defaulting to 2 s. `validate_control_parameters` rejects a negative value and
+warns when a fractional one is rounded up to whole seconds.
 
 **What the straw does not do.** It pins the level *after* a dilution. It has no effect on how
 high the level climbs *during* one. That transient is what overflowed a pilot run, and it is
@@ -1543,8 +1556,11 @@ a protocol-level problem rather than a fluidics-tuning one — see §16.3.
 
 ### 16.3 Overflow-safe delivery
 
-**Status:** designed, not built. Firmware behaviour measured 2026-09-23; full evidence in
-`FLUIDICS_FIRMWARE_AUDIT.md`, which this section summarises.
+**Status:** partially built. Firmware behaviour measured 2026-09-23; full evidence in
+`FLUIDICS_FIRMWARE_AUDIT.md`, which this section summarises. **Built 2026-09-23:** the
+combined frame and schedule decomposition (§16.3.2–16.3.3, `server/fluidics.py`) and the
+wizard's overrun field. **Not built:** the headroom planner (§16.3.4) and the dedicated
+executor (§16.3.6) — frames still go straight into the firmware queue each cycle.
 
 #### 16.3.1 The firmware model
 
@@ -1566,6 +1582,17 @@ that is 23 mL into 15 mL of dead space.
 
 The 2016 client was safer here than the port. Restoring the combined frame is the primary
 fix.
+
+**Fixed 2026-09-23.** `app.py:_dispatch_dilutions` quantises each dilution
+(`fluidics.quantise_dilution`: `influx_s = round(pump_time)`, `efflux_s = influx_s +
+ceil(efflux_extra_seconds)`), plans the cycle's dilutions as one schedule
+(`fluidics.plan_dilution_frames`, §16.3.3) and sends it with `SerialManager.pump_frames`. Every
+diluting vial's influx and efflux start together in the first frame, all vials run in
+parallel, and each vial's overrun is the tail of its efflux run. Total efflux seconds per
+dilution are unchanged, so waste accounting (§16.3.7) is not affected. `pump_log.csv` keeps
+exactly two rows per dilution (influx and efflux totals); the frames themselves go to
+`events.csv` as one `pump_batch` event. The peak level rise drops from `F_in · t` to the pump
+mismatch `(F_in − F_out) · t`.
 
 #### 16.3.3 Schedule decomposition
 

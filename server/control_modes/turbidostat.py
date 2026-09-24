@@ -94,9 +94,10 @@ def _rebaseline_future(
 class PumpAction:
     """One dilution event returned from :meth:`TurbidostatController.decide`.
 
-    The engine translates this into two ``SerialManager.pump_command`` calls:
-    influx for ``pump_time`` seconds, efflux for
-    ``pump_time + efflux_extra_seconds`` seconds.
+    ``app.py`` fires it as part of one concurrent pump schedule per cycle
+    (``fluidics.plan_dilution_frames``): influx for ``pump_time`` seconds and
+    efflux for ``pump_time + efflux_extra_seconds`` seconds, both starting
+    together.
 
     ``average_od`` is the rolling mean that decided *whether* to dilute (it
     is what lands in ``pump_log.csv``'s ``od_at_pump`` column). ``sizing_od``

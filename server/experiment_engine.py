@@ -55,6 +55,7 @@ from data_export import (
 )
 from data_logger import _VALID_NAME
 
+import fluidics
 import growth_rate as growth
 from serial_manager import (
     HEATER_OFF_SETPOINT,
@@ -389,7 +390,22 @@ def validate_control_parameters(
                 f"'start_after_seconds' must be >= 0 when given, got {start_after}"
             )
 
-    if float(parameters.get("efflux_extra_seconds", DEFAULT_EFFLUX_EXTRA_SECONDS)) <= 0:
+    efflux_extra = float(
+        parameters.get("efflux_extra_seconds", DEFAULT_EFFLUX_EXTRA_SECONDS)
+    )
+    if efflux_extra < 0:
+        raise ValueError(
+            f"'efflux_extra_seconds' must be >= 0, got {efflux_extra}"
+        )
+    if efflux_extra > 0 and not float(efflux_extra).is_integer():
+        influx_s, efflux_s = fluidics.quantise_dilution(1.0, efflux_extra)
+        warnings.append(
+            f"efflux_extra_seconds={efflux_extra:g} is not a whole number: the "
+            f"firmware takes whole seconds, so it is applied as "
+            f"{efflux_s - influx_s} s "
+            "(rounded up, toward more efflux)."
+        )
+    if efflux_extra <= 0:
         warnings.append(
             "efflux_extra_seconds is 0: vial volume is not pinned by the efflux "
             "straw, so level drifts with influx/efflux flow mismatch and no "
@@ -1390,7 +1406,8 @@ class ExperimentEngine:
         ``[]`` when the engine isn't RUNNING or no vial wants a pump.
 
         The caller (sensor_loop in app.py) is responsible for:
-          - firing the pumps via ``serial_manager.pump_command``,
+          - firing the pumps, as one concurrent schedule per cycle
+            (``fluidics.plan_dilution_frames`` -> ``pump_frames``),
           - logging via ``data_logger.log_pump_event``,
           - emitting ``experiment_event`` over socketio.
 
@@ -2164,12 +2181,14 @@ class ExperimentEngine:
     ) -> None:
         """Record one segment boundary per pump action (§4.5).
 
-        A boundary is an interval, not an instant: influx runs for
-        ``pump_time``, efflux for ``pump_time + efflux_extra_seconds``, and
-        mixing continues after that. With ``pump_time`` capped at 20 s against
+        A boundary is an interval, not an instant: influx and efflux start
+        together and efflux runs ``efflux_extra_seconds`` longer, and mixing
+        continues after that. With ``pump_time`` capped at 20 s against
         a 10 s loop, one dilution can span two or three sensor cycles, so the
         estimator excises the whole interval rather than assuming one OD
-        sample per event.
+        sample per event. The end is the whole-second efflux the dispatcher
+        actually fires (``fluidics.quantise_dilution``); every vial in a
+        cycle's schedule starts at ``now``, so it holds for all of them.
 
         ``delivered_ml`` is recorded but never reaches the reported growth
         rate -- only the gated diagnostic reads it (§4.5). That is what keeps
@@ -2180,8 +2199,9 @@ class ExperimentEngine:
             events.append(
                 growth.DilutionEvent(
                     t_start=float(now),
-                    t_efflux_end=float(now) + action.pump_time
-                    + action.efflux_extra_seconds,
+                    t_efflux_end=float(now) + fluidics.quantise_dilution(
+                        action.pump_time, action.efflux_extra_seconds
+                    )[1],
                     delivered_ml=self._influx_ml_locked(vial, action),
                 )
             )

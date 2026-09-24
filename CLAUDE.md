@@ -98,15 +98,16 @@ Consequences:
 `efflux_extra_seconds` is what engages the mechanism. The repo default is **0.0** (commit
 `a7b408a`, "live-validated default from eVOLVER-001"), which disables it. **That gate is now
 closed:** the operator has run the rig with **2.0 s** of overrun against a 25 mL straw and it
-behaves. The value belongs in the experiment config — and needs a wizard field, because the
-creation wizard has never written this key at all, which is why every wizard-created run
-silently inherited the 0.0 default.
+behaves. The value belongs in the experiment config. The creation wizard never wrote this key
+before 2026-09-23, so every wizard-created run until then silently inherited the 0.0 default;
+it now has an "Efflux overrun" field (Parameters step) defaulting to 2 s.
 
 **The straw pins the steady state, not the transient.** A correct overrun restores the level
 *after* a dilution; it does nothing about how high the level climbs *during* one. That
 distinction is what caused a pilot run to overflow, and the mechanism is in the next section:
-the server issues influx and efflux as two separate frames, the firmware runs frames strictly
-one at a time, so nothing drains for the whole influx phase. See `FLUIDICS_FIRMWARE_AUDIT.md`.
+the server issued influx and efflux as two separate frames, the firmware runs frames strictly
+one at a time, so nothing drained for the whole influx phase. **Fixed 2026-09-23:** dilutions
+now go out as one concurrent schedule (`server/fluidics.py`). See `FLUIDICS_FIRMWARE_AUDIT.md`.
 
 Do **not** try to fix volume drift by computing a balancing efflux duration in software.
 `t_efflux = (F_in × t_in) / F_out` is generally non-integer, and the firmware accepts whole
@@ -173,10 +174,13 @@ The measured firmware model, in one paragraph:
 Three consequences for any new work:
 
 1. **`st<mask>,0,<sec>,` can fire influx and efflux together** by OR-ing both bits, exactly as
-   `mac_original/custom_script.py:114` did. `SerialManager.pump_command(vial, direction, …)`
-   cannot express this — it sets one bit — so the current server issues two frames that
-   *serialise*, and **nothing drains during the influx phase**. That is the vial-overflow
-   mechanism, and the 2016 client was safer here than the port.
+   `mac_original/custom_script.py:114` did. Until 2026-09-23 the server used
+   `SerialManager.pump_command(vial, direction, …)`, which sets one bit, so it issued two
+   frames that *serialised* and **nothing drained during the influx phase** — the
+   vial-overflow mechanism. Dilutions now go through `SerialManager.pump_frames` with a
+   schedule from `fluidics.plan_dilution_frames`: every diluting vial's influx and efflux
+   start together, all vials run in parallel, and the efflux overrun is the tail. **Never
+   fire a dilution as per-direction frames again.**
 2. **There is no software stop.** The only real emergency stop is cutting power to the
    auxiliary pump board. Command duration *is* the exposure window, which makes every
    duration cap a safety parameter.
@@ -393,6 +397,7 @@ processes, owns `/dev/ttyAMA0` directly, and serves the dashboard at
 | Deployment: systemd unit, `install.sh`, Tailscale keepalive | Built | `DEPLOY.md`, `deploy/` |
 | Consumables safety interlock (reserve/waste hard stop, auto-maintenance) | Built | `experiment_engine.py` |
 | Volume-based fluidics (mL manual pumping, quantisation preview) | Built | `experiment_engine.py`, `/api/actuators/pump` |
+| Concurrent dilution schedules (influx+efflux together, all vials in parallel, efflux overrun kept) | Built | `server/fluidics.py`, `app.py:_dispatch_dilutions` |
 | Rotating disk-aware logs, per-experiment `events.csv`, error classification | Built | `server/event_log.py` |
 | Alert drawer, RS485 bus indicator, per-vial sensor-health badge | Built | `index.html`, `/api/events/*`, `/api/health` |
 | Calibration provenance store (versioned envelopes, legacy `.txt` as derived views) | Built | `server/calibration_service.py`, `calibration/` |
@@ -555,11 +560,14 @@ backup, vial groups, multi-phase protocols, and authentication.
    same pump; nothing preempts; the Arduino never transmits. Three consequences that bite
    immediately:
 
-   - **`SerialManager.pump_command(vial, direction, seconds)` cannot express a combined
-     influx+efflux frame** — it sets one bit. So the server issues two frames that
-     *serialise*, nothing drains during the influx phase, and the level rises by the whole
-     bolus. That is the vial-overflow mechanism, and `mac_original/custom_script.py:114`
-     did it correctly with one OR'd mask.
+   - **Dilutions must fire as one concurrent schedule, never per-direction frames.**
+     `SerialManager.pump_command(vial, direction, seconds)` sets one bit; firing influx and
+     efflux through it issues two frames that *serialise*, so nothing drains during the
+     influx phase and the level rises by the whole bolus — the vial-overflow mechanism.
+     `app.py:_dispatch_dilutions` (fixed 2026-09-23) plans each cycle's dilutions with
+     `fluidics.plan_dilution_frames` and sends them via `pump_frames`: influx and efflux
+     start together, all vials in parallel, overrun as the tail, bus time = the longest
+     vial. `pump_log.csv` still gets exactly two rows per dilution (totals, not frames).
    - **`stop_all_pumps()` is inert.** It does not halt a running pump and does not flush the
      queue; no frame shape tested stops anything. `emergency_stop`,
      `watchdog.emergency_shutdown` and `_zero_experiment_actuators_locked` all rely on it.
@@ -655,6 +663,7 @@ eVOLVER_FileStruct/
     serial_manager.py        # RS485 (real hardware); owns /dev/ttyAMA0
     mock_serial_manager.py   # Simulated hardware — run app.py --mock
     experiment_engine.py     # Lifecycle, run_cycle, media tracking, maintenance, resume
+    fluidics.py              # pump frame scheduler (audit §4.1-4.2) — pure, I/O-free
     growth_rate.py           # SPEC §17 growth estimation — pure, I/O-free, no engine imports
     replay_growth.py         #   replay a logged run through the estimator (read-only)
     verify_growth_rate.py    #   accuracy report + `--generate` for the 1x-time fixtures
