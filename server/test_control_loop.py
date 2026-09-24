@@ -342,6 +342,115 @@ def test_validation_efflux_overrun_quantisation() -> None:
         raise AssertionError("negative efflux_extra_seconds accepted")
 
 
+# ----------------------------------------------------------------------
+# 4. Vial groups: two modes side by side in one experiment (Session Y)
+# ----------------------------------------------------------------------
+
+def test_mixed_groups_hold_band_and_deliver_rate_through_the_engine() -> None:
+    """The per-controller checks above, repeated through the ENGINE for one
+    experiment whose groups run different modes. What this adds is the group
+    plumbing: each vial's controller is built from its own group's mode and
+    merged parameters, and one run_cycle dispatches both modes' decisions --
+    so the turbidostat group must hold its band while the chemostat group,
+    in the same cycles, delivers its dilution rate.
+
+    Same culture model as above; each dilution is applied at the whole
+    seconds the dispatcher actually fires (``fluidics.quantise_dilution``)."""
+    import json as _json
+    import shutil
+    import tempfile
+
+    import numpy as np
+
+    import fluidics
+    from data_logger import DataLogger
+    from experiment_engine import ExperimentEngine
+    from mock_serial_manager import MockSerialManager
+
+    cal = Path(__file__).resolve().parent.parent / "calibration"
+    tick = 60.0
+    hours = 24
+    D = 0.5
+    turb = (0, 1, 2, 3)
+    chem = (8, 9)
+    root = Path(tempfile.mkdtemp(prefix="evolver-mixed-loop-"))
+    try:
+        manager = MockSerialManager(seed=1)
+        manager.load_calibration(str(cal / "temp_calibration.txt"),
+                                 str(cal / "OD_cal.txt"))
+        clock = {"t": 1_000_000.0}
+        engine = ExperimentEngine(
+            serial_manager=manager, data_logger=DataLogger(root),
+            experiments_root=root,
+            temp_cal=np.genfromtxt(str(cal / "temp_calibration.txt"), delimiter=","),
+            clock=lambda: clock["t"],
+            cycle_interval_seconds=tick, base_tick_seconds=tick,
+        )
+        engine.create_experiment(
+            name="mixed",
+            parameters={"volume_ml": V, "efflux_extra_seconds": 2,
+                        "temperature_c": 37, "stir_rate": 8,
+                        "pump_flow_rates": [F] * 16},
+            groups=[
+                {"name": "turb", "vials": list(turb), "mode": "turbidostat",
+                 "parameters": {"od_lower_thresh": 0.2, "od_upper_thresh": 0.4,
+                                "pump_wait_minutes": 15}},
+                {"name": "chem", "vials": list(chem), "mode": "chemostat",
+                 "parameters": {"dilution_rate_per_hour": D,
+                                "bolus_interval_seconds": tick}},
+            ],
+        )
+        engine.start_experiment("mixed")
+
+        od = [0.2] * 16
+        for v in chem:
+            od[v] = 0.3
+        settled: dict[int, list[float]] = {v: [] for v in turb}
+        fired_turb: set[int] = set()
+        influx_s = {v: 0 for v in chem}
+        for i in range(int(hours * 3600 / tick)):
+            for v in turb + chem:
+                od[v] *= math.exp(MU * tick)
+            actions = engine.run_cycle(
+                f"t{i}", [37.0] * 16, list(od), od_flags=["ok"] * 16,
+            )
+            for v, a in actions:
+                seconds, _ = fluidics.quantise_dilution(
+                    a.pump_time, a.efflux_extra_seconds,
+                )
+                od[v] *= math.exp(-F * seconds / V)
+                if v in chem:
+                    influx_s[v] += seconds
+                else:
+                    fired_turb.add(v)
+            for v in turb:
+                if v in fired_turb:
+                    settled[v].append(od[v])
+            clock["t"] += tick
+
+        assert fired_turb == set(turb), fired_turb
+        for v in turb:
+            assert min(settled[v]) >= 0.2 * 0.97, (
+                f"turbidostat vial {v} driven to {min(settled[v]):.4f}, "
+                "below its 0.2 floor"
+            )
+            assert max(settled[v]) <= 0.4 * 1.03, (
+                f"turbidostat vial {v} reached {max(settled[v]):.4f}, "
+                "above its 0.4 ceiling"
+            )
+        for v in chem:
+            delivered_d = influx_s[v] * F / V / hours
+            assert abs(delivered_d - D) / D <= 0.02, (
+                f"chemostat vial {v} delivered D={delivered_d:.4f} "
+                f"against the requested {D}"
+            )
+        cfg = _json.loads((root / "mixed" / "config.json").read_text())
+        assert cfg["mode"] == "mixed"
+        engine.stop_experiment(reason="test")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def main() -> int:
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

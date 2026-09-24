@@ -161,15 +161,35 @@ def _deep_merge(base: dict, overlay: dict) -> dict:
     return out
 
 
+class _ActiveRun:
+    """One experiment the logger is writing rows for."""
+
+    __slots__ = ("name", "dir", "start", "vials")
+
+    def __init__(self, name: str, directory: Path, start: datetime, vials: list[int]):
+        self.name = name
+        self.dir = directory
+        self.start = start
+        self.vials = list(vials)
+
+
 class DataLogger:
+    """Per-vial CSV writers for every ACTIVE experiment.
+
+    Parallel experiments: several experiments can be active at once, each
+    over its own vials. A row about a vial goes to the experiment that owns
+    that vial; ``log_event`` routes by experiment name when it has one, then
+    by vial owner, and otherwise -- a machine-wide event such as a bus fault
+    or an emergency stop -- to every active experiment (PARALLEL_EXPERIMENTS.md
+    T6). Two active experiments may never share a vial.
+    """
+
     def __init__(self, experiments_root: Path) -> None:
         self.experiments_root = Path(experiments_root)
         self.experiments_root.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
-        self._active_name: Optional[str] = None
-        self._active_dir: Optional[Path] = None
-        self._active_start: Optional[datetime] = None
-        self._active_vials: Optional[list[int]] = None
+        # name -> _ActiveRun, in activation order.
+        self._active: dict[str, _ActiveRun] = {}
         # Last calibrated OD per vial, refreshed each log_sensor_cycle. Used
         # to populate od_at_pump when the caller doesn't supply it (e.g.
         # manual pump commands from the dashboard).
@@ -182,24 +202,39 @@ class DataLogger:
     @property
     def is_running(self) -> bool:
         with self._lock:
-            return self._active_name is not None
+            return bool(self._active)
+
+    @staticmethod
+    def _describe(run: _ActiveRun) -> dict:
+        return {
+            "name": run.name,
+            "directory": str(run.dir),
+            "started": run.start.isoformat(timespec="seconds"),
+            "vials": list(run.vials),
+        }
 
     def active_experiment(self) -> Optional[dict]:
+        """The first active experiment (the only one, before parallel runs)."""
         with self._lock:
-            if self._active_name is None:
+            if not self._active:
                 return None
-            return {
-                "name": self._active_name,
-                "directory": str(self._active_dir),
-                "started": self._active_start.isoformat(timespec="seconds"),
-                "vials": list(self._active_vials),
-            }
+            return self._describe(next(iter(self._active.values())))
+
+    def active_experiments(self) -> list[dict]:
+        with self._lock:
+            return [self._describe(r) for r in self._active.values()]
+
+    def _owner_locked(self, vial: int) -> Optional[_ActiveRun]:
+        for run in self._active.values():
+            if vial in run.vials:
+                return run
+        return None
 
     def list_experiments(self) -> list[dict]:
         """Return one entry per experiment directory on disk, with the
-        currently-active one (if any) marked ``status=running``."""
+        currently-active ones marked ``status=running``."""
         with self._lock:
-            active = self._active_name
+            active = set(self._active)
         results: list[dict] = []
         if not self.experiments_root.exists():
             return results
@@ -215,7 +250,7 @@ class DataLogger:
                     )
                 except Exception:
                     log.exception("failed to parse %s", config_path)
-            if entry.name == active:
+            if entry.name in active:
                 info["status"] = "running"
             results.append(info)
         return results
@@ -239,6 +274,9 @@ class DataLogger:
         calibration: Optional[dict] = None,
         notes: str = "",
         media: Optional[dict] = None,
+        groups: Optional[list] = None,
+        operator: str = "",
+        expected_end: Optional[str] = None,
     ) -> dict:
         """Create the experiment directory, write ``config.json``, and
         pre-create per-vial CSV files with their headers. Does NOT flip
@@ -247,7 +285,9 @@ class DataLogger:
 
         ``media`` is an opaque dict (see SPEC §8 / engine plan) round-tripped
         through ``config.json`` — DataLogger does not interpret it; the
-        engine does.
+        engine does. ``groups`` (vial groups, ``run_config.py``) is the same:
+        opaque here, written only when the experiment has explicit groups, so
+        a single-mode config is unchanged on disk.
 
         Raises:
             ValueError: name / vials are malformed.
@@ -280,6 +320,14 @@ class DataLogger:
         }
         if media is not None:
             config["media"] = media
+        if groups:
+            config["groups"] = groups
+        # Parallel experiments: who is running this, and until when. Only
+        # written when given, so a config from before them is unchanged.
+        if operator:
+            config["operator"] = str(operator)
+        if expected_end:
+            config["expected_end"] = str(expected_end)
 
         exp_dir = self.experiments_root / name
         if exp_dir.exists():
@@ -322,7 +370,8 @@ class DataLogger:
 
         Raises:
             FileNotFoundError: directory or config.json missing.
-            RuntimeError: another experiment is already activated.
+            RuntimeError: this experiment is already active, or one of its
+                vials is being logged by another active experiment.
         """
         exp_dir = self.experiments_root / name
         config_path = exp_dir / "config.json"
@@ -337,32 +386,46 @@ class DataLogger:
         vials = sorted(int(v) for v in config.get("vials", []))
 
         with self._lock:
-            if self._active_name is not None:
-                raise RuntimeError(
-                    f"experiment '{self._active_name}' is already activated; "
-                    "deactivate it first"
-                )
-            self._active_name = name
-            self._active_dir = exp_dir
-            self._active_start = start or datetime.now(timezone.utc)
-            self._active_vials = vials
-            self._latest_od = None
-        log.info("experiment '%s' activated (start=%s)", name, self._active_start)
+            self._check_can_activate_locked(name, vials)
+            run = _ActiveRun(name, exp_dir, start or datetime.now(timezone.utc), vials)
+            self._active[name] = run
+        log.info("experiment '%s' activated (start=%s)", name, run.start)
         return config
 
-    def deactivate_experiment(self) -> Optional[str]:
-        """Stop writing rows. The experiment directory and CSVs are left
-        on disk. Returns the previously-active experiment name (or None)."""
+    def _check_can_activate_locked(self, name: str, vials: list[int]) -> None:
+        if name in self._active:
+            raise RuntimeError(f"experiment '{name}' is already activated")
+        for other in self._active.values():
+            shared = sorted(set(vials) & set(other.vials))
+            if shared:
+                raise RuntimeError(
+                    f"vials {shared} are already being logged for experiment "
+                    f"'{other.name}'; two experiments cannot share a vial"
+                )
+
+    def deactivate_experiment(self, name: Optional[str] = None) -> Optional[str]:
+        """Stop writing rows for ``name``. The experiment directory and CSVs
+        are left on disk. Returns the deactivated name (or None).
+
+        ``name=None`` means the only active experiment -- the pre-parallel
+        call shape. With several active it is ambiguous and raises."""
         with self._lock:
-            name = self._active_name
-            self._active_name = None
-            self._active_dir = None
-            self._active_start = None
-            self._active_vials = None
-            self._latest_od = None
-        if name is not None:
+            if name is None:
+                if not self._active:
+                    return None
+                if len(self._active) > 1:
+                    raise ValueError(
+                        "several experiments are active; name the one to "
+                        f"deactivate ({sorted(self._active)})"
+                    )
+                name = next(iter(self._active))
+            run = self._active.pop(name, None)
+            if not self._active:
+                self._latest_od = None
+        if run is not None:
             log.info("experiment '%s' deactivated", name)
-        return name
+            return name
+        return None
 
     def start_experiment(
         self,
@@ -388,11 +451,7 @@ class DataLogger:
         # at which point the new directory is already on disk and the
         # next call to start_experiment fails with FileExistsError.
         with self._lock:
-            if self._active_name is not None:
-                raise RuntimeError(
-                    f"experiment '{self._active_name}' is already activated; "
-                    "deactivate it first"
-                )
+            self._check_can_activate_locked(name, sorted(set(vials)))
         config = self.create_experiment(
             name=name,
             mode=mode,
@@ -404,9 +463,9 @@ class DataLogger:
         self.activate_experiment(name)
         return config
 
-    def stop_experiment(self) -> Optional[str]:
+    def stop_experiment(self, name: Optional[str] = None) -> Optional[str]:
         """Alias for :meth:`deactivate_experiment` (back-compat)."""
-        return self.deactivate_experiment()
+        return self.deactivate_experiment(name)
 
     # ------------------------------------------------------------------
     # Logging — no-ops when no experiment is running
@@ -451,7 +510,7 @@ class DataLogger:
         cannot corrupt CSV rows (Windows lacks POSIX O_APPEND atomic-write
         semantics for multi-handle scenarios)."""
         with self._lock:
-            if self._active_name is None:
+            if not self._active:
                 return
             has_od = od_calibrated is not None
             if has_od and od_raw is None:
@@ -476,9 +535,6 @@ class DataLogger:
                     raise ValueError(
                         f"'{label}' must have {N_VIALS} entries, got {len(series)}"
                     )
-            exp_dir = self._active_dir
-            vials = list(self._active_vials)
-            elapsed_h = self._elapsed_hours_locked(timestamp_iso)
             if has_od:
                 # Only refreshed on an OD tick, so this stays the last
                 # ACTUALLY measured OD rather than being reset by the five
@@ -488,31 +544,46 @@ class DataLogger:
                     for x in od_calibrated
                 ]
 
-            elapsed_str = f"{elapsed_h:.4f}"
-            for v in vials:
-                self._append_row(
-                    exp_dir / f"vial{v:02d}_temp.csv",
-                    [
-                        timestamp_iso,
-                        elapsed_str,
-                        _format_int(temperature_raw[v]),
-                        _format_number(temperature_calibrated[v], 4),
-                    ],
+            for run in self._active.values():
+                self._write_sensor_rows_locked(
+                    run, timestamp_iso, temperature_calibrated, temperature_raw,
+                    od_calibrated, od_raw, od_n_valid, od_flags, od_dark,
                 )
-                if not has_od:
-                    continue
-                self._append_row(
-                    exp_dir / f"vial{v:02d}_OD.csv",
-                    [
-                        timestamp_iso,
-                        elapsed_str,
-                        _format_int(od_raw[v]),
-                        _format_number(od_calibrated[v], 4),
-                        _format_int(od_n_valid[v]) if od_n_valid is not None else "",
-                        (od_flags[v] if od_flags is not None else "") or "",
-                        _format_int(od_dark[v]) if od_dark is not None else "",
-                    ],
-                )
+
+    def _write_sensor_rows_locked(
+        self, run: _ActiveRun, timestamp_iso: str,
+        temperature_calibrated, temperature_raw,
+        od_calibrated, od_raw, od_n_valid, od_flags, od_dark,
+    ) -> None:
+        """One temperature row (and one OD row on an OD tick) per vial of
+        ``run``, stamped with ``run``'s own elapsed hours."""
+        has_od = od_calibrated is not None
+        exp_dir = run.dir
+        elapsed_str = f"{self._elapsed_hours(run, timestamp_iso):.4f}"
+        for v in run.vials:
+            self._append_row(
+                exp_dir / f"vial{v:02d}_temp.csv",
+                [
+                    timestamp_iso,
+                    elapsed_str,
+                    _format_int(temperature_raw[v]),
+                    _format_number(temperature_calibrated[v], 4),
+                ],
+            )
+            if not has_od:
+                continue
+            self._append_row(
+                exp_dir / f"vial{v:02d}_OD.csv",
+                [
+                    timestamp_iso,
+                    elapsed_str,
+                    _format_int(od_raw[v]),
+                    _format_number(od_calibrated[v], 4),
+                    _format_int(od_n_valid[v]) if od_n_valid is not None else "",
+                    (od_flags[v] if od_flags is not None else "") or "",
+                    _format_int(od_dark[v]) if od_dark is not None else "",
+                ],
+            )
 
     def log_pump_event(
         self,
@@ -532,12 +603,11 @@ class DataLogger:
                 f"direction must be 'influx' or 'efflux'; got {direction!r}"
             )
         with self._lock:
-            if self._active_name is None:
+            run = self._owner_locked(vial)
+            if run is None:
                 return
-            if vial not in self._active_vials:
-                return
-            exp_dir = self._active_dir
-            elapsed_h = self._elapsed_hours_locked(timestamp_iso)
+            exp_dir = run.dir
+            elapsed_h = self._elapsed_hours(run, timestamp_iso)
             if od_at_pump is None and self._latest_od is not None:
                 od_at_pump = self._latest_od[vial]
             path = exp_dir / f"vial{vial:02d}_pump_log.csv"
@@ -573,12 +643,11 @@ class DataLogger:
         part an operator actually needs when a run reports no growth.
         """
         with self._lock:
-            if self._active_name is None:
+            run = self._owner_locked(vial)
+            if run is None:
                 return
-            if vial not in self._active_vials:
-                return
-            exp_dir = self._active_dir
-            elapsed_h = self._elapsed_hours_locked(timestamp_iso)
+            exp_dir = run.dir
+            elapsed_h = self._elapsed_hours(run, timestamp_iso)
             est = report.growth
             path = exp_dir / f"vial{vial:02d}_growth.csv"
             self._append_row(
@@ -621,12 +690,11 @@ class DataLogger:
         ``(vial, ordering)``.
         """
         with self._lock:
-            if self._active_name is None:
+            run = self._owner_locked(vial)
+            if run is None:
                 return
-            if vial not in self._active_vials:
-                return
-            exp_dir = self._active_dir
-            elapsed_h = self._elapsed_hours_locked(timestamp_iso)
+            exp_dir = run.dir
+            elapsed_h = self._elapsed_hours(run, timestamp_iso)
             path = exp_dir / "escalation_log.csv"
             if not path.exists():
                 self._init_csv(path, ESCALATION_HEADER)
@@ -653,26 +721,33 @@ class DataLogger:
         message: str,
         vial: Optional[int] = None,
         data: Optional[dict] = None,
+        experiment: Optional[str] = None,
     ) -> bool:
-        """Append one row to ``events.csv`` for the active experiment (SPEC §20.2).
+        """Append one row to ``events.csv`` (SPEC §20.2), for the right runs.
 
-        Returns True if a row was written, False if skipped (no experiment
-        running). Unlike :meth:`log_escalation_event` this does NOT filter on
-        experiment vial membership — machine-wide events carry ``vial=None``,
-        and an event about a vial outside the run (a manual pump, a serial
-        fault) is still part of that run's story.
+        Routing (PARALLEL_EXPERIMENTS.md T6), first match wins:
+
+        1. ``experiment`` names an active experiment -> that one only. Every
+           engine alert and event carries its experiment's name.
+        2. ``vial`` belongs to an active experiment -> its owner.
+        3. Otherwise -- a machine-wide event (bus, disk, watchdog, emergency
+           stop, calibration install) or one about a vial no run owns (a
+           manual pump on a free sleeve) -- every active experiment, because
+           it is part of each run's story.
+
+        Returns True if any row was written, False if skipped (nothing active).
 
         ``data`` is serialised to the ``data_json`` column; an unserialisable
         value degrades to its ``repr`` rather than losing the whole row.
         """
         with self._lock:
-            if self._active_name is None:
+            if not self._active:
                 return False
-            exp_dir = self._active_dir
-            elapsed_h = self._elapsed_hours_locked(timestamp_iso)
-            path = exp_dir / "events.csv"
-            if not path.exists():
-                self._init_csv(path, EVENT_HEADER)
+            if experiment is not None and experiment in self._active:
+                targets = [self._active[experiment]]
+            else:
+                owner = self._owner_locked(int(vial)) if vial is not None else None
+                targets = [owner] if owner is not None else list(self._active.values())
             if data:
                 try:
                     data_json = json.dumps(data, sort_keys=True, default=str)
@@ -680,18 +755,22 @@ class DataLogger:
                     data_json = json.dumps({"repr": repr(data)})
             else:
                 data_json = ""
-            self._append_row(
-                path,
-                [
-                    timestamp_iso,
-                    f"{elapsed_h:.4f}",
-                    str(level),
-                    str(category),
-                    "" if vial is None else int(vial),
-                    _one_line(message),
-                    data_json,
-                ],
-            )
+            for run in targets:
+                path = run.dir / "events.csv"
+                if not path.exists():
+                    self._init_csv(path, EVENT_HEADER)
+                self._append_row(
+                    path,
+                    [
+                        timestamp_iso,
+                        f"{self._elapsed_hours(run, timestamp_iso):.4f}",
+                        str(level),
+                        str(category),
+                        "" if vial is None else int(vial),
+                        _one_line(message),
+                        data_json,
+                    ],
+                )
             return True
 
     def update_experiment_config(self, name: str, partial: dict) -> dict:
@@ -720,14 +799,14 @@ class DataLogger:
     # Helpers
     # ------------------------------------------------------------------
 
-    def _elapsed_hours_locked(self, timestamp_iso: str) -> float:
+    @staticmethod
+    def _elapsed_hours(run: _ActiveRun, timestamp_iso: str) -> float:
+        """Hours since ``run`` started -- each experiment keeps its own clock."""
         try:
             now = _parse_iso(timestamp_iso)
         except Exception:
             now = datetime.now(timezone.utc)
-        if self._active_start is None:
-            return 0.0
-        return max(0.0, (now - self._active_start).total_seconds() / 3600.0)
+        return max(0.0, (now - run.start).total_seconds() / 3600.0)
 
     @staticmethod
     def _init_csv(path: Path, header: Iterable[str]) -> None:

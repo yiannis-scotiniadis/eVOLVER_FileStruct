@@ -44,6 +44,8 @@ Reading the tree rather than the plan, the following is **built and in `main`**:
 | Rotating disk-aware file logs, unified `events.csv`, error classification | Built (Session M) | `server/event_log.py`, `data_logger.log_event`, `/api/events/*`, `/api/health` |
 | Alert drawer, three-level alert colours, RS485 bus + per-vial health badges | Built (Session M2) | `index.html` (`#alert-drawer`, `applyHealth`) |
 | Calibration provenance, per-run OD blank, pump gravimetric wizard, reconciliation, staleness | Built (Session O) | `server/calibration_service.py`, `app.py` `/api/calibration/*`, `index.html` Calibration tab |
+| Vial groups within one experiment (per-group mode, parameters, temperature, stir), preconditioning for the blank, `CONTROL_MODES` registry | Built (Session Y, 2026-09-24) | `server/run_config.py`, `experiment_engine.py`, `/api/experiments/{name}/precondition`, wizard step 5 |
+| Parallel experiments: several independent experiments (own vials, modes, lifecycles, operators), shared bottles/carboys, machine hold | Built (2026-09-24) | `server/supervisor.py`, `server/vessels.py`, `/api/machine*`, `/api/vessels`, dashboard run chips |
 
 **Sessions K, L, M, M2 and O shipped on 2026-08-20** and are folded into the table above;
 their per-session sections below carry the completion notes and verification results.
@@ -112,7 +114,7 @@ the code.
 | 15 | Intelligent contamination detection | Low–Med | High | **High** | P1 / **P3** | V / deferred |
 | 16 | Slack/email integration for alerts | Med | High | Low | **P1** | W |
 | 17 | Backup experiment memory to OneDrive | Med | Med–High | Med–High | **P1** (rescoped) | X |
-| 18 | Parallel experiment running | Med | High | **High** | P1 / **P2** | Y / AB |
+| 18 | Parallel experiment running | Med | High | **High** | **Done** | Y + supervisor |
 | 19 | Distinct 16-colour palette | — | — | — | **Done** | AD (audit only) |
 | 20 | Map stir rate to physical RPM + animation | Low | Med | Med (bench work) | **P2** | AC |
 
@@ -1121,7 +1123,23 @@ Flask process so a backup failure can never affect the control loop.
 
 ### Session Y — Vial groups within one experiment
 
-**Effort: MEDIUM (90 min). Depends on: Q helps, not required.**
+**STATUS: DONE (2026-09-24).** `server/run_config.py` (pure normalisation and
+validation), per-group controller construction through the engine's new
+`CONTROL_MODES` registry, per-vial heater/stir targets, per-vial growth regime,
+`POST /api/experiments/{name}/precondition` for taking the blank at per-group
+conditions, `vial_groups.csv` in the export bundle, and the wizard's "Mode & groups"
+step. Covered by `server/test_vial_groups.py` and an engine-level mixed-mode closed-loop
+test in `server/test_control_loop.py`. Specification: `SPEC.md` §9.1.
+
+Decisions taken while building it: groups share the experiment's lifecycle (no
+per-group stop — that is what a separate experiment is for); the run-wide keys
+(`volume_ml`, `efflux_extra_seconds`, vial geometry, `od_acquisition`,
+`pump_flow_rates`) are refused inside a group; a single group submits and saves
+exactly as a pre-groups experiment; a bottle feeding a morbidostat group may not feed
+another group. The config shape below was the sketch; the built one names a group's
+overrides `parameters` (see `SPEC.md` §6).
+
+*Original triage: Effort: MEDIUM (90 min). Depends on: Q helps, not required.*
 
 The pragmatic 80 % of meeting item 18 (see §2 for why true concurrency is deferred).
 Extend the experiment config so an experiment contains *groups*, each with its own vials,
@@ -1148,11 +1166,16 @@ mode at different parameters across vials (a dilution-rate series, a temperature
 
 **Verification:**
 
-- [ ] Two groups with different modes run simultaneously in mock mode without interfering
-- [ ] Per-group parameters honoured; per-group media tracked separately
-- [ ] A vial cannot belong to two groups
-- [ ] Existing single-mode configs still load (treated as one implicit group)
-- [ ] Resume restores all groups correctly
+- [x] Two groups with different modes run simultaneously in mock mode without interfering
+      *(closed loop through the engine: turbidostat band held and chemostat D within 2 %)*
+- [x] Per-group parameters honoured; per-group media tracked separately
+- [x] A vial cannot belong to two groups
+- [x] Existing single-mode configs still load (treated as one implicit group) — the
+      pre-existing suite passes with no test edits
+- [x] Resume restores all groups correctly, including pre-groups `state.json`
+- [ ] **Wizard rendering checked in a real browser — NOT VERIFIED.** The wizard and
+      dashboard logic were driven headlessly (JavaScriptCore with a stub DOM); layout
+      and styling have not been looked at.
 
 ---
 
@@ -1209,6 +1232,17 @@ signal with an `OD_cal.meta.json` sidecar recording that fact — that sidecar i
 Session O2's dark read graduate from diagnostic to correction.
 
 ### Session AB — True parallel experiments
+
+> **DONE (2026-09-24), not as described below.** Built as a single-threaded
+> `ExperimentSupervisor` (`server/supervisor.py`) holding one `ExperimentEngine` per
+> experiment on one shared lock and one tick — no per-experiment threads, no RS485
+> arbitration (every dilution of a tick goes out in one concurrent schedule). Shared
+> media bottles and waste carboys are machine-scoped vessels (`server/vessels.py`). Vial
+> ownership, the machine hold, N-way resume and emergency-stop fan-out are in the
+> supervisor. Covered by `server/test_parallel_runs.py`; specification `SPEC.md` §9.2.
+> Not built: the actuator "reducer" and the `state.json` persistence debounce from
+> `MULTIPLEX_OPTIONS.md` — measured unnecessary at N ≤ 3 (see `PARALLEL_EXPERIMENTS.md`).
+> The text below is the original framing.
 
 Only if Session Y's groups prove insufficient — specifically, if the lab needs experiments
 with genuinely independent lifecycles (different start times, independent stop/resume,

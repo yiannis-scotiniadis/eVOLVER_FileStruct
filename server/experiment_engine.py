@@ -36,6 +36,8 @@ import shutil
 import threading
 import time
 from collections import deque
+from collections.abc import MutableMapping
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -57,6 +59,9 @@ from data_logger import _VALID_NAME
 
 import fluidics
 import growth_rate as growth
+import run_config
+import vessels as vessel_lib
+from vessels import KIND_MEDIA, KIND_WASTE, VesselRegistry
 from serial_manager import (
     HEATER_OFF_SETPOINT,
     MAX_SAFE_TEMP_C,
@@ -66,12 +71,53 @@ from serial_manager import (
     OD_DEFAULT_N_SAMPLES,
 )
 
-# Union of all controller types accepted by the engine. New modes that follow
-# the same interface (push_od / decide / to_state / restore_state /
-# flow_rate_ml_s) plug in by adding to this union and to SUPPORTED_MODES.
+# Union of the built-in controller types. The engine itself only relies on
+# the duck-typed protocol (push_od / decide / to_state / restore_state /
+# flow_rate_influx_ml_s, plus the optional members listed on ControlModeSpec),
+# so a new mode needs a CONTROL_MODES entry, not an edit here.
 ControllerType = TurbidostatController | ChemostatController | MorbidostatController
 
-SUPPORTED_MODES: frozenset[str] = frozenset({"turbidostat", "chemostat", "morbidostat"})
+
+@dataclass(frozen=True)
+class ControlModeSpec:
+    """One control mode the engine can run.
+
+    Group validation at create, per-mode parameter validation, and controller
+    construction at start and resume all look a mode up here, so a group's
+    ``mode`` is just a key into :data:`CONTROL_MODES`. Adding a mode later
+    (e.g. the ``"custom"`` mode sketched in CUSTOM_CONTROLLER_DESIGN.md) means
+    registering it; ``run_config.py`` needs no change.
+
+    ``validate(parameters, flow_rates, vials, control_interval_seconds)``
+        Returns warnings; raises ``ValueError`` for a configuration that
+        cannot work. ``parameters`` are the group's MERGED parameters.
+    ``build(engine, group, calibration)``
+        Returns ``{vial: controller}`` for ``group.vials``. Receives the whole
+        :class:`run_config.Group` (name, mode, vials, merged parameters)
+        rather than loose arguments, so a mode that keeps per-group state can
+        key it by group name.
+    """
+
+    name: str
+    validate: Callable[[dict, list[float], list[int], float], list[str]]
+    build: Callable[[Any, "run_config.Group", dict], dict]
+
+
+# Populated by register_control_mode() at the bottom of this module, after
+# ExperimentEngine (whose methods build the built-in controllers) exists.
+CONTROL_MODES: dict[str, ControlModeSpec] = {}
+
+
+def register_control_mode(spec: ControlModeSpec) -> None:
+    """Make ``spec.name`` a mode experiments and groups may use."""
+    if not run_config.GROUP_NAME.match(spec.name):
+        raise ValueError(f"mode name {spec.name!r} must match {run_config.GROUP_NAME.pattern!r}")
+    CONTROL_MODES[spec.name] = spec
+
+
+def supported_modes() -> frozenset[str]:
+    """The modes currently registered in :data:`CONTROL_MODES`."""
+    return frozenset(CONTROL_MODES)
 
 
 class ConflictError(Exception):
@@ -231,6 +277,176 @@ def _as_flow_rates_32(value: Any) -> list[float]:
     )
 
 
+def _validate_od_band(
+    od_lower: list[float],
+    od_upper: list[float],
+    parameters: dict,
+    flow_rates: list[float],
+    vials: list[int],
+) -> list[str]:
+    """Checks shared by every mode that dilutes an OD band down to a floor
+    (turbidostat, and the morbidostat's inner turbidostat)."""
+    warnings: list[str] = []
+    volume_ml = float(parameters.get("volume_ml", DEFAULT_VOLUME_ML))
+    for vial in vials:
+        lo, hi = od_lower[vial], od_upper[vial]
+        if lo <= 0:
+            raise ValueError(f"vial {vial}: OD lower threshold must be > 0, got {lo}")
+        if hi <= lo:
+            raise ValueError(
+                f"vial {vial}: OD upper threshold ({hi}) must be > lower ({lo})"
+            )
+        flow = flow_rates[vial]
+        # Smallest bolus the controller can ever be asked for: the one
+        # that takes OD from `hi` (where hysteresis flips the target)
+        # down to `lo`. The turbidostat truncates to whole seconds and
+        # carries nothing (T-3), so if even this is sub-second the vial
+        # never dilutes -- silently, exactly the legacy `%d` bug.
+        min_bolus_s = math.log(hi / lo) * volume_ml / flow
+        if min_bolus_s < 1.0:
+            widest = lo * math.exp(flow / volume_ml)
+            raise ValueError(
+                f"vial {vial}: OD band [{lo:g}, {hi:g}] is too narrow to "
+                f"dilute -- the largest bolus it can ever call for is "
+                f"{min_bolus_s:.2f} s, and the 2016 firmware accepts whole "
+                f"seconds only, so nothing would ever fire. With "
+                f"volume_ml={volume_ml:g} and this vial's influx rate "
+                f"{flow:g} mL/s the upper threshold must be at least "
+                f"{widest:.3f}"
+            )
+        if min_bolus_s < 2.0:
+            warnings.append(
+                f"vial {vial}: OD band [{lo:g}, {hi:g}] gives a "
+                f"{min_bolus_s:.2f} s bolus; whole-second truncation "
+                f"discards up to "
+                f"{100.0 * (min_bolus_s - int(min_bolus_s)) / min_bolus_s:.0f}% "
+                "of each dilution. Widen the band for finer control."
+            )
+
+    # GROWTH_RATE_METHOD.md §4.5: the refractory gate is what makes
+    # segmentation viable at all -- turbidostat segments can never be
+    # shorter than pump_wait however fast the culture grows. Below the
+    # estimator's minimum fit span, every segment is too short to fit and
+    # the growth-rate service reports nothing for the whole run. That is a
+    # degraded analysis, not an unsafe run, so it warns and proceeds.
+    pump_wait_min = float(
+        parameters.get("pump_wait_minutes", DEFAULT_PUMP_WAIT_MINUTES)
+    )
+    min_span_min = growth.MIN_FIT_SPAN_SECONDS / 60.0
+    if pump_wait_min < min_span_min:
+        warnings.append(
+            f"pump_wait_minutes={pump_wait_min:g} is below the growth-rate "
+            f"service's minimum fit span ({min_span_min:g} min), so every "
+            "inter-dilution segment will be too short to fit and no growth "
+            "rate will be reported for this run. Dilution itself is "
+            "unaffected."
+        )
+
+    return warnings
+
+
+def _validate_turbidostat_parameters(
+    parameters: dict,
+    flow_rates: list[float],
+    vials: list[int],
+    control_interval_seconds: float,
+) -> list[str]:
+    od_lower = _as_list_of_16(
+        parameters.get("od_lower_thresh", parameters.get("od_lower", 0.2)),
+        default=0.2, name="od_lower_thresh",
+    )
+    od_upper = _as_list_of_16(
+        parameters.get("od_upper_thresh", parameters.get("od_upper", 0.4)),
+        default=0.4, name="od_upper_thresh",
+    )
+    return _validate_od_band(od_lower, od_upper, parameters, flow_rates, vials)
+
+
+def _validate_morbidostat_parameters(
+    parameters: dict,
+    flow_rates: list[float],
+    vials: list[int],
+    control_interval_seconds: float,
+) -> list[str]:
+    od_lower = _as_list_of_16(
+        parameters.get("od_lower", 0.2), default=0.2, name="od_lower",
+    )
+    od_upper = _as_list_of_16(
+        parameters.get("target_od", 0.4), default=0.4, name="target_od",
+    )
+    return _validate_od_band(od_lower, od_upper, parameters, flow_rates, vials)
+
+
+def _validate_chemostat_parameters(
+    parameters: dict,
+    flow_rates: list[float],
+    vials: list[int],
+    control_interval_seconds: float,
+) -> list[str]:
+    warnings: list[str] = []
+    volume_ml = float(parameters.get("volume_ml", DEFAULT_VOLUME_ML))
+    dilution_rate = float(parameters.get("dilution_rate_per_hour", 0.5))
+    if dilution_rate <= 0:
+        raise ValueError(
+            f"'dilution_rate_per_hour' must be > 0, got {dilution_rate}"
+        )
+    bolus_interval = parameters.get("bolus_interval_seconds")
+    if bolus_interval is None:
+        bolus_interval = DEFAULT_CYCLE_INTERVAL_SECONDS
+    bolus_interval = float(bolus_interval)
+    # The control lane calls decide() once per control tick, so a bolus
+    # interval below it cannot be honoured -- the interval silently
+    # becomes the tick. That alone would be harmless (boli are sized from
+    # elapsed time, so D is preserved), but `safety_cap` is derived from
+    # the NOMINAL interval while the bolus is sized from the ACTUAL
+    # elapsed time: ask for a 5 s interval against a 10 s tick and every
+    # single bolus clips to 4 s, emits `bolus_cap_clipped`, and the run
+    # under-delivers for its whole length while booking the full rate.
+    if bolus_interval < control_interval_seconds:
+        raise ValueError(
+            f"'bolus_interval_seconds' must be >= the control interval "
+            f"({control_interval_seconds:g} s), got {bolus_interval:g}: "
+            "the controller only decides once per control tick, so a "
+            "shorter interval is not honoured -- and because each bolus "
+            "is sized from elapsed time while the overlap safety cap is "
+            "sized from the nominal interval, every bolus would be "
+            "clipped and the delivered dilution rate would fall short of "
+            "the requested one for the entire run"
+        )
+    if bolus_interval < MIN_BOLUS_INTERVAL_SECONDS:
+        raise ValueError(
+            f"'bolus_interval_seconds' must be >= "
+            f"{MIN_BOLUS_INTERVAL_SECONDS} s, got {bolus_interval}: the "
+            "per-bolus duration is capped at bolus_interval - 1 s so "
+            "consecutive boli cannot overlap, and below 2 s that cap falls "
+            "under the firmware's 1 s resolution -- the run would deliver "
+            "no media at all while booking the full requested volume"
+        )
+    safety_cap = min(20.0, max(bolus_interval - 1.0, 0.1))
+    for vial in vials:
+        flow = flow_rates[vial]
+        needed_s = dilution_rate * volume_ml * bolus_interval / 3600.0 / flow
+        if needed_s > safety_cap:
+            achievable_d = safety_cap * flow * 3600.0 / (volume_ml * bolus_interval)
+            warnings.append(
+                f"vial {vial}: D={dilution_rate:g}/h needs {needed_s:.1f} s "
+                f"per bolus but the safety cap is {safety_cap:.1f} s -- every "
+                f"bolus will be clipped and the delivered rate will be about "
+                f"{achievable_d:.2f}/h. Lengthen bolus_interval_seconds or "
+                "lower the dilution rate."
+            )
+    start_od = parameters.get("start_od")
+    if start_od is not None and float(start_od) <= 0:
+        raise ValueError(f"'start_od' must be > 0 when given, got {start_od}")
+    start_after = parameters.get("start_after_seconds")
+    if start_after is not None and float(start_after) < 0:
+        raise ValueError(
+            f"'start_after_seconds' must be >= 0 when given, got {start_after}"
+        )
+
+    return warnings
+
+
 def validate_control_parameters(
     mode: str,
     parameters: dict,
@@ -259,136 +475,17 @@ def validate_control_parameters(
         raise ValueError(f"'volume_ml' must be > 0, got {volume_ml}")
     influx_rates = [flow_rates[v] for v in vials]
 
-    if mode in ("turbidostat", "morbidostat"):
-        if mode == "turbidostat":
-            od_lower = _as_list_of_16(
-                parameters.get("od_lower_thresh", parameters.get("od_lower", 0.2)),
-                default=0.2, name="od_lower_thresh",
-            )
-            od_upper = _as_list_of_16(
-                parameters.get("od_upper_thresh", parameters.get("od_upper", 0.4)),
-                default=0.4, name="od_upper_thresh",
-            )
-        else:
-            od_lower = _as_list_of_16(
-                parameters.get("od_lower", 0.2), default=0.2, name="od_lower",
-            )
-            od_upper = _as_list_of_16(
-                parameters.get("target_od", 0.4), default=0.4, name="target_od",
-            )
-        for vial in vials:
-            lo, hi = od_lower[vial], od_upper[vial]
-            if lo <= 0:
-                raise ValueError(f"vial {vial}: OD lower threshold must be > 0, got {lo}")
-            if hi <= lo:
-                raise ValueError(
-                    f"vial {vial}: OD upper threshold ({hi}) must be > lower ({lo})"
-                )
-            flow = flow_rates[vial]
-            # Smallest bolus the controller can ever be asked for: the one
-            # that takes OD from `hi` (where hysteresis flips the target)
-            # down to `lo`. The turbidostat truncates to whole seconds and
-            # carries nothing (T-3), so if even this is sub-second the vial
-            # never dilutes -- silently, exactly the legacy `%d` bug.
-            min_bolus_s = math.log(hi / lo) * volume_ml / flow
-            if min_bolus_s < 1.0:
-                widest = lo * math.exp(flow / volume_ml)
-                raise ValueError(
-                    f"vial {vial}: OD band [{lo:g}, {hi:g}] is too narrow to "
-                    f"dilute -- the largest bolus it can ever call for is "
-                    f"{min_bolus_s:.2f} s, and the 2016 firmware accepts whole "
-                    f"seconds only, so nothing would ever fire. With "
-                    f"volume_ml={volume_ml:g} and this vial's influx rate "
-                    f"{flow:g} mL/s the upper threshold must be at least "
-                    f"{widest:.3f}"
-                )
-            if min_bolus_s < 2.0:
-                warnings.append(
-                    f"vial {vial}: OD band [{lo:g}, {hi:g}] gives a "
-                    f"{min_bolus_s:.2f} s bolus; whole-second truncation "
-                    f"discards up to "
-                    f"{100.0 * (min_bolus_s - int(min_bolus_s)) / min_bolus_s:.0f}% "
-                    "of each dilution. Widen the band for finer control."
-                )
-
-        # GROWTH_RATE_METHOD.md §4.5: the refractory gate is what makes
-        # segmentation viable at all -- turbidostat segments can never be
-        # shorter than pump_wait however fast the culture grows. Below the
-        # estimator's minimum fit span, every segment is too short to fit and
-        # the growth-rate service reports nothing for the whole run. That is a
-        # degraded analysis, not an unsafe run, so it warns and proceeds.
-        pump_wait_min = float(
-            parameters.get("pump_wait_minutes", DEFAULT_PUMP_WAIT_MINUTES)
+    # Mode-specific checks, through the CONTROL_MODES registry. An unknown
+    # mode is a hard error: silently running only the global checks below is
+    # exactly the validation hole CONTROL_MODE_AUDIT.md C-3 closed.
+    spec = CONTROL_MODES.get(mode)
+    if spec is None:
+        raise ValueError(
+            f"unsupported mode {mode!r}; supported: {sorted(CONTROL_MODES)}"
         )
-        min_span_min = growth.MIN_FIT_SPAN_SECONDS / 60.0
-        if pump_wait_min < min_span_min:
-            warnings.append(
-                f"pump_wait_minutes={pump_wait_min:g} is below the growth-rate "
-                f"service's minimum fit span ({min_span_min:g} min), so every "
-                "inter-dilution segment will be too short to fit and no growth "
-                "rate will be reported for this run. Dilution itself is "
-                "unaffected."
-            )
-
-    elif mode == "chemostat":
-        dilution_rate = float(parameters.get("dilution_rate_per_hour", 0.5))
-        if dilution_rate <= 0:
-            raise ValueError(
-                f"'dilution_rate_per_hour' must be > 0, got {dilution_rate}"
-            )
-        bolus_interval = parameters.get("bolus_interval_seconds")
-        if bolus_interval is None:
-            bolus_interval = DEFAULT_CYCLE_INTERVAL_SECONDS
-        bolus_interval = float(bolus_interval)
-        # The control lane calls decide() once per control tick, so a bolus
-        # interval below it cannot be honoured -- the interval silently
-        # becomes the tick. That alone would be harmless (boli are sized from
-        # elapsed time, so D is preserved), but `safety_cap` is derived from
-        # the NOMINAL interval while the bolus is sized from the ACTUAL
-        # elapsed time: ask for a 5 s interval against a 10 s tick and every
-        # single bolus clips to 4 s, emits `bolus_cap_clipped`, and the run
-        # under-delivers for its whole length while booking the full rate.
-        if bolus_interval < control_interval_seconds:
-            raise ValueError(
-                f"'bolus_interval_seconds' must be >= the control interval "
-                f"({control_interval_seconds:g} s), got {bolus_interval:g}: "
-                "the controller only decides once per control tick, so a "
-                "shorter interval is not honoured -- and because each bolus "
-                "is sized from elapsed time while the overlap safety cap is "
-                "sized from the nominal interval, every bolus would be "
-                "clipped and the delivered dilution rate would fall short of "
-                "the requested one for the entire run"
-            )
-        if bolus_interval < MIN_BOLUS_INTERVAL_SECONDS:
-            raise ValueError(
-                f"'bolus_interval_seconds' must be >= "
-                f"{MIN_BOLUS_INTERVAL_SECONDS} s, got {bolus_interval}: the "
-                "per-bolus duration is capped at bolus_interval - 1 s so "
-                "consecutive boli cannot overlap, and below 2 s that cap falls "
-                "under the firmware's 1 s resolution -- the run would deliver "
-                "no media at all while booking the full requested volume"
-            )
-        safety_cap = min(20.0, max(bolus_interval - 1.0, 0.1))
-        for vial in vials:
-            flow = flow_rates[vial]
-            needed_s = dilution_rate * volume_ml * bolus_interval / 3600.0 / flow
-            if needed_s > safety_cap:
-                achievable_d = safety_cap * flow * 3600.0 / (volume_ml * bolus_interval)
-                warnings.append(
-                    f"vial {vial}: D={dilution_rate:g}/h needs {needed_s:.1f} s "
-                    f"per bolus but the safety cap is {safety_cap:.1f} s -- every "
-                    f"bolus will be clipped and the delivered rate will be about "
-                    f"{achievable_d:.2f}/h. Lengthen bolus_interval_seconds or "
-                    "lower the dilution rate."
-                )
-        start_od = parameters.get("start_od")
-        if start_od is not None and float(start_od) <= 0:
-            raise ValueError(f"'start_od' must be > 0 when given, got {start_od}")
-        start_after = parameters.get("start_after_seconds")
-        if start_after is not None and float(start_after) < 0:
-            raise ValueError(
-                f"'start_after_seconds' must be >= 0 when given, got {start_after}"
-            )
+    warnings.extend(spec.validate(
+        parameters, flow_rates, list(vials), control_interval_seconds,
+    ))
 
     efflux_extra = float(
         parameters.get("efflux_extra_seconds", DEFAULT_EFFLUX_EXTRA_SECONDS)
@@ -521,13 +618,18 @@ def _validate_and_normalize_media(media: dict) -> dict:
             raise ValueError(
                 f"'media.bottles[{i}].low_volume_alert_ml' must be >= 0"
             )
-        bottles.append({
+        entry = {
             "id": bid,
             "name": name,
             "contents": contents,
             "initial_volume_ml": initial,
             "low_volume_alert_ml": float(low),
-        })
+        }
+        if b.get("vessel") is not None:
+            if not isinstance(b["vessel"], str) or not b["vessel"]:
+                raise ValueError(f"'media.bottles[{i}].vessel' must be a vessel id string")
+            entry["vessel"] = b["vessel"]
+        bottles.append(entry)
 
     v2b_in = media.get("vial_to_bottle")
     if not isinstance(v2b_in, dict) or not v2b_in:
@@ -566,18 +668,74 @@ def _validate_and_normalize_media(media: dict) -> dict:
     if not isinstance(waste_name, str):
         raise ValueError("'media.waste.name' must be a string")
 
+    waste_out = {
+        "name": waste_name,
+        "capacity_ml": capacity,
+        "high_fill_alert_ml": float(high),
+    }
+    if waste_in.get("vessel") is not None:
+        if not isinstance(waste_in["vessel"], str) or not waste_in["vessel"]:
+            raise ValueError("'media.waste.vessel' must be a vessel id string")
+        waste_out["vessel"] = waste_in["vessel"]
     return {
         "bottles": bottles,
         "vial_to_bottle": vial_to_bottle,
-        "waste": {
-            "name": waste_name,
-            "capacity_ml": capacity,
-            "high_fill_alert_ml": float(high),
-        },
+        "waste": waste_out,
     }
 
 
+class _BottleField(MutableMapping):
+    """``{bottle_id: value}`` view of one field of this run's media vessels.
+
+    The per-bottle books (consumed volume, alert latches) used to be plain
+    dicts on the engine. They now live in the shared :class:`VesselRegistry`
+    keyed by vessel id -- a bottle two experiments feed from is one record --
+    and this view keeps the run-local bottle-id interface over them."""
+
+    def __init__(self, engine: "ExperimentEngine", key: str, default) -> None:
+        self._engine = engine
+        self._key = key
+        self._default = default
+
+    def _vid(self, bottle_id: str) -> Optional[str]:
+        vid = self._engine._bottle_vessel.get(bottle_id)
+        if vid is None or not self._engine._vessels.exists(vid):
+            return None
+        return vid
+
+    def __getitem__(self, bottle_id: str):
+        vid = self._vid(bottle_id)
+        if vid is None:
+            raise KeyError(bottle_id)
+        return self._engine._vessels.field(vid, self._key, self._default)
+
+    def __setitem__(self, bottle_id: str, value) -> None:
+        vid = self._vid(bottle_id)
+        if vid is None:
+            raise KeyError(bottle_id)
+        self._engine._vessels.set_field(vid, self._key, value)
+
+    def __delitem__(self, bottle_id: str) -> None:
+        raise TypeError("vessel books cannot be deleted through a run")
+
+    def __iter__(self):
+        return iter(list(self._engine._bottle_vessel))
+
+    def __len__(self) -> int:
+        return len(self._engine._bottle_vessel)
+
+
 class ExperimentEngine:
+    """Drives ONE experiment: its lifecycle, per-vial controllers, heater
+    safety, media books and ``state.json``.
+
+    Several can run side by side under :class:`supervisor.ExperimentSupervisor`
+    (parallel experiments), sharing its lock, serial manager, data logger and
+    vessel registry; each still sees only its own vials. Constructed alone --
+    as the tests do -- it owns a private lock and an in-memory registry and
+    behaves exactly as the single-experiment engine always has.
+    """
+
     def __init__(
         self,
         serial_manager,
@@ -594,6 +752,8 @@ class ExperimentEngine:
         heater_overrun_C: float = DEFAULT_HEATER_OVERRUN_C,
         heater_critical_C: float = DEFAULT_HEATER_CRITICAL_C,
         maintenance_timeout_minutes: float = DEFAULT_MAINTENANCE_TIMEOUT_MINUTES,
+        lock: Optional[threading.RLock] = None,
+        vessel_registry: Optional[VesselRegistry] = None,
     ) -> None:
         self._manager = serial_manager
         self._data_logger = data_logger
@@ -612,16 +772,34 @@ class ExperimentEngine:
         self._heater_critical_C = float(heater_critical_C)
         self._maintenance_timeout_seconds = float(maintenance_timeout_minutes) * 60.0
 
-        self._lock = threading.RLock()
+        # Shared with every other experiment when a supervisor holds several:
+        # they all read-modify-write the same 16-vial heater and stir vectors
+        # on the manager, and one lock serialises that.
+        self._lock = lock if lock is not None else threading.RLock()
 
         # Loaded experiment (single-experiment Phase 1)
         self._status: str = ExperimentStatus.IDLE
         self._name: Optional[str] = None
         self._config: Optional[dict] = None
         self._vials: list[int] = []
+        # Vial groups (ROADMAP Session Y / run_config.py). A config without
+        # `groups` normalises to one implicit group, so this is never empty
+        # while an experiment is loaded.
+        self._groups: list[run_config.Group] = []
+        self._vial_group: dict[int, run_config.Group] = {}
         self._controllers: dict[int, ControllerType] = {}
         self._setpoint_raw: dict[int, int] = {}
-        self._setpoint_stir: int = 0
+        # Per-vial stir PWM: groups may stir at different rates.
+        self._stir_by_vial: dict[int, int] = {}
+        # Set while a CREATED experiment holds its vials at run conditions
+        # (heaters at target, stir on) so the per-run OD blank can be taken
+        # under the conditions it will be used in. See precondition_experiment.
+        self._preconditioned_at: Optional[datetime] = None
+        # run_cycle re-sends this run's stir every tick (drift protection).
+        # A supervisor holding several runs turns this off and writes ONE
+        # composed stir vector per tick instead (stir_targets), so N runs do
+        # not cost N `zv` frames on the 9600-baud bus.
+        self.resend_stir_in_cycle: bool = True
         # Dropped-read streaks, one per lane. Split because the two lanes
         # tick at different periods: three consecutive dropped TEMPERATURE
         # reads is 30 s, three consecutive dropped OD reads is 3 min, and a
@@ -630,6 +808,9 @@ class ExperimentEngine:
         self._temp_nan_streak: dict[int, int] = {}
         self._od_nan_streak: dict[int, int] = {}
         self._od_range_streak: dict[int, int] = {}
+        # Consecutive over-critical temperature reads per vial; three latch
+        # an overtemp fault (_handle_heater_safety_locked).
+        self._overtemp_streak: dict[int, int] = {}
         # Set by anything that changes persisted state on a fast tick, so the
         # every-tick fsync in _save_state_locked can be skipped when nothing
         # actually moved. OD ticks persist unconditionally.
@@ -664,20 +845,22 @@ class ExperimentEngine:
         self._stopped_at: Optional[datetime] = None
         self._stop_reason: Optional[str] = None
 
-        # Media tracking (Phase 1: bottles are purely logical; static for run)
+        # Media tracking. Static per-bottle config is this run's; the LEVELS
+        # and alert latches live in the vessel registry (vessels.py), because
+        # a bottle or carboy another experiment also uses is one vessel with
+        # one level. _bottle_consumed_ml / _bottle_alerted_low /
+        # _bottle_alerted_blocked / _waste_* are views onto it (properties
+        # below). The two latch kinds are distinct: low_volume_alert_ml /
+        # high_fill_alert_ml are a user-configurable heads-up, reserve_ml is
+        # the §15 hard-stop floor.
+        self._vessels: VesselRegistry = (
+            vessel_registry if vessel_registry is not None else VesselRegistry()
+        )
         self._media_bottles: dict[str, dict] = {}     # id -> static config
         self._vial_to_bottle: dict[int, str] = {}     # vial -> bottle id
-        self._bottle_consumed_ml: dict[str, float] = {}
-        self._bottle_alerted_low: dict[str, bool] = {}
-        # Consumables interlock (SPEC §15) — one-shot critical-alert latches,
-        # distinct from the low/high warning latches above (different
-        # thresholds: low_volume_alert_ml/high_fill_alert_ml are a
-        # user-configurable heads-up, reserve_ml is the hard-stop floor).
-        self._bottle_alerted_blocked: dict[str, bool] = {}
+        self._bottle_vessel: dict[str, str] = {}      # bottle id -> vessel id
+        self._waste_vessel: Optional[str] = None
         self._waste_config: Optional[dict] = None
-        self._waste_filled_ml: float = 0.0
-        self._waste_alerted_high: bool = False
-        self._waste_alerted_blocked: bool = False
 
         # Maintenance mode (pauses pump execution; coalesces decisions per
         # vial so we don't over-dilute on resume). Cleared on stop.
@@ -716,6 +899,93 @@ class ExperimentEngine:
         with self._lock:
             return self._status
 
+    @property
+    def controls_actuators(self) -> bool:
+        """True while the loaded experiment drives its vials' heaters and
+        stirrers: RUNNING, or CREATED and preconditioned. The manual actuator
+        endpoints refuse writes to those vials, because the engine re-asserts
+        its own setpoints over them every tick."""
+        with self._lock:
+            return self._status == ExperimentStatus.RUNNING or (
+                self._status == ExperimentStatus.CREATED
+                and self._preconditioned_at is not None
+            )
+
+    # ---- Media books, as views onto the vessel registry ----
+
+    @property
+    def _bottle_consumed_ml(self) -> _BottleField:
+        return _BottleField(self, "level_ml", 0.0)
+
+    @property
+    def _bottle_alerted_low(self) -> _BottleField:
+        return _BottleField(self, "alerted_level", False)
+
+    @property
+    def _bottle_alerted_blocked(self) -> _BottleField:
+        return _BottleField(self, "alerted_blocked", False)
+
+    def _waste_field(self, key: str, default):
+        vid = self._waste_vessel
+        if vid is None or not self._vessels.exists(vid):
+            return default
+        return self._vessels.field(vid, key, default)
+
+    def _set_waste_field(self, key: str, value) -> None:
+        vid = self._waste_vessel
+        if vid is not None and self._vessels.exists(vid):
+            self._vessels.set_field(vid, key, value)
+
+    @property
+    def _waste_filled_ml(self) -> float:
+        return float(self._waste_field("level_ml", 0.0))
+
+    @_waste_filled_ml.setter
+    def _waste_filled_ml(self, value: float) -> None:
+        self._set_waste_field("level_ml", float(value))
+
+    @property
+    def _waste_alerted_high(self) -> bool:
+        return bool(self._waste_field("alerted_level", False))
+
+    @_waste_alerted_high.setter
+    def _waste_alerted_high(self, value: bool) -> None:
+        self._set_waste_field("alerted_level", bool(value))
+
+    @property
+    def _waste_alerted_blocked(self) -> bool:
+        return bool(self._waste_field("alerted_blocked", False))
+
+    @_waste_alerted_blocked.setter
+    def _waste_alerted_blocked(self, value: bool) -> None:
+        self._set_waste_field("alerted_blocked", bool(value))
+
+    @property
+    def vessel_ids(self) -> dict[str, list[str]]:
+        """``{"media": [...], "waste": [...]}`` vessels this run draws on."""
+        with self._lock:
+            return {
+                KIND_MEDIA: sorted(set(self._bottle_vessel.values())),
+                KIND_WASTE: [self._waste_vessel] if self._waste_vessel else [],
+            }
+
+    def vial_group(self, vial: int) -> Optional[dict]:
+        """``{"name", "mode"}`` of the loaded experiment's group holding
+        ``vial``, or None when the vial is not in the loaded experiment."""
+        with self._lock:
+            g = self._vial_group.get(int(vial))
+            return None if g is None else {"name": g.name, "mode": g.mode}
+
+    def _set_groups_locked(self, groups: list[run_config.Group]) -> None:
+        self._groups = list(groups)
+        self._vial_group = run_config.group_by_vial(self._groups)
+
+    def _vial_mode_locked(self, vial: int) -> str:
+        g = self._vial_group.get(vial)
+        if g is not None:
+            return g.mode
+        return (self._config or {}).get("mode", "turbidostat")
+
     def od_acquisition_params(self) -> dict:
         """Enhanced-OD acquisition parameters for the loaded experiment, as
         keyword args for ``SerialManager.read_od_enhanced`` (``n_samples``,
@@ -739,12 +1009,15 @@ class ExperimentEngine:
     def create_experiment(
         self,
         name: str,
-        mode: str,
+        mode: Optional[str] = None,
         vials: Optional[list[int]] = None,
         parameters: Optional[dict] = None,
         calibration: Optional[dict] = None,
         notes: str = "",
         media: Optional[dict] = None,
+        groups: Optional[list] = None,
+        operator: str = "",
+        expected_end: Optional[str] = None,
     ) -> dict:
         """Validate, create the experiment directory via DataLogger, write
         the initial ``state.json``, and transition IDLE → CREATED. Returns
@@ -753,10 +1026,17 @@ class ExperimentEngine:
         When ``media`` is provided, ``vials`` may be omitted — the engine
         derives the vial list from ``media.vial_to_bottle.keys()``. If both
         are supplied they must agree (sorted-equal).
+
+        ``groups`` (ROADMAP Session Y, ``run_config.py``) splits the vials
+        into named groups, each with its own mode and parameter overrides.
+        With ``groups`` given, ``mode`` must be omitted (or equal the groups'
+        shared mode) and ``vials`` defaults to the union of the groups.
+        Without it, ``mode`` + ``vials`` + ``parameters`` form one implicit
+        group, exactly as before groups existed.
         """
-        if mode not in SUPPORTED_MODES:
+        if not groups and mode not in CONTROL_MODES:
             raise ValueError(
-                f"unsupported mode {mode!r}; supported: {sorted(SUPPORTED_MODES)}"
+                f"unsupported mode {mode!r}; supported: {sorted(CONTROL_MODES)}"
             )
 
         # Validate the optional od_acquisition block up front so a malformed
@@ -783,7 +1063,9 @@ class ExperimentEngine:
 
         normalized_media: Optional[dict] = None
         if media is not None:
-            normalized_media = _validate_and_normalize_media(media)
+            normalized_media = _validate_and_normalize_media(
+                self._fill_shared_vessel_refs(media)
+            )
             derived_vials = sorted(int(k) for k in normalized_media["vial_to_bottle"])
             if vials is None or len(vials) == 0:
                 vials = derived_vials
@@ -794,6 +1076,26 @@ class ExperimentEngine:
                         f"({derived_vials}); got {sorted(vials)}"
                     )
 
+        # Groups. With explicit groups the vial list is their union, and it
+        # must agree with media.vial_to_bottle when media is given (the
+        # vials derived from media above are checked against the union).
+        group_list = run_config.normalize_groups(
+            mode=mode, vials=vials, parameters=parameters or {}, groups=groups,
+            supported_modes=supported_modes(),
+        )
+        grouped = run_config.is_grouped(group_list)
+        if grouped:
+            derived_mode = run_config.run_mode(group_list)
+            if mode is not None and mode != derived_mode:
+                raise ValueError(
+                    f"'mode'={mode!r} conflicts with the groups' mode "
+                    f"{derived_mode!r}; omit 'mode' when supplying 'groups'"
+                )
+            mode = derived_mode
+            vials = sorted(v for g in group_list for v in g.vials)
+            if normalized_media is not None:
+                self._check_morbidostat_bottles(group_list, normalized_media)
+
         if vials is None or len(vials) == 0:
             raise ValueError("'vials' must be a non-empty list (or supply 'media')")
 
@@ -801,12 +1103,9 @@ class ExperimentEngine:
         # (a band that cannot dilute, a sub-2 s bolus interval) become HTTP
         # 400; the warnings are returned to the caller and raised as alerts
         # so they land in the run's event log rather than only in a response
-        # body someone may not read.
-        control_warnings = validate_control_parameters(
-            mode, parameters or {}, flow_rates,
-            sorted(int(v) for v in vials),
-            control_interval_seconds=self._cycle_interval_seconds,
-        )
+        # body someone may not read. Validated once per group: the function
+        # is already vial-scoped, and each group has its own mode.
+        control_warnings = self._validate_groups_control(group_list, flow_rates)
 
         with self._lock:
             self._assert_status(ExperimentStatus.IDLE, ExperimentStatus.STOPPED, ExperimentStatus.ERROR)
@@ -822,19 +1121,27 @@ class ExperimentEngine:
                 calibration=calibration or {},
                 notes=notes,
                 media=normalized_media,
+                # Only an explicit group list is written back: a legacy
+                # single-mode config stays byte-identical on disk.
+                groups=[g.to_config() for g in group_list] if grouped else None,
+                operator=operator,
+                expected_end=expected_end,
             )
             self._status = ExperimentStatus.CREATED
             self._name = name
             self._config = config
             self._vials = sorted(int(v) for v in config["vials"])
+            self._set_groups_locked(group_list)
             self._controllers = {}  # built at start()
             # Init experiment vials parked OFF; start_experiment will replace
             # these with the target temperatures derived from config parameters.
             self._setpoint_raw = {v: HEATER_OFF_SETPOINT for v in self._vials}
-            self._setpoint_stir = 0
+            self._stir_by_vial = {v: 0 for v in self._vials}
+            self._preconditioned_at = None
             self._temp_nan_streak = {v: 0 for v in self._vials}
             self._od_nan_streak = {v: 0 for v in self._vials}
             self._od_range_streak = {v: 0 for v in self._vials}
+            self._overtemp_streak = {}
             self._vial_faults = {v: None for v in self._vials}
             self._reset_growth_state_locked()
             self._created_at = _now_utc()
@@ -842,16 +1149,20 @@ class ExperimentEngine:
             self._stopped_at = None
             self._stop_reason = None
             # Reset media tracking; populated at start_experiment time below.
-            self._media_bottles = {}
-            self._vial_to_bottle = {}
-            self._bottle_consumed_ml = {}
-            self._bottle_alerted_low = {}
-            self._waste_config = None
-            self._waste_filled_ml = 0.0
-            self._waste_alerted_high = False
+            self._clear_media_mapping_locked()
+            # The vessels this experiment declares itself exist from create,
+            # so another experiment created before this one starts can
+            # already share them -- and they start empty/full HERE, never at
+            # start, so starting cannot wipe what a sharing experiment has
+            # already moved.
+            if normalized_media is not None:
+                self._register_owned_vessels_locked(name, normalized_media)
             self._save_state_locked()
 
-        self._broadcast_event({"type": "created", "name": name, "vials": self._vials})
+        created_event: dict = {"type": "created", "name": name, "vials": self._vials}
+        if grouped:
+            created_event["groups"] = [g.summary() for g in group_list]
+        self._broadcast_event(created_event)
         for warning in control_warnings:
             log.warning("experiment '%s': %s", name, warning)
             self._broadcast_alert(
@@ -863,6 +1174,117 @@ class ExperimentEngine:
         config = dict(config)
         config["warnings"] = control_warnings
         return config
+
+    def _fill_shared_vessel_refs(self, media: dict) -> dict:
+        """Complete bottles/waste that reference an existing vessel.
+
+        A shared reference (``{"id": "lb", "vessel": "run_a.bottle_a"}``)
+        need not repeat the vessel's size; it is taken from the registry, so
+        ``config.json`` stays self-describing and two runs sharing a vessel
+        cannot disagree about how big it is. An unknown vessel, or one of the
+        wrong kind, is a 400."""
+        if not isinstance(media, dict):
+            return media
+        out = dict(media)
+        bottles = []
+        for i, b in enumerate(media.get("bottles") or []):
+            if isinstance(b, dict) and b.get("vessel"):
+                rec = self._vessels.get(str(b["vessel"]))
+                if rec is None:
+                    raise ValueError(
+                        f"'media.bottles[{i}].vessel' {b['vessel']!r} is not a known vessel"
+                    )
+                if rec.get("kind") != KIND_MEDIA:
+                    raise ValueError(
+                        f"'media.bottles[{i}].vessel' {b['vessel']!r} is a "
+                        f"{rec.get('kind')} vessel, not a media bottle"
+                    )
+                b = dict(b)
+                for key in ("name", "contents", "initial_volume_ml", "low_volume_alert_ml"):
+                    if key in rec and b.get(key) in (None, ""):
+                        b[key] = rec[key]
+            bottles.append(b)
+        if "bottles" in media:
+            out["bottles"] = bottles
+        waste = media.get("waste")
+        if isinstance(waste, dict) and waste.get("vessel"):
+            rec = self._vessels.get(str(waste["vessel"]))
+            if rec is None:
+                raise ValueError(
+                    f"'media.waste.vessel' {waste['vessel']!r} is not a known vessel"
+                )
+            if rec.get("kind") != KIND_WASTE:
+                raise ValueError(
+                    f"'media.waste.vessel' {waste['vessel']!r} is a "
+                    f"{rec.get('kind')} vessel, not a waste carboy"
+                )
+            waste = dict(waste)
+            for key in ("name", "capacity_ml", "high_fill_alert_ml"):
+                if key in rec and waste.get(key) in (None, ""):
+                    waste[key] = rec[key]
+            out["waste"] = waste
+        return out
+
+    def _validate_groups_control(
+        self, group_list: list[run_config.Group], flow_rates: list[float],
+    ) -> list[str]:
+        """``validate_control_parameters`` once per group.
+
+        A warning every group produces identically (the run-wide efflux
+        overrun warning, say) is reported once, unprefixed; the rest carry the
+        group's name so the wizard's review step can say which arm it is
+        about. With one group nothing is prefixed, so a legacy single-mode
+        experiment reports exactly what it always did."""
+        per_group = [
+            (g, validate_control_parameters(
+                g.mode, dict(g.parameters), flow_rates, list(g.vials),
+                control_interval_seconds=self._cycle_interval_seconds,
+            ))
+            for g in group_list
+        ]
+        if len(per_group) == 1:
+            return list(per_group[0][1])
+        shared = set(per_group[0][1])
+        for _g, w in per_group[1:]:
+            shared &= set(w)
+        out: list[str] = []
+        for w in per_group[0][1]:
+            if w in shared and w not in out:
+                out.append(w)
+        for g, warnings in per_group:
+            for w in warnings:
+                if w not in shared:
+                    out.append(f"group '{g.name}': {w}")
+        return out
+
+    @staticmethod
+    def _check_morbidostat_bottles(
+        group_list: list[run_config.Group], media: dict,
+    ) -> None:
+        """A bottle feeding a morbidostat group may not feed another group.
+
+        Confirming an escalation physically swaps the drug bottle behind a
+        vial (``confirm_escalation``); if that bottle also fed a turbidostat
+        or chemostat arm, the swap would silently dose it too."""
+        owner = run_config.group_by_vial(group_list)
+        groups_per_bottle: dict[str, set[str]] = {}
+        morbido_bottles: set[str] = set()
+        for key, bottle in media["vial_to_bottle"].items():
+            g = owner.get(int(key))
+            if g is None:
+                continue
+            groups_per_bottle.setdefault(bottle, set()).add(g.name)
+            if g.mode == "morbidostat":
+                morbido_bottles.add(bottle)
+        for bottle in sorted(morbido_bottles):
+            names = groups_per_bottle[bottle]
+            if len(names) > 1:
+                raise ValueError(
+                    f"bottle {bottle!r} feeds a morbidostat group and also "
+                    f"groups {sorted(names)}; a morbidostat escalation swaps "
+                    "its drug bottle, which would dose the other groups too -- "
+                    "give the morbidostat group its own bottle"
+                )
 
     def start_experiment(self, name: Optional[str] = None) -> dict:
         """Build per-vial controllers, send initial actuator commands,
@@ -876,11 +1298,13 @@ class ExperimentEngine:
             params = self._config["parameters"]
             calibration = self._config.get("calibration", {})
 
-            mode = self._config.get("mode", "turbidostat")
-            self._controllers = self._build_controllers(
-                mode, params, calibration, self._vials
+            # Groups are re-derived from the persisted config rather than
+            # trusted from create: a blank commit or metadata edit may have
+            # reloaded self._config since.
+            self._set_groups_locked(
+                run_config.groups_from_config(self._config, supported_modes())
             )
-            self._setpoint_stir = int(params.get("stir_rate", 10))
+            self._controllers = self._build_group_controllers(calibration)
 
             # Initialise media tracking from the persisted config (if present).
             self._load_media_locked(self._config.get("media"))
@@ -893,14 +1317,16 @@ class ExperimentEngine:
             self._data_logger.activate_experiment(self._name, start=self._started_at)
 
             try:
-                self._apply_initial_actuators_locked(params)
+                self._apply_initial_actuators_locked()
             except Exception:
                 log.exception("failed to apply initial actuators; aborting start")
-                self._data_logger.deactivate_experiment()
+                self._data_logger.deactivate_experiment(self._name)
                 self._started_at = None
                 raise
 
             self._status = ExperimentStatus.RUNNING
+            # Preconditioning ends here: the run now owns these vials outright.
+            self._preconditioned_at = None
             self._save_state_locked()
             cfg = dict(self._config)
             efflux_extra = float(
@@ -932,6 +1358,52 @@ class ExperimentEngine:
         log.info("experiment '%s' started", cfg["name"])
         return cfg
 
+    def precondition_experiment(self, name: Optional[str] = None) -> dict:
+        """Hold a CREATED experiment's vials at run conditions -- each vial's
+        group heater target and stir PWM -- without starting control or
+        logging.
+
+        The per-run OD blank must be taken under the conditions the run will
+        use (CALIBRATION_PROTOCOL §5.4: stir at the run's PWM, temperature
+        equilibrated). With vial groups those conditions differ per vial, so
+        setting them by hand through the dense manual actuator API is
+        impractical; this applies them in one step.
+
+        While preconditioned, ``run_cycle`` runs the fast-lane safety subset
+        for these vials (heater overrun/critical handling and the stir
+        re-send), and the manual actuator endpoints refuse them
+        (``controls_actuators``). ``start_experiment`` takes over from here;
+        ``stop_experiment`` parks the vials. Idempotent: calling again
+        re-applies the targets."""
+        with self._lock:
+            self._assert_status(ExperimentStatus.CREATED)
+            if name is not None and name != self._name:
+                raise ValueError(
+                    f"requested precondition of '{name}' but '{self._name}' is loaded"
+                )
+            self._set_groups_locked(
+                run_config.groups_from_config(self._config, supported_modes())
+            )
+            self._apply_initial_actuators_locked()
+            self._preconditioned_at = _now_utc()
+            self._save_state_locked()
+            targets = run_config.temperature_c_by_vial(self._groups)
+            result = {
+                "name": self._name,
+                "vials": list(self._vials),
+                "temperature_c": {
+                    str(v): (None if self._vial_faults.get(v) else targets[v])
+                    for v in self._vials
+                },
+                "stir": {str(v): self._stir_by_vial.get(v, 0) for v in self._vials},
+                "preconditioned_at": self._preconditioned_at.isoformat(timespec="seconds"),
+            }
+        self._broadcast_event({
+            "type": "preconditioned", "name": result["name"], "vials": result["vials"],
+        })
+        log.info("experiment '%s' preconditioned (vials=%s)", result["name"], result["vials"])
+        return result
+
     def stop_experiment(self, reason: str = "manual") -> Optional[str]:
         """Zero pumps/heater/stir for experiment vials, deactivate the
         DataLogger, persist state, and transition to STOPPED.
@@ -944,13 +1416,21 @@ class ExperimentEngine:
                 # Already stopped — idempotent return.
                 return self._name
             if self._status == ExperimentStatus.CREATED:
-                # CREATED never sent actuator commands, so no zeroing needed.
+                # A plain CREATED experiment never sent actuator commands; a
+                # preconditioned one is holding its vials at run conditions
+                # and must park them, exactly as a RUNNING stop does.
                 name = self._name
+                if self._preconditioned_at is not None:
+                    self._zero_experiment_actuators_locked()
+                    self._preconditioned_at = None
                 self._stopped_at = _now_utc()
                 self._stop_reason = reason
                 self._status = ExperimentStatus.STOPPED
                 self._save_state_locked()
-                self._broadcast_event({"type": "stopped", "name": name, "reason": reason})
+                self._broadcast_event({
+                    "type": "stopped", "name": name, "reason": reason,
+                    "vials": list(self._vials),
+                })
                 log.info("experiment '%s' stopped from CREATED state (%s)", name, reason)
                 return name
 
@@ -961,7 +1441,7 @@ class ExperimentEngine:
             self._zero_experiment_actuators_locked()
             # Stop logging
             try:
-                self._data_logger.deactivate_experiment()
+                self._data_logger.deactivate_experiment(self._name)
             except Exception:
                 log.exception("data_logger.deactivate_experiment failed during stop")
 
@@ -976,7 +1456,10 @@ class ExperimentEngine:
             self._status = ExperimentStatus.STOPPED
             self._save_state_locked()
 
-        self._broadcast_event({"type": "stopped", "name": name, "reason": reason})
+        self._broadcast_event({
+            "type": "stopped", "name": name, "reason": reason,
+            "vials": list(self._vials),
+        })
         log.info("experiment '%s' stopped (%s)", name, reason)
         return name
 
@@ -1257,6 +1740,22 @@ class ExperimentEngine:
         )
         return queued
 
+    def defer_actions(self, entries: list[tuple[int, PumpAction, str]]) -> bool:
+        """Queue decided-but-unfired dilutions into this run's maintenance
+        queue (newest wins per vial), if it is in maintenance. Returns False
+        -- and queues nothing -- when it is not, so the caller fires them.
+
+        Used when a machine-wide hold (supervisor) releases while this run is
+        in its own maintenance: the held actions must wait for the run's own
+        resume rather than fire into the pause it asked for."""
+        with self._lock:
+            if not self._maintenance_active:
+                return False
+            for vial, action, ts_iso in entries:
+                if vial in self._vials:
+                    self._pending_pump_actions[vial] = (action, ts_iso)
+            return True
+
     def check_maintenance_timeout(
         self,
     ) -> Optional[list[tuple[int, PumpAction, str]]]:
@@ -1470,6 +1969,11 @@ class ExperimentEngine:
 
         with self._lock:
             if self._status != ExperimentStatus.RUNNING:
+                if (
+                    self._status == ExperimentStatus.CREATED
+                    and self._preconditioned_at is not None
+                ):
+                    self._conditioning_cycle_locked(temperature_calibrated)
                 return []
             for vial in list(self._vials):
                 if self._vial_faults.get(vial) is not None:
@@ -1690,10 +2194,11 @@ class ExperimentEngine:
                 log.exception("growth-rate update failed")
 
             # (5) re-send stir setpoints (drift protection)
-            try:
-                self._resend_stir_locked()
-            except Exception:
-                log.exception("resend stir failed")
+            if self.resend_stir_in_cycle:
+                try:
+                    self._resend_stir_locked()
+                except Exception:
+                    log.exception("resend stir failed")
 
             # (4c) Maintenance mode: keep the decision but don't execute.
             # Coalesce per-vial so a long maintenance window doesn't queue
@@ -1728,6 +2233,30 @@ class ExperimentEngine:
                     log.exception("state.json persist failed")
 
         return pump_actions_to_return
+
+    def _conditioning_cycle_locked(self, temperature_calibrated: list[float]) -> None:
+        """The fast-lane safety subset for a preconditioned CREATED
+        experiment: heater safety on every vial whose heater it drives, and
+        the stir re-send. No OD control, no pumps, no growth, and no CSV
+        rows -- the DataLogger is not active until start."""
+        for vial in list(self._vials):
+            if self._vial_faults.get(vial) is not None:
+                continue
+            temp_c = temperature_calibrated[vial]
+            if _is_nan(temp_c):
+                continue
+            self._handle_heater_safety_locked(vial, float(temp_c))
+        if self.resend_stir_in_cycle:
+            try:
+                self._resend_stir_locked()
+            except Exception:
+                log.exception("resend stir failed (preconditioning)")
+        if self._state_dirty:
+            try:
+                self._save_state_locked()
+                self._state_dirty = False
+            except Exception:
+                log.exception("state.json persist failed (preconditioning)")
 
     # ------------------------------------------------------------------
     # Inspection / data
@@ -1789,12 +2318,24 @@ class ExperimentEngine:
                 # non-exponential data is meaningless, and presenting it
                 # unqualified is worse than presenting nothing.
                 report = self._growth_reports.get(vial)
+                group = self._vial_group.get(vial)
+                setpoint_raw = self._setpoint_raw.get(vial, HEATER_OFF_SETPOINT)
                 per_vial[str(vial)] = {
+                    "group": group.name if group else None,
+                    "mode": group.mode if group else None,
+                    "stir": self._stir_by_vial.get(vial, 0),
+                    # The heater target in effect, after any overrun step-down;
+                    # None while parked off.
+                    "target_temp_c": (
+                        None if setpoint_raw >= HEATER_OFF_SETPOINT
+                        or self._temp_cal is None
+                        else round(self._raw_to_C(setpoint_raw, vial), 2)
+                    ),
                     "target": target,
                     "avg_od": avg,
                     "last_pump_age_s": (None if math.isinf(age) else age),
                     "fault": self._vial_faults.get(vial),
-                    "setpoint_raw": self._setpoint_raw.get(vial, HEATER_OFF_SETPOINT),
+                    "setpoint_raw": setpoint_raw,
                     "consumables_blocked": self._vial_consumables_blocked_locked(vial),
                     "nan_streak": nan_streak,
                     "od_range_streak": od_range_streak,
@@ -1822,19 +2363,35 @@ class ExperimentEngine:
                 "started": self._started_at.isoformat(timespec="seconds") if self._started_at else None,
                 "stopped": self._stopped_at.isoformat(timespec="seconds") if self._stopped_at else None,
                 "stop_reason": self._stop_reason,
+                "operator": (self._config or {}).get("operator", ""),
+                "expected_end": (self._config or {}).get("expected_end"),
                 "elapsed_hours": round(elapsed_h, 4),
                 "vials": self._vials,
+                "groups": [
+                    {**g.summary(), "parameters": dict(g.overrides)}
+                    for g in self._groups
+                ],
+                "grouped": run_config.is_grouped(self._groups),
+                "preconditioned": self._preconditioned_at is not None,
                 "per_vial": per_vial,
-                "setpoint_stir": self._setpoint_stir,
+                # Scalar when every vial stirs alike (always, pre-groups);
+                # None when groups differ -- read per_vial[v].stir then.
+                "setpoint_stir": self._uniform_stir_locked(),
                 "media": self._media_status_locked(),
                 "maintenance": self._maintenance_status_locked(),
                 "morbidostat": self._morbidostat_status_locked(),
             }
 
+    def _uniform_stir_locked(self) -> Optional[int]:
+        values = {self._stir_by_vial.get(v, 0) for v in self._vials}
+        if len(values) == 1:
+            return values.pop()
+        return 0 if not values else None
+
     def _morbidostat_status_locked(self) -> Optional[dict]:
         """Build the ``morbidostat`` block for ``status()``. Returns None
-        when the active experiment isn't morbidostat mode."""
-        if (self._config or {}).get("mode") != "morbidostat":
+        when no group of the active experiment is morbidostat mode."""
+        if not any(g.mode == "morbidostat" for g in self._groups):
             return None
         per_vial: dict[str, dict] = {}
         for vial in self._vials:
@@ -1893,6 +2450,14 @@ class ExperimentEngine:
                 "reserve_ml": round(_media_reserve_ml(initial), 3),
                 "blocked": self._bottle_blocked_locked(bid),
                 "estimate_quality": estimate_quality,
+                # Shared consumables: which vessel this bottle is, whether
+                # another experiment may draw on it too, and who used how much.
+                "vessel": self._bottle_vessel.get(bid),
+                "shared": bool(b.get("vessel")),
+                "attribution": dict(
+                    self._vessels.field(self._bottle_vessel.get(bid, ""), "attribution", {})
+                    or {}
+                ),
             })
         waste: Optional[dict] = None
         if self._waste_config is not None:
@@ -1911,6 +2476,12 @@ class ExperimentEngine:
                 "reserve_ml": round(_waste_reserve_ml(cap), 3),
                 "blocked": self._waste_blocked_locked(),
                 "estimate_quality": estimate_quality,
+                "vessel": self._waste_vessel,
+                "shared": bool(self._waste_config.get("vessel")),
+                "attribution": dict(
+                    self._vessels.field(self._waste_vessel or "", "attribution", {})
+                    or {}
+                ),
             }
         return {
             "bottles": bottles,
@@ -2316,9 +2887,11 @@ class ExperimentEngine:
         blank_present = bool(ctx.get("blank_present"))
         pump_calibrated = bool(ctx.get("pump_calibrated"))
         pump_reason = ctx.get("pump_reason_unavailable")
-        mode = (self._config or {}).get("mode", "turbidostat")
 
         for vial in vials:
+            # Per vial, not per run: a chemostat group's vials take the
+            # mass-balance regime while a turbidostat group's take segments.
+            mode = self._vial_mode_locked(vial)
             self._growth_due[vial] = now + growth.RECOMPUTE_INTERVAL_SECONDS
             c = self._controllers.get(vial)
             if c is None:
@@ -2413,10 +2986,13 @@ class ExperimentEngine:
                 (action.pump_time + action.efflux_extra_seconds)
                 * controller.flow_rate_influx_ml_s
             )
-            self._bottle_consumed_ml[bottle_id] = (
-                self._bottle_consumed_ml.get(bottle_id, 0.0) + influx_ml
+            self._vessels.add_level(
+                self._bottle_vessel[bottle_id], influx_ml, experiment=self._name,
             )
-            self._waste_filled_ml += efflux_ml
+            if self._waste_vessel is not None:
+                self._vessels.add_level(
+                    self._waste_vessel, efflux_ml, experiment=self._name,
+                )
 
             self._check_bottle_threshold_locked(bottle_id)
         self._check_waste_threshold_locked()
@@ -2452,12 +3028,15 @@ class ExperimentEngine:
             if bottle_id is None:
                 return
             if direction == "influx":
-                self._bottle_consumed_ml[bottle_id] = (
-                    self._bottle_consumed_ml.get(bottle_id, 0.0) + delivered_ml
+                self._vessels.add_level(
+                    self._bottle_vessel[bottle_id], delivered_ml,
+                    experiment=self._name,
                 )
                 self._check_bottle_threshold_locked(bottle_id)
-            else:
-                self._waste_filled_ml += delivered_ml
+            elif self._waste_vessel is not None:
+                self._vessels.add_level(
+                    self._waste_vessel, delivered_ml, experiment=self._name,
+                )
                 self._check_waste_threshold_locked()
             self._save_state_locked()
 
@@ -2579,9 +3158,16 @@ class ExperimentEngine:
                 raise ValueError(
                     f"experiment {name!r} is not the running experiment"
                 )
-            if (self._config or {}).get("mode") != "morbidostat":
+            if not any(g.mode == "morbidostat" for g in self._groups):
                 raise ValueError(
                     f"experiment {name!r} is not morbidostat mode"
+                )
+            if self._vial_mode_locked(vial) != "morbidostat":
+                group = self._vial_group.get(vial)
+                raise ValueError(
+                    f"vial {vial} is in group "
+                    f"{group.name if group else None!r} "
+                    f"({self._vial_mode_locked(vial)}), not a morbidostat group"
                 )
             controller = self._controllers.get(vial)
             if not isinstance(controller, MorbidostatController):
@@ -2603,6 +3189,9 @@ class ExperimentEngine:
                 bottle_id = self._vial_to_bottle.get(vial)
                 if bottle_id and bottle_id in self._media_bottles:
                     self._media_bottles[bottle_id]["contents"] = str(new_bottle_contents)
+                    vid = self._bottle_vessel.get(bottle_id)
+                    if vid is not None and self._vessels.exists(vid):
+                        self._vessels.set_field(vid, "contents", str(new_bottle_contents))
                     if isinstance(self._config, dict):
                         media = self._config.get("media")
                         if isinstance(media, dict):
@@ -2788,21 +3377,27 @@ class ExperimentEngine:
     def _restore_media_runtime_locked(
         self, media_config: Optional[dict], media_state: Optional[dict]
     ) -> None:
-        """Re-load the runtime media tracking from a persisted state.json
-        snapshot. Called from resume_on_startup."""
-        self._load_media_locked(media_config)
+        """Re-load the runtime media tracking on resume.
+
+        The vessel registry is authoritative for any vessel it still holds --
+        it is written on every debit, and a SHARED vessel's level includes
+        other runs' use, which this run's snapshot cannot know. Only a vessel
+        the registry lacks (a standalone engine's in-memory registry, or a
+        lost registry file) is seeded from this run's state.json snapshot."""
+        created = self._load_media_locked(media_config, starting=False)
         if not media_state or not self._media_bottles:
             return
         bottles_state = media_state.get("bottles") or {}
         for bid, b in bottles_state.items():
-            if bid in self._bottle_consumed_ml:
+            if self._bottle_vessel.get(bid) in created:
                 self._bottle_consumed_ml[bid] = float(b.get("consumed_ml", 0.0))
                 self._bottle_alerted_low[bid] = bool(b.get("alerted_low", False))
                 self._bottle_alerted_blocked[bid] = bool(b.get("alerted_blocked", False))
-        waste_state = media_state.get("waste") or {}
-        self._waste_filled_ml = float(waste_state.get("filled_ml", 0.0))
-        self._waste_alerted_high = bool(waste_state.get("alerted_high", False))
-        self._waste_alerted_blocked = bool(waste_state.get("alerted_blocked", False))
+        if self._waste_vessel in created:
+            waste_state = media_state.get("waste") or {}
+            self._waste_filled_ml = float(waste_state.get("filled_ml", 0.0))
+            self._waste_alerted_high = bool(waste_state.get("alerted_high", False))
+            self._waste_alerted_blocked = bool(waste_state.get("alerted_blocked", False))
 
     # ------------------------------------------------------------------
     # Safety / fault helpers (must hold self._lock)
@@ -2823,9 +3418,7 @@ class ExperimentEngine:
             # Debounce: the thermistor/RS485 bus is lossy and can spike
             # spuriously, so a SINGLE over-critical sample must not park the
             # heater. Require 3 consecutive over-critical reads before latching.
-            streak = getattr(self, "_overtemp_streak", None)
-            if streak is None:
-                streak = self._overtemp_streak = {}
+            streak = self._overtemp_streak
             streak[vial] = streak.get(vial, 0) + 1
             if streak[vial] >= 3:
                 self._latch_fault_locked(vial, "overtemp")
@@ -2836,8 +3429,7 @@ class ExperimentEngine:
                     vial, temp_c, self._heater_critical_C, streak[vial],
                 )
             return
-        if getattr(self, "_overtemp_streak", None) is not None:
-            self._overtemp_streak[vial] = 0
+        self._overtemp_streak[vial] = 0
         if temp_c > setpoint_c + self._heater_overrun_C:
             # Overrun: lower the target by DEFAULT_HEATER_STEP_DOWN_C (SPEC.md §10).
             new_target_c = max(22.0, setpoint_c - DEFAULT_HEATER_STEP_DOWN_C)
@@ -2866,9 +3458,8 @@ class ExperimentEngine:
             self._apply_temperature_locked()
         except Exception:
             log.exception("latch_fault: heater park-off failed for vial %d", vial)
-        # Stir is a 16-vial command; the experiment's _setpoint_stir is
-        # shared, so we don't zero stir on a single-vial fault. The
-        # vial's heater being parked off is the primary safety action.
+        # The heater being parked off is the primary safety action. Stir for
+        # a faulted vial drops to 0 on the next _resend_stir_locked.
         level = "critical" if kind == "overtemp" else "warning"
         self._broadcast_alert(
             level=level,
@@ -2881,20 +3472,19 @@ class ExperimentEngine:
     # Actuator helpers (must hold self._lock)
     # ------------------------------------------------------------------
 
-    def _apply_initial_actuators_locked(self, parameters: dict) -> None:
-        """At start: convert ``temperature_c`` to per-vial raw setpoints,
-        send ``set_temperature_raw`` and ``set_stir``. Preserves non-experiment
-        vials' existing setpoints (which default to HEATER_OFF_SETPOINT)."""
-        target_temps = _as_list_of_16(
-            parameters.get("temperature_c"),
-            default=parameters.get("temperature", 37.0) if isinstance(parameters.get("temperature"), (int, float)) else 37.0,
-            name="temperature_c",
-        )
+    def _apply_initial_actuators_locked(self) -> None:
+        """At start (and at precondition): convert each vial's group
+        ``temperature_c`` to a raw setpoint and its group ``stir_rate`` to a
+        stir PWM, then send ``set_temperature_raw`` and ``set_stir``.
+        Preserves non-experiment vials' existing setpoints (which default to
+        HEATER_OFF_SETPOINT)."""
+        target_temps = run_config.temperature_c_by_vial(self._groups)
         if self._temp_cal is None:
             raise RuntimeError(
                 "temp_cal is None — engine cannot convert °C to raw setpoint. "
                 "Load calibration first."
             )
+        self._stir_by_vial = run_config.stir_by_vial(self._groups)
         # Build the full 16-vial raw-setpoint list, splicing in experiment vials
         # only. Vials outside the experiment keep whatever the manager last sent
         # (defaults to HEATER_OFF_SETPOINT on fresh init).
@@ -2906,7 +3496,13 @@ class ExperimentEngine:
         )
         raw_list = [int(v) for v in current_raw.tolist()]
         for vial in self._vials:
-            target_raw = self._C_to_raw(target_temps[vial], vial)
+            if self._vial_faults.get(vial) is not None:
+                # A fault latched while preconditioning stays parked: start
+                # must not re-heat a sleeve the safety path turned off.
+                target_raw = HEATER_OFF_SETPOINT
+                self._stir_by_vial[vial] = 0
+            else:
+                target_raw = self._C_to_raw(target_temps[vial], vial)
             self._setpoint_raw[vial] = target_raw
             raw_list[vial] = target_raw
         self._manager.set_temperature_raw(raw_list)
@@ -2917,7 +3513,7 @@ class ExperimentEngine:
         )
         stir_list = [int(v) for v in current_stir.tolist()]
         for vial in self._vials:
-            stir_list[vial] = self._setpoint_stir
+            stir_list[vial] = self._stir_by_vial.get(vial, 0)
         self._manager.set_stir(stir_list)
 
     def _apply_temperature_locked(self) -> None:
@@ -2934,6 +3530,23 @@ class ExperimentEngine:
             raw_list[vial] = int(raw)
         self._manager.set_temperature_raw(raw_list)
 
+    def stir_targets(self) -> dict[int, int]:
+        """``{vial: stir PWM}`` for the vials this run is driving right now
+        (RUNNING, or CREATED and preconditioned) -- what ``_resend_stir_locked``
+        would write for them. Faulted vials stir at 0."""
+        with self._lock:
+            driving = self._status == ExperimentStatus.RUNNING or (
+                self._status == ExperimentStatus.CREATED
+                and self._preconditioned_at is not None
+            )
+            if not driving:
+                return {}
+            return {
+                v: (0 if self._vial_faults.get(v) is not None
+                    else self._stir_by_vial.get(v, 0))
+                for v in self._vials
+            }
+
     def _resend_stir_locked(self) -> None:
         """Re-send stir setpoints for experiment vials (SPEC §9 step 6).
         Preserves non-experiment vials' values."""
@@ -2943,7 +3556,10 @@ class ExperimentEngine:
         stir_list = [int(v) for v in current_stir.tolist()]
         for vial in self._vials:
             # Faulted vials don't get stirred either.
-            stir_list[vial] = 0 if self._vial_faults.get(vial) is not None else self._setpoint_stir
+            stir_list[vial] = (
+                0 if self._vial_faults.get(vial) is not None
+                else self._stir_by_vial.get(vial, 0)
+            )
         self._manager.set_stir(stir_list)
 
     def _zero_experiment_actuators_locked(self) -> None:
@@ -2972,11 +3588,11 @@ class ExperimentEngine:
         # Park experiment-vial heaters off (HEATER_OFF_SETPOINT, NOT zero —
         # the convention is inverted; zero would max the heaters). Stir is
         # genuinely raw-PWM-0-is-off, so it really does get zeroed.
-        # _setpoint_stir is zeroed BEFORE _resend_stir_locked since the
+        # _stir_by_vial is zeroed BEFORE _resend_stir_locked since the
         # resend reads it.
         for vial in self._vials:
             self._setpoint_raw[vial] = HEATER_OFF_SETPOINT
-        self._setpoint_stir = 0
+            self._stir_by_vial[vial] = 0
         try:
             self._apply_temperature_locked()
         except Exception:
@@ -3018,20 +3634,28 @@ class ExperimentEngine:
     # Controllers
     # ------------------------------------------------------------------
 
-    def _build_controllers(
-        self,
-        mode: str,
-        parameters: dict,
-        calibration: dict,
-        vials: list[int],
+    def _build_group_controllers(
+        self, calibration: dict,
     ) -> dict[int, ControllerType]:
-        if mode == "turbidostat":
-            return self._build_turbidostat_controllers(parameters, calibration, vials)
-        if mode == "chemostat":
-            return self._build_chemostat_controllers(parameters, calibration, vials)
-        if mode == "morbidostat":
-            return self._build_morbidostat_controllers(parameters, calibration, vials)
-        raise ValueError(f"no controller builder for mode {mode!r}")
+        """One controller per vial, each built from its own group's mode and
+        merged parameters. The builders are vial-scoped already, so a group is
+        just a call with that group's vials."""
+        controllers: dict[int, ControllerType] = {}
+        for g in self._groups:
+            spec = CONTROL_MODES.get(g.mode)
+            if spec is None:
+                raise ValueError(
+                    f"group {g.name!r}: no controller builder for mode {g.mode!r}"
+                )
+            built = spec.build(self, g, calibration)
+            missing = sorted(set(g.vials) - set(built))
+            if missing:
+                raise ValueError(
+                    f"group {g.name!r}: mode {g.mode!r} built no controller "
+                    f"for vials {missing}"
+                )
+            controllers.update({v: built[v] for v in g.vials})
+        return controllers
 
     def _resolve_flow_rates(self, parameters: dict, calibration: dict) -> list[float]:
         """Flow rates in canonical flat-32 form (0..15 influx, 16..31 efflux):
@@ -3236,6 +3860,7 @@ class ExperimentEngine:
         exp_dir = self._experiments_root / self._name
         if not exp_dir.is_dir():
             return
+        uniform_stir = self._uniform_stir_locked()
         payload: dict[str, Any] = {
             "name": self._name,
             "status": self._status,
@@ -3248,8 +3873,15 @@ class ExperimentEngine:
             "started": self._started_at.isoformat(timespec="seconds") if self._started_at else None,
             "stopped": self._stopped_at.isoformat(timespec="seconds") if self._stopped_at else None,
             "stop_reason": self._stop_reason,
+            "groups": (self._config or {}).get("groups"),
+            "operator": (self._config or {}).get("operator", ""),
+            "expected_end": (self._config or {}).get("expected_end"),
             "setpoint_raw": dict(self._setpoint_raw),
-            "setpoint_stir": self._setpoint_stir,
+            "stir_by_vial": {str(k): v for k, v in self._stir_by_vial.items()},
+            "preconditioned_at": (
+                self._preconditioned_at.isoformat(timespec="seconds")
+                if self._preconditioned_at else None
+            ),
             "controllers": {
                 str(v): c.to_state() for v, c in self._controllers.items()
             },
@@ -3268,6 +3900,9 @@ class ExperimentEngine:
             },
             "last_persisted": _iso_now(),
         }
+        if uniform_stir is not None:
+            # Pre-groups readers (and a downgrade) resume stir from this key.
+            payload["setpoint_stir"] = uniform_stir
         state_path = exp_dir / "state.json"
         tmp_path = exp_dir / "state.json.tmp"
         with tmp_path.open("w", encoding="utf-8") as f:
@@ -3332,7 +3967,14 @@ class ExperimentEngine:
                 json.dumps(other_state, indent=4), encoding="utf-8"
             )
 
-        # Resume the winner
+        return self.resume_from_state(winner, state)
+
+    def resume_from_state(self, winner: str, state: dict) -> str:
+        """Resume the RUNNING experiment ``winner`` from its ``state.json``
+        contents: rebuild controllers, restore books, re-activate logging and
+        re-send actuators. ``resume_on_startup`` calls this for the single
+        experiment it picks; the supervisor calls it once per RUNNING
+        experiment, on a fresh engine each."""
         with self._lock:
             self._status = ExperimentStatus.RUNNING
             self._name = winner
@@ -3345,9 +3987,27 @@ class ExperimentEngine:
                 "media": state.get("media"),
                 "notes": state.get("notes", ""),
                 "created": state.get("created"),
+                "operator": state.get("operator", ""),
+                "expected_end": state.get("expected_end"),
             }
+            if state.get("groups"):
+                self._config["groups"] = state["groups"]
             self._vials = sorted(int(v) for v in state.get("vials", []))
-            self._setpoint_stir = int(state.get("setpoint_stir", 0))
+            self._set_groups_locked(
+                run_config.groups_from_config(self._config, supported_modes())
+            )
+            # Back-compat: state.json written before groups carries one
+            # scalar `setpoint_stir` for every vial.
+            saved_stir = state.get("stir_by_vial")
+            if saved_stir:
+                self._stir_by_vial = {int(k): int(v) for k, v in saved_stir.items()}
+            else:
+                legacy_stir = int(state.get("setpoint_stir", 0))
+                self._stir_by_vial = {v: legacy_stir for v in self._vials}
+            for vial in self._vials:
+                self._stir_by_vial.setdefault(vial, 0)
+            self._preconditioned_at = None
+            self._overtemp_streak = {}
             self._setpoint_raw = {
                 int(k): int(v) for k, v in (state.get("setpoint_raw") or {}).items()
             }
@@ -3396,12 +4056,9 @@ class ExperimentEngine:
                     _now_utc() - self._started_at
                 ).total_seconds()
 
-            # Rebuild controllers and restore their state
-            self._controllers = self._build_controllers(
-                self._config.get("mode", "turbidostat"),
-                self._config["parameters"],
+            # Rebuild controllers (per group) and restore their state
+            self._controllers = self._build_group_controllers(
                 self._config["calibration"],
-                self._vials,
             )
             saved_controllers = state.get("controllers") or {}
             # `now` lets each controller re-baseline a timestamp that was
@@ -3470,9 +4127,14 @@ class ExperimentEngine:
         self._vials = []
         self._controllers = {}
         self._setpoint_raw = {}
-        self._setpoint_stir = 0
-        self._nan_streak = {}
+        self._groups = []
+        self._vial_group = {}
+        self._stir_by_vial = {}
+        self._preconditioned_at = None
+        self._temp_nan_streak = {}
+        self._od_nan_streak = {}
         self._od_range_streak = {}
+        self._overtemp_streak = {}
         self._vial_faults = {}
         self._od_history = {}
         self._dilution_events = {}
@@ -3485,45 +4147,90 @@ class ExperimentEngine:
         self._started_at = None
         self._stopped_at = None
         self._stop_reason = None
-        self._media_bottles = {}
-        self._vial_to_bottle = {}
-        self._bottle_consumed_ml = {}
-        self._bottle_alerted_low = {}
-        self._bottle_alerted_blocked = {}
-        self._waste_config = None
-        self._waste_filled_ml = 0.0
-        self._waste_alerted_high = False
-        self._waste_alerted_blocked = False
+        self._clear_media_mapping_locked()
         self._maintenance_active = False
         self._maintenance_entered_at = None
         self._maintenance_reason = None
         self._pending_pump_actions = {}
 
-    def _load_media_locked(self, media_config: Optional[dict]) -> None:
-        """Initialise media tracking state from `config.media`. Called at
-        start_experiment and resume_on_startup. No-op when media is absent."""
+    def _register_owned_vessels_locked(self, name: str, media: dict) -> None:
+        for b in media["bottles"]:
+            if not b.get("vessel"):
+                self._vessels.register(
+                    vessel_lib.owned_vessel_id(name, b["id"]), KIND_MEDIA, b, reset=True,
+                )
+        waste = media["waste"]
+        if not waste.get("vessel"):
+            self._vessels.register(
+                vessel_lib.owned_vessel_id(name, "waste"), KIND_WASTE, waste, reset=True,
+            )
+
+    def _clear_media_mapping_locked(self) -> None:
+        """Forget this run's bottle/vessel mapping. The vessels themselves --
+        and their levels -- stay in the registry."""
+        self._media_bottles = {}
+        self._vial_to_bottle = {}
+        self._bottle_vessel = {}
+        self._waste_vessel = None
+        self._waste_config = None
+
+    def _load_media_locked(
+        self, media_config: Optional[dict], *, starting: bool = True,
+    ) -> set[str]:
+        """Map `config.media` onto vessels in the registry. Called at
+        start_experiment (``starting=True``) and resume (``starting=False``).
+        No-op when media is absent. Returns the vessel ids that did not exist
+        before this call, so a resume can seed them from its state.json
+        snapshot. Never resets a level: an owned vessel was reset at create.
+
+        A bottle or carboy this run declares itself is its own vessel
+        (``vessels.owned_vessel_id``). One that names an existing vessel
+        (``vessel`` key) shares it: the level carries over and every run that
+        uses it debits it (SPEC §15, shared consumables). Static numbers --
+        initial volume, capacity, alert thresholds -- come from the vessel,
+        so two runs sharing one never disagree about how big it is."""
+        self._clear_media_mapping_locked()
         if not media_config:
-            self._media_bottles = {}
-            self._vial_to_bottle = {}
-            self._bottle_consumed_ml = {}
-            self._bottle_alerted_low = {}
-            self._bottle_alerted_blocked = {}
-            self._waste_config = None
-            self._waste_filled_ml = 0.0
-            self._waste_alerted_high = False
-            self._waste_alerted_blocked = False
-            return
-        self._media_bottles = {b["id"]: dict(b) for b in media_config["bottles"]}
+            return set()
+        ids = vessel_lib.resolved_vessel_ids(self._name or "", media_config)
+        created: set[str] = set()
         self._vial_to_bottle = {
             int(k): v for k, v in media_config["vial_to_bottle"].items()
         }
-        self._bottle_consumed_ml = {bid: 0.0 for bid in self._media_bottles}
-        self._bottle_alerted_low = {bid: False for bid in self._media_bottles}
-        self._bottle_alerted_blocked = {bid: False for bid in self._media_bottles}
-        self._waste_config = dict(media_config["waste"])
-        self._waste_filled_ml = 0.0
-        self._waste_alerted_high = False
-        self._waste_alerted_blocked = False
+        for b in media_config["bottles"]:
+            bid = b["id"]
+            vid = ids[bid]
+            shared = bool(b.get("vessel"))
+            existed = self._vessels.exists(vid)
+            if shared and not existed and starting:
+                raise ValueError(
+                    f"bottle {bid!r} uses vessel {vid!r}, which no longer exists"
+                )
+            rec = self._vessels.register(vid, KIND_MEDIA, b, reset=False)
+            if not existed:
+                created.add(vid)
+            self._bottle_vessel[bid] = vid
+            static = dict(b)
+            for key in ("name", "contents", "initial_volume_ml", "low_volume_alert_ml"):
+                if key in rec:
+                    static[key] = rec[key]
+            self._media_bottles[bid] = static
+        waste = media_config["waste"]
+        vid = ids["waste"]
+        shared = bool(waste.get("vessel"))
+        existed = self._vessels.exists(vid)
+        if shared and not existed and starting:
+            raise ValueError(f"waste uses vessel {vid!r}, which no longer exists")
+        rec = self._vessels.register(vid, KIND_WASTE, waste, reset=False)
+        if not existed:
+            created.add(vid)
+        self._waste_vessel = vid
+        static = dict(waste)
+        for key in ("name", "capacity_ml", "high_fill_alert_ml"):
+            if key in rec:
+                static[key] = rec[key]
+        self._waste_config = static
+        return created
 
     def _assert_status(self, *allowed: str) -> None:
         if self._status not in allowed:
@@ -3538,6 +4245,10 @@ class ExperimentEngine:
         try:
             payload = dict(payload)
             payload.setdefault("timestamp", _iso_now())
+            # With parallel experiments every event must say whose it is:
+            # the event log routes it to that run's events.csv.
+            if self._name is not None:
+                payload.setdefault("experiment", self._name)
             self._on_event(payload)
         except Exception:
             log.exception("on_event callback failed")
@@ -3573,11 +4284,54 @@ class ExperimentEngine:
             }
             if vial is not None:
                 payload["vial"] = vial
-            if dedup_key is not None:
+            if self._name is not None:
+                # Whose alert this is: routes it to this run's events.csv, and
+                # keeps two experiments' identical alerts (the same dedup key,
+                # or the same text) from collapsing into one drawer row -- the
+                # rate limiter would otherwise swallow the second run's.
+                payload["experiment"] = self._name
+                payload["data"] = {"experiment": self._name}
+                payload["dedup_key"] = (
+                    self._name,
+                    dedup_key if dedup_key is not None else (category, level, message),
+                )
+            elif dedup_key is not None:
                 payload["dedup_key"] = dedup_key
             self._on_alert(payload)
         except Exception:
             log.exception("on_alert callback failed")
+
+
+# ---------------------------------------------------------------------------
+# Built-in control modes. A new mode registers here (or from its own module)
+# and is immediately usable as an experiment mode or a group mode.
+# ---------------------------------------------------------------------------
+
+register_control_mode(ControlModeSpec(
+    name="turbidostat",
+    validate=_validate_turbidostat_parameters,
+    build=lambda engine, group, calibration: engine._build_turbidostat_controllers(
+        dict(group.parameters), calibration, list(group.vials),
+    ),
+))
+register_control_mode(ControlModeSpec(
+    name="chemostat",
+    validate=_validate_chemostat_parameters,
+    build=lambda engine, group, calibration: engine._build_chemostat_controllers(
+        dict(group.parameters), calibration, list(group.vials),
+    ),
+))
+register_control_mode(ControlModeSpec(
+    name="morbidostat",
+    validate=_validate_morbidostat_parameters,
+    build=lambda engine, group, calibration: engine._build_morbidostat_controllers(
+        dict(group.parameters), calibration, list(group.vials),
+    ),
+))
+
+# The built-in set, for importers that want a constant. Code that must honour
+# modes registered later reads CONTROL_MODES / supported_modes() instead.
+SUPPORTED_MODES: frozenset[str] = supported_modes()
 
 
 def _parse_iso(s: Optional[str]) -> Optional[datetime]:

@@ -41,6 +41,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Iterator, Optional
 
+import run_config
+
 N_VIALS = 16
 
 # Parameters this module knows how to export and the calibrated value column in
@@ -711,6 +713,33 @@ def events_csv(exp_dir: Path, hours: Optional[float] = None) -> Optional[str]:
     return out.getvalue()
 
 
+def vial_groups_csv(exp_dir: Path, vials: Iterable[int]) -> Optional[str]:
+    """``vial,group,mode`` for the requested vials of a grouped experiment.
+
+    A NEW file, never a new column: the per-vial CSVs carry no schema marker,
+    so positional parsers break silently on an inserted column (CLAUDE.md
+    fact 6). ``None`` for an experiment without explicit groups, so a
+    single-mode export bundle is unchanged."""
+    config_path = exp_dir / "config.json"
+    if not config_path.is_file():
+        return None
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        groups = run_config.groups_from_config(config)
+    except Exception:
+        return None
+    if not run_config.is_grouped(groups):
+        return None
+    wanted = set(int(v) for v in vials)
+    by_vial = run_config.group_by_vial(groups)
+    lines = ["vial,group,mode"]
+    for v in sorted(by_vial):
+        if v in wanted:
+            g = by_vial[v]
+            lines.append(f"{v},{g.name},{g.mode}")
+    return "\n".join(lines) + "\n"
+
+
 def build_bundle(
     exp_dir: Path,
     *,
@@ -760,6 +789,7 @@ def build_bundle(
     # derived per-experiment record, not one of the three raw per-vial
     # streams the plots let you toggle.
     growth_text = growth_csv(exp_dir, vials, hours)
+    groups_text = vial_groups_csv(exp_dir, vials)
 
     file_rows: dict[str, int] = {}
 
@@ -787,6 +817,8 @@ def build_bundle(
             zf.writestr("events.csv", events_text)
         if growth_text is not None:
             zf.writestr(f"{name}_growth.csv", growth_text)
+        if groups_text is not None:
+            zf.writestr("vial_groups.csv", groups_text)
 
         manifest = {
             "experiment": name,
@@ -804,6 +836,10 @@ def build_bundle(
         if growth_text is not None:
             manifest["files"][f"{name}_growth.csv"] = {
                 "data_rows": _row_count(growth_text)
+            }
+        if groups_text is not None:
+            manifest["files"]["vial_groups.csv"] = {
+                "data_rows": _row_count(groups_text)
             }
         zf.writestr("export_manifest.json", json.dumps(manifest, indent=2))
     return f"{name}_export.zip", buf.getvalue()

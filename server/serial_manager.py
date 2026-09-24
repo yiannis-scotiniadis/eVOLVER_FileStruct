@@ -83,6 +83,18 @@ OD_AGG_CHOICES = ("median", "mean", "trimmed_mean")
 STOP_ALL_PUMPS_BODY = "t," + ("1" * 32) + "," + ("0," * 16)
 
 
+def led_power_vector(led_power) -> "np.ndarray":
+    """One LED power for all sixteen vials, or a per-vial list of 16, as the
+    clipped integer vector a ``we`` frame carries."""
+    if isinstance(led_power, (list, tuple, np.ndarray)):
+        arr = np.asarray(led_power, dtype=float)
+        if arr.shape != (N_VIALS,):
+            raise ValueError(f"led_power list must have {N_VIALS} entries, got {arr.shape}")
+    else:
+        arr = np.full(N_VIALS, float(led_power))
+    return np.clip(np.rint(arr), 0, OD_LED_MAX).astype(int)
+
+
 @dataclass(frozen=True)
 class ODReading:
     """Structured result of one enhanced OD acquisition cycle.
@@ -206,12 +218,27 @@ class SerialManager:
                 od_cal[2, v] = float(c_run)
             self.od_cal = od_cal
 
-    def clear_od_blank(self) -> None:
-        """Restore the pristine (pre-blank) OD calibration. No-op when no
-        calibration is loaded or no blank was ever applied."""
+    def clear_od_blank(self, vials=None) -> None:
+        """Restore the pristine (pre-blank) OD calibration -- for every vial,
+        or only ``vials``. No-op when no calibration is loaded or no blank
+        was ever applied.
+
+        Per-vial because a per-run blank belongs to one run: with parallel
+        experiments, stopping one must restore ITS vials' row 2 and leave the
+        other run's re-anchor alone, or that run's OD silently reverts to the
+        offset curve mid-experiment."""
         with self._lock:
-            if self._od_cal_base is not None:
+            if self._od_cal_base is None:
+                return
+            if vials is None:
                 self.od_cal = self._od_cal_base.copy()
+                return
+            od_cal = self.od_cal.copy()
+            for vial in vials:
+                v = int(vial)
+                if 0 <= v < N_VIALS:
+                    od_cal[2, v] = self._od_cal_base[2, v]
+            self.od_cal = od_cal
 
     @staticmethod
     def _read_cal_dark_subtracted(od_cal_path: str) -> bool:
@@ -374,12 +401,16 @@ class SerialManager:
         ``n_samples`` raw OD reads at ``led_power`` (0 = dark read), reduced
         to per-vial NaN-aware statistics. No calibration is applied.
 
+        ``led_power`` may be one power for all sixteen LEDs or a 16-list:
+        with parallel experiments a blank's dark read must darken only its
+        own run's vials, never another run's mid-experiment.
+
         Returns ``{"median": [...16], "sd": [...16], "n_valid": [...16]}``;
         a vial with zero surviving samples reports NaN median/sd."""
-        led = int(np.clip(led_power, 0, OD_LED_MAX))
+        leds = led_power_vector(led_power)
         n = max(1, int(n_samples))
         with self._lock:
-            body = self._format_csv(np.full(N_VIALS, led))
+            body = self._format_csv(leds)
             samples = self._collect_od_reads(body, n)
         median: list[float] = []
         sd: list[float] = []

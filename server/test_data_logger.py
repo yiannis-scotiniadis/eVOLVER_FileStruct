@@ -194,9 +194,10 @@ def test_elapsed_hours_is_monotonic() -> None:
         dl = DataLogger(root)
         dl.start_experiment(name="exp1", mode="manual", vials=[0])
         # Cheat: rewrite the start time to 1 hour ago to verify elapsed_hours.
-        dl._active_start = datetime.now(timezone.utc).replace(microsecond=0)
-        dl._active_start = dl._active_start.fromtimestamp(
-            dl._active_start.timestamp() - 3600, tz=timezone.utc
+        # (Each active experiment keeps its own start since parallel runs.)
+        start = datetime.now(timezone.utc).replace(microsecond=0)
+        dl._active["exp1"].start = start.fromtimestamp(
+            start.timestamp() - 3600, tz=timezone.utc
         )
         temp_cal, temp_raw, od_cal, od_raw = _make_arrays()
         ts = _now_iso()
@@ -261,21 +262,48 @@ def test_od_diagnostics_columns() -> None:
     print("PASS  OD diagnostics columns (n_valid, flag, dark) written and blank-safe")
 
 
-def test_cannot_start_two_experiments() -> None:
+def test_two_experiments_may_log_at_once_but_never_share_a_vial() -> None:
+    """Parallel experiments (PARALLEL_EXPERIMENTS.md T6). Before them this
+    asserted that a second activation always raised; now two experiments over
+    disjoint vials log side by side, and only a shared vial is refused."""
     with TmpRoot() as root:
         dl = DataLogger(root)
         dl.start_experiment(name="exp1", mode="manual", vials=[0])
         raised = False
         try:
-            dl.start_experiment(name="exp2", mode="manual", vials=[1])
+            dl.start_experiment(name="exp2", mode="manual", vials=[0, 1])
         except RuntimeError:
             raised = True
-        assert raised, "second start_experiment should have raised"
-        dl.stop_experiment()
-        # Now it should succeed.
-        dl.start_experiment(name="exp2", mode="manual", vials=[1])
-        dl.stop_experiment()
-    print("PASS  cannot start two experiments concurrently")
+        assert raised, "an experiment sharing vial 0 should have been refused"
+        assert not (root / "exp2").exists(), "refused start left a directory"
+        dl.start_experiment(name="exp3", mode="manual", vials=[1])
+        assert [e["name"] for e in dl.active_experiments()] == ["exp1", "exp3"]
+
+        ts = "2026-05-14T10:00:00+00:00"
+        dl.log_sensor_cycle(ts, [30.0] * 16, [500] * 16)
+        assert (root / "exp1" / "vial00_temp.csv").read_text().count("\n") == 2
+        assert (root / "exp3" / "vial01_temp.csv").read_text().count("\n") == 2
+        # A pump row goes to the vial's owner only.
+        dl.log_pump_event(ts, vial=1, direction="influx", duration_seconds=2.0)
+        assert (root / "exp3" / "vial01_pump_log.csv").read_text().count("\n") == 2
+        # Events: named experiment -> that run; machine-wide -> every run.
+        dl.log_event(ts, "info", "lifecycle", "exp3 only", experiment="exp3")
+        dl.log_event(ts, "critical", "serial", "bus down")
+        ev1 = (root / "exp1" / "events.csv").read_text()
+        ev3 = (root / "exp3" / "events.csv").read_text()
+        assert "exp3 only" not in ev1 and "exp3 only" in ev3
+        assert "bus down" in ev1 and "bus down" in ev3
+
+        try:
+            dl.stop_experiment()
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("an unnamed stop with two active must be refused")
+        dl.stop_experiment("exp1")
+        dl.stop_experiment()          # the only one left
+        assert not dl.is_running
+    print("PASS  two experiments log side by side; a shared vial is refused")
 
 
 def test_duplicate_directory_rejected() -> None:

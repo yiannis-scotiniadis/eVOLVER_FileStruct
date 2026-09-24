@@ -76,10 +76,15 @@ class FakeManager:
         self.blank_counts = blank
         self.pump_calls: list[tuple[int, str, float]] = []
 
-    def collect_od_raw(self, led_power: int, n_samples: int = 5) -> dict:
-        val = self.dark_counts if led_power == 0 else self.blank_counts
+    def collect_od_raw(self, led_power, n_samples: int = 5) -> dict:
+        # One power for every LED, or a per-vial list (a blank's dark read
+        # darkens only its own run's vials -- parallel experiments).
+        leds = (list(led_power) if isinstance(led_power, (list, tuple))
+                else [led_power] * N_VIALS)
+        self.last_leds = leds
         return {
-            "median": [val] * N_VIALS,
+            "median": [self.dark_counts if p == 0 else self.blank_counts
+                       for p in leds],
             "sd": [10.0] * N_VIALS,
             "n_valid": [n_samples] * N_VIALS,
         }

@@ -406,6 +406,8 @@ processes, owns `/dev/ttyAMA0` directly, and serves the dashboard at
 | 32 independent flow rates in the engine (influx ≠ efflux) | Built | `experiment_engine._as_flow_rates_32`, `control_modes/*` |
 | Post-run mass reconciliation + staleness surfacing + dashboard banner | Built | `/api/experiments/{name}/reconcile`, `/api/calibration/staleness` |
 | Per-vial growth-rate service (μ, doubling time, R², gated dilution diagnostic) | Built | `server/growth_rate.py`, `/api/growth_rate`, `vialNN_growth.csv` |
+| Vial groups within one experiment (per-group mode/params/temp/stir, one lifecycle), preconditioning for the blank, `CONTROL_MODES` registry | Built | `server/run_config.py`, `experiment_engine.py`, SPEC §9.1 |
+| Parallel experiments (independent experiments, vial ownership, shared bottles/carboys, machine hold, N-way resume) | Built | `server/supervisor.py`, `server/vessels.py`, SPEC §9.2 |
 
 **Session N shipped 2026-08-23** — the per-vial growth-rate service: the estimator, the
 engine-owned OD history and dilution boundaries, `status()` / WebSocket / API / CSV
@@ -422,7 +424,7 @@ the Tier 3 calibration wizards (thermistor
 two-point, OD dilution series, stir RPM — `/api/calibration/temperature/*`, `od/series/*`
 and `stir/*` do not exist; Session AA), hygiene/sterilisation records, experiment
 templates, supervised per-vial override, anomaly detection, notifications, off-box
-backup, vial groups, multi-phase protocols, and authentication.
+backup, multi-phase protocols, and authentication.
 
 ### Where to look for what
 
@@ -453,7 +455,7 @@ backup, vial groups, multi-phase protocols, and authentication.
   and how to verify `/dev/ttyAMA0` is the PL011, restoring the state git does not carry,
   Tailscale identity, and which parts of `DEPLOY.md` Phase 4 a rebuild may skip.
 
-### Nine facts worth carrying into any new work
+### Ten facts worth carrying into any new work
 
 1. **`xr` is a closed-loop setpoint, not a PWM, and the slope is negative.** The Arduino
    already closes the temperature loop. `xr=0` requests ~82 °C. See the Testing warning
@@ -584,6 +586,27 @@ backup, vial groups, multi-phase protocols, and authentication.
    commands" and a candidate cause of this rig's NaN storms. Any threaded fluidics executor
    must hold the `SerialManager` lock across the whole transaction, not just the write.
 
+10. **Several experiments can run at once, multiplexed on one tick.** `app.py`'s
+    `state.engine` is an `ExperimentSupervisor` (`server/supervisor.py`) holding one
+    `ExperimentEngine` per loaded experiment, all on ONE shared lock and ONE sensor thread.
+    Carry these invariants into any new work:
+
+    - **A vial has at most one owner** (create → stop). Anything vial-addressed — manual
+      control, pump booking, flow rates, growth — routes to the owner. A call that names
+      no experiment means the only one loaded and raises `AmbiguousExperimentError`
+      (409 `ambiguous_experiment`) when several are.
+    - **Every dilution of a tick goes out as one pump schedule**, whichever experiments
+      decided it; stir is written once per tick for all of them. Never give an engine its
+      own write path to the bus per tick.
+    - **Bottle and carboy levels are vessels (`server/vessels.py`), not experiment
+      state**: a shared carboy blocks every experiment draining into it. Owned vessels are
+      created at *create*, never reset at start.
+    - **Engine alerts/events carry `experiment`** and namespaced dedup keys; `events.csv`
+      routing is experiment → vial owner → everyone (SPEC §20.2).
+    - **Machine-wide things stay machine-wide**: emergency stop and shutdown stop every
+      experiment; the machine hold holds every experiment's pumps; pump calibration and
+      raw actuator routes need the whole machine. The per-run OD blank does not.
+
 
 ## Technical constraints
 
@@ -664,6 +687,9 @@ eVOLVER_FileStruct/
     mock_serial_manager.py   # Simulated hardware — run app.py --mock
     experiment_engine.py     # Lifecycle, run_cycle, media tracking, maintenance, resume
     fluidics.py              # pump frame scheduler (audit §4.1-4.2) — pure, I/O-free
+    run_config.py            # vial groups: normalise/validate, per-vial targets — pure (SPEC §9.1)
+    supervisor.py            # parallel experiments: one engine per experiment, one tick (SPEC §9.2)
+    vessels.py               # machine-scoped bottle/carboy levels, shareable across experiments
     growth_rate.py           # SPEC §17 growth estimation — pure, I/O-free, no engine imports
     replay_growth.py         #   replay a logged run through the estimator (read-only)
     verify_growth_rate.py    #   accuracy report + `--generate` for the 1x-time fixtures
@@ -680,6 +706,8 @@ eVOLVER_FileStruct/
     test_*.py                # pytest suite, all runnable against the mock
     test_control_loop.py     #   closed-loop: drives the real controllers against a
                              #   simulated culture and checks the OD band / delivered D
+    test_vial_groups.py      #   vial groups: run_config, engine, API (SPEC §9.1)
+    test_parallel_runs.py    #   parallel experiments: supervisor + API (SPEC §9.2)
     verify_control_modes.py  #   same checks as a readable report (CONTROL_MODE_AUDIT.md)
 
   frontend/
@@ -695,6 +723,8 @@ eVOLVER_FileStruct/
     od_blank.json            # per-run OD blank envelope (SPEC §19.2) — run-scoped
     reconciliation.json      # post-run mass reconciliation record (SPEC §19.4)
   exports/                   # Server-side export bundles (outside experiments/ by design)
+  machine/                   # Machine-scoped runtime state (gitignored): vessels.json
+                             #   (shared bottle/carboy levels), hold.json (machine hold)
   deploy/                    # systemd unit, Tailscale keepalive
 ```
 

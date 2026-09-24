@@ -58,10 +58,14 @@ from calibration_service import (  # noqa: E402
 from data_logger import DataLogger  # noqa: E402
 from experiment_engine import (  # noqa: E402
     ConflictError,
-    ExperimentEngine,
     ExperimentStatus,
     InvalidExperimentStateError,
     compute_pump_quantization,
+)
+from supervisor import (  # noqa: E402
+    AmbiguousExperimentError,
+    ExperimentNotLoadedError,
+    ExperimentSupervisor,
 )
 from mock_serial_manager import MockSerialManager  # noqa: E402
 from serial_manager import HEATER_OFF_SETPOINT, MAX_SAFE_TEMP_C  # noqa: E402
@@ -470,8 +474,20 @@ def _event_message(kind: str, payload: dict) -> str:
             f"Pump suppressed for vial {vial}: "
             f"{payload.get('reason', 'unknown reason')}"
         )
+    if kind == "created" and payload.get("groups"):
+        groups = "; ".join(
+            f"{g.get('name')} ({g.get('mode')}, vials "
+            f"{', '.join(str(v) for v in g.get('vials') or [])})"
+            for g in payload["groups"]
+        )
+        return f"Experiment '{name}' created with groups: {groups}"
     if kind in ("created", "started", "resumed"):
         return f"Experiment '{name}' {kind}"
+    if kind == "preconditioned":
+        return (
+            f"Experiment '{name}' holding its vials at run conditions "
+            "(heaters at target, stir on) before start"
+        )
     if kind == "stopped":
         return f"Experiment '{name}' stopped ({payload.get('reason', 'manual')})"
     if kind == "renamed":
@@ -634,6 +650,7 @@ def create_app(use_mock: bool):
         "started": (evlog.LEVEL_INFO, evlog.CATEGORY_LIFECYCLE),
         "stopped": (evlog.LEVEL_INFO, evlog.CATEGORY_LIFECYCLE),
         "resumed": (evlog.LEVEL_INFO, evlog.CATEGORY_LIFECYCLE),
+        "preconditioned": (evlog.LEVEL_INFO, evlog.CATEGORY_LIFECYCLE),
         "renamed": (evlog.LEVEL_INFO, evlog.CATEGORY_LIFECYCLE),
         "metadata_updated": (evlog.LEVEL_INFO, evlog.CATEGORY_LIFECYCLE),
         "pump": (evlog.LEVEL_INFO, evlog.CATEGORY_PUMP),
@@ -703,11 +720,13 @@ def create_app(use_mock: bool):
         )
         if kind == "stopped":
             # A per-run OD blank belongs to one run (SPEC §19.2): restore the
-            # pristine calibration so idle reads stop carrying its re-anchor.
+            # pristine curve for THAT run's vials only. With parallel
+            # experiments, clearing all sixteen would silently revert every
+            # other running experiment's OD to the offset curve.
             try:
                 clear = getattr(state.manager, "clear_od_blank", None)
                 if clear is not None:
-                    clear()
+                    clear(payload.get("vials"))
                     if getattr(state.manager, "od_cal", None) is not None:
                         state.od_cal = np.asarray(state.manager.od_cal)
             except Exception:
@@ -728,24 +747,34 @@ def create_app(use_mock: bool):
     state.watchdog = watchdog
     watchdog.start()
 
-    # -------------------- Experiment engine (SPEC §9) ------------------------
-    # Owns the turbidostat control loop, per-vial state, and state.json
-    # persistence. Driven by sensor_loop's run_cycle() call below; emits
-    # `experiment_event` and `alert` over the socketio bus.
+    # ---------------- Experiments (SPEC §9; parallel: supervisor.py) ----------
+    # One ExperimentEngine per loaded experiment, held by the supervisor and
+    # driven by sensor_loop's run_cycle() on one tick. Each engine owns its
+    # own vials, controllers and state.json; the supervisor owns vial
+    # ownership, the shared vessel registry and the machine hold. Engines emit
+    # `experiment_event` and `alert` through the two funnels above, stamped
+    # with their experiment's name.
+    #
+    # `state.engine` keeps its name: with one experiment loaded, every call
+    # that names none means that one, exactly as before parallel runs.
 
-    engine = ExperimentEngine(
+    engine = ExperimentSupervisor(
         serial_manager=manager,
         data_logger=data_logger,
         experiments_root=EXPERIMENTS_DIR,
         on_event=_emit_event,
         on_alert=_emit_alert_payload,
         temp_cal=temp_cal,
-        # The engine needs both periods: the control lane's to validate a
+        # The engines need both periods: the control lane's to validate a
         # chemostat bolus interval it can actually honour and to describe OD
         # streaks in minutes, the base tick's to describe temperature streaks
         # in seconds.
         cycle_interval_seconds=OD_INTERVAL_SECONDS,
         base_tick_seconds=SENSOR_LOOP_INTERVAL_SECONDS,
+        # Machine-scoped state (shared vessel levels, the machine hold) lives
+        # beside experiments/, never inside it, so no listing mistakes it for
+        # an experiment.
+        machine_dir=EXPERIMENTS_DIR.parent / "machine",
     )
     state.engine = engine
 
@@ -797,7 +826,7 @@ def create_app(use_mock: bool):
         so the estimator never runs on a stale view of the calibration.
         """
         try:
-            state.engine.set_growth_context(cal_service.growth_context(name))
+            state.engine.set_growth_context(name, cal_service.growth_context(name))
         except Exception:
             log.exception("failed to push growth context for '%s'", name)
 
@@ -892,14 +921,19 @@ def create_app(use_mock: bool):
         return jsonify(payload)
 
     def _experiment_locks_vial(vial: int) -> tuple[int, str] | None:
-        """If the engine is running and `vial` is in its experiment, return
-        (vial, experiment_name). Else None. Used by the actuator endpoints
-        to block manual control of vials assigned to a live experiment."""
-        if state.engine is None or not state.engine.is_running:
+        """If an experiment drives `vial` -- RUNNING, or CREATED and
+        preconditioned -- return (vial, experiment_name). Else None. Used by
+        the actuator endpoints to block manual control of vials an engine
+        re-asserts its own setpoints over."""
+        if state.engine is None:
             return None
-        if vial in state.engine.loaded_vials:
-            return (vial, state.engine.loaded_experiment or "")
-        return None
+        owner = state.engine.driven_vials().get(int(vial))
+        return None if owner is None else (int(vial), owner)
+
+    def _owner_label(name: str) -> str:
+        """`'exp'` or `'exp' (operator Ana)` for a 409 message."""
+        op = state.engine.operator_of(name) if state.engine is not None else ""
+        return f"'{name}'" + (f" (operator {op})" if op else "")
 
     @flask_app.route("/api/actuators/temperature", methods=["POST"])
     def api_set_temperature():
@@ -926,8 +960,9 @@ def create_app(use_mock: bool):
         # compare on the raw setpoint stored in the manager (translated
         # from the request's °C via the calibration) so the comparison
         # is exact rather than fuzzy on floating-point Celsius.
-        if state.engine is not None and state.engine.is_running:
-            locked = state.engine.loaded_vials
+        driven = state.engine.driven_vials() if state.engine is not None else {}
+        if driven:
+            locked = sorted(driven)
             current_raw = np.asarray(
                 getattr(
                     state.manager,
@@ -946,7 +981,7 @@ def create_app(use_mock: bool):
                         return jsonify(
                             error=(
                                 f"vial {v} is controlled by experiment "
-                                f"'{state.engine.loaded_experiment}'"
+                                f"{_owner_label(driven[v])}"
                             )
                         ), 409
         try:
@@ -986,8 +1021,9 @@ def create_app(use_mock: bool):
         err = _validate_int_array(values, N_VIALS, 0, STIR_MAX, "values")
         if err is not None:
             return jsonify(error=err), 400
-        if state.engine is not None and state.engine.is_running:
-            locked = state.engine.loaded_vials
+        driven = state.engine.driven_vials() if state.engine is not None else {}
+        if driven:
+            locked = sorted(driven)
             current_stir = np.asarray(
                 getattr(state.manager, "stir_speed", np.zeros(N_VIALS))
             )
@@ -996,7 +1032,7 @@ def create_app(use_mock: bool):
                     return jsonify(
                         error=(
                             f"vial {v} is controlled by experiment "
-                            f"'{state.engine.loaded_experiment}'"
+                            f"{_owner_label(driven[v])}"
                         )
                     ), 409
         try:
@@ -1074,7 +1110,7 @@ def create_app(use_mock: bool):
         lock = _experiment_locks_vial(int(vial))
         if lock is not None:
             return jsonify(
-                error=f"vial {lock[0]} is controlled by experiment '{lock[1]}'"
+                error=f"vial {lock[0]} is controlled by experiment {_owner_label(lock[1])}"
             ), 409
 
         requested_ml = None
@@ -1193,12 +1229,18 @@ def create_app(use_mock: bool):
             category=evlog.CATEGORY_ACTUATOR, timestamp=timestamp,
             dedup_key="emergency_stop",
         )
+        stopped: list = []
         if state.engine is not None:
             try:
-                state.engine.handle_emergency_stop()
+                # Every experiment: an emergency stop says the INSTRUMENT is
+                # wrong, not one culture (PARALLEL_EXPERIMENTS.md T9).
+                stopped = state.engine.handle_emergency_stop()
             except Exception:
                 log.exception("engine.handle_emergency_stop failed")
-        return jsonify(status="ok", message="All actuators zeroed")
+        return jsonify(
+            status="ok", message="All actuators zeroed",
+            experiments_stopped=stopped,
+        )
 
     # ----------------------- Experiment routes (SPEC §6) ---------------------
     # All endpoints delegate to ExperimentEngine. The engine owns lifecycle,
@@ -1228,15 +1270,26 @@ def create_app(use_mock: bool):
         except Exception:
             log.exception("calibration provenance enrichment failed")
         try:
+            groups = body.get("groups")
             config = state.engine.create_experiment(
                 name=body.get("name"),
-                mode=body.get("mode", "turbidostat"),
+                # With groups, each group names its own mode; a top-level
+                # mode is optional and must agree. Without, the legacy
+                # single-mode default applies.
+                mode=body.get("mode") if groups else body.get("mode", "turbidostat"),
                 vials=body.get("vials"),
                 parameters=body.get("params") or body.get("parameters") or {},
                 calibration=calibration_body,
                 notes=body.get("notes", ""),
                 media=body.get("media"),
+                groups=groups,
+                # Parallel experiments: who is running this, and until when.
+                operator=str(body.get("operator") or ""),
+                expected_end=body.get("expected_end") or None,
             )
+        except ConflictError as exc:
+            # A vial another experiment holds, or a clashing shared setting.
+            return jsonify(error=str(exc), code="conflict"), 409
         except ValueError as exc:
             return jsonify(error=str(exc)), 400
         except FileExistsError as exc:
@@ -1255,6 +1308,21 @@ def create_app(use_mock: bool):
             name=config["name"],
             warnings=config.get("warnings") or [],
         )
+
+    @flask_app.route("/api/experiments/<name>/precondition", methods=["POST"])
+    def api_experiments_precondition(name):
+        """Hold a CREATED experiment's vials at their groups' heater and stir
+        targets, so the per-run OD blank can be taken under run conditions
+        (SPEC §19.2). Control and logging do not start until /start."""
+        try:
+            result = state.engine.precondition_experiment(name)
+        except InvalidExperimentStateError as exc:
+            return jsonify(error=str(exc)), 409
+        except ValueError as exc:
+            return jsonify(error=str(exc)), 400
+        except RuntimeError as exc:
+            return jsonify(error=str(exc)), 500
+        return jsonify(status="preconditioned", **result)
 
     @flask_app.route("/api/experiments/<name>/start", methods=["POST"])
     def api_experiments_start(name):
@@ -1302,9 +1370,9 @@ def create_app(use_mock: bool):
 
     @flask_app.route("/api/experiments/<name>/stop", methods=["POST"])
     def api_experiments_stop(name):
-        if state.engine.loaded_experiment != name:
+        if state.engine.get_run(name) is None:
             return jsonify(error=f"experiment '{name}' is not loaded"), 400
-        stopped = state.engine.stop_experiment(reason="manual")
+        stopped = state.engine.stop_experiment(name, reason="manual")
         if stopped is None:
             return jsonify(error=f"experiment '{name}' is not running"), 400
         return jsonify(
@@ -1315,8 +1383,8 @@ def create_app(use_mock: bool):
 
     @flask_app.route("/api/experiments/<name>/status", methods=["GET"])
     def api_experiments_status(name):
-        if state.engine.loaded_experiment == name:
-            return jsonify(state.engine.status())
+        if state.engine.get_run(name) is not None:
+            return jsonify(state.engine.status(name))
         # Look on disk for stopped/created experiments not currently loaded.
         state_path = EXPERIMENTS_DIR / name / "state.json"
         config_path = EXPERIMENTS_DIR / name / "config.json"
@@ -1596,18 +1664,36 @@ def create_app(use_mock: bool):
     # without disrupting the experiment. Sensor reads + CSV logging keep
     # running; pump actions are queued and fire on exit.
 
+    # Each experiment has its own maintenance ("pause MY run while I swap my
+    # bottle"). The /api/experiments/<name>/maintenance/* routes name it; the
+    # older /api/maintenance/* ones mean the only loaded experiment and
+    # answer 409 `ambiguous_experiment` when several are loaded. "Someone has
+    # the machine open" is the machine hold below, for every experiment.
+
+    def _ambiguous(exc: InvalidExperimentStateError):
+        code = "ambiguous_experiment" if isinstance(exc, AmbiguousExperimentError) else None
+        body = {"error": str(exc)}
+        if code:
+            body["code"] = code
+            body["experiments"] = exc.names
+        return jsonify(body), 409
+
     @flask_app.route("/api/maintenance/enter", methods=["POST"])
-    def api_maintenance_enter():
+    @flask_app.route("/api/experiments/<name>/maintenance/enter", methods=["POST"])
+    def api_maintenance_enter(name=None):
         try:
-            status_block = state.engine.enter_maintenance()
+            status_block = state.engine.enter_maintenance(name)
         except InvalidExperimentStateError as exc:
-            return jsonify(error=str(exc)), 409
+            return _ambiguous(exc)
         return jsonify(status="maintenance", maintenance=status_block)
 
     @flask_app.route("/api/maintenance/exit", methods=["POST"])
-    def api_maintenance_exit():
+    @flask_app.route("/api/experiments/<name>/maintenance/exit", methods=["POST"])
+    def api_maintenance_exit(name=None):
         try:
-            queued = state.engine.exit_maintenance(reason="manual")
+            queued = state.engine.exit_maintenance(name, reason="manual")
+        except InvalidExperimentStateError as exc:
+            return _ambiguous(exc)
         except Exception as exc:
             log.exception("exit_maintenance failed")
             return jsonify(error=str(exc)), 500
@@ -1623,27 +1709,86 @@ def create_app(use_mock: bool):
                 category=evlog.CATEGORY_PUMP,
                 dedup_key="queued_pump_exit_failed",
             )
-        return jsonify(
-            status="resumed",
-            fired=len(queued),
-            maintenance=state.engine.status().get("maintenance"),
-        )
+        try:
+            maint = state.engine.status(name).get("maintenance")
+        except InvalidExperimentStateError:
+            maint = None
+        return jsonify(status="resumed", fired=len(queued), maintenance=maint)
 
     @flask_app.route("/api/maintenance/refill", methods=["POST"])
-    def api_maintenance_refill():
+    @flask_app.route("/api/experiments/<name>/maintenance/refill", methods=["POST"])
+    def api_maintenance_refill(name=None):
         body = request.get_json(silent=True) or {}
         bottles = body.get("bottles") or None
         waste = body.get("waste") or {}
         waste_filled_ml = waste.get("filled_ml") if isinstance(waste, dict) else None
         try:
             updated = state.engine.refill_media(
-                bottles=bottles, waste_filled_ml=waste_filled_ml,
+                name, bottles=bottles, waste_filled_ml=waste_filled_ml,
             )
         except InvalidExperimentStateError as exc:
-            return jsonify(error=str(exc)), 409
+            return _ambiguous(exc)
         except ValueError as exc:
             return jsonify(error=str(exc)), 400
         return jsonify(status="ok", **updated)
+
+    # --------------------- Machine hold (parallel experiments) --------------
+    # Someone has the machine open: every experiment's pumps are held, the
+    # decided dilutions queued newest-per-vial, and the same 30-minute
+    # auto-resume failsafe as an experiment's own maintenance applies.
+
+    @flask_app.route("/api/machine", methods=["GET"])
+    def api_machine():
+        return jsonify(
+            machine_hold=state.engine.machine_hold,
+            experiments=state.engine.experiments_summary(),
+            owners={str(v): n for v in range(N_VIALS)
+                    if (n := state.engine.owner_of(v)) is not None},
+        )
+
+    @flask_app.route("/api/machine/hold", methods=["POST"])
+    def api_machine_hold():
+        body = request.get_json(silent=True) or {}
+        hold = state.engine.enter_machine_hold(
+            reason=str(body.get("reason") or "physical_intervention"),
+        )
+        return jsonify(status="held", machine_hold=hold)
+
+    @flask_app.route("/api/machine/release", methods=["POST"])
+    def api_machine_release():
+        queued = state.engine.exit_machine_hold(reason="manual")
+        try:
+            if queued:
+                _execute_queued_pump_actions(queued)
+        except Exception as exc:
+            log.exception("execute held pump actions failed on release")
+            _emit_alert(
+                "critical",
+                "Dilutions held during the machine hold were NOT delivered on "
+                f"release: {exc}",
+                category=evlog.CATEGORY_PUMP,
+                dedup_key="held_pump_release_failed",
+            )
+        return jsonify(status="released", fired=len(queued))
+
+    # --------------------- Shared vessels (parallel experiments) ------------
+
+    @flask_app.route("/api/vessels", methods=["GET"])
+    def api_vessels():
+        """Every media bottle and waste carboy the machine knows, with its
+        level and the loaded experiments using it -- so a new experiment can
+        share one (media.bottles[i].vessel / media.waste.vessel)."""
+        return jsonify(vessels=state.engine.vessels())
+
+    @flask_app.route("/api/vessels/<vessel_id>", methods=["DELETE"])
+    def api_vessel_retire(vessel_id):
+        try:
+            state.engine.retire_vessel(vessel_id)
+        except FileNotFoundError as exc:
+            return jsonify(error=str(exc)), 404
+        except ConflictError as exc:
+            return jsonify(error=str(exc), code="conflict"), 409
+        return jsonify(status="retired", id=vessel_id)
 
     # --------------------- Morbidostat-specific routes ----------------------
     # Manual-swap escalation: engine detects growth recovery and emits an
@@ -1685,20 +1830,29 @@ def create_app(use_mock: bool):
     # route rejects with 409 while an experiment is RUNNING, and these are the
     # ONLY routes permitted to reach the raw actuator paths (§19.6).
 
-    def _cal_route(mutating: bool = True):
+    def _cal_route(mutating: bool = True, exclusive: bool = True):
         """Decorator: RUNNING-experiment guard + exception -> HTTP mapping
         (ValueError 400, CalibrationConflict 409, QCRefusal 422 with the qc
-        block, FileNotFoundError 404)."""
+        block, FileNotFoundError 404).
+
+        ``exclusive`` routes (pump calibration, raw actuator paths) need the
+        whole machine: 409 while ANY experiment runs, naming who. The per-run
+        OD blank is not exclusive -- it touches only its own CREATED
+        experiment's vials, so one operator can take a blank while another's
+        experiment runs (PARALLEL_EXPERIMENTS.md T3)."""
         def decorate(fn):
             @functools.wraps(fn)
             def wrapper(*args, **kwargs):
-                if mutating and state.engine is not None and state.engine.is_running:
+                running = state.engine.running_names() if state.engine is not None else []
+                if mutating and exclusive and running:
+                    who = ", ".join(_owner_label(n) for n in running)
                     return jsonify(
                         error=(
                             "calibration is unavailable while an experiment "
-                            "is RUNNING (SPEC §19.6) — stop it first"
+                            f"is RUNNING (SPEC §19.6) — running: {who}"
                         ),
                         code="experiment_running",
+                        experiments=running,
                     ), 409
                 try:
                     return fn(*args, **kwargs)
@@ -1715,9 +1869,11 @@ def create_app(use_mock: bool):
         return decorate
 
     def _loaded_experiment_info() -> tuple[str | None, str | None]:
+        """The experiment the calibration surface reports on: a CREATED one
+        (the next blank to take) before a RUNNING one."""
         if state.engine is None:
             return None, None
-        return state.engine.loaded_experiment, state.engine.status_string
+        return state.engine.first_with_status("created", "running")
 
     @flask_app.route("/api/calibration/", methods=["GET"])
     @_cal_route(mutating=False)
@@ -1748,52 +1904,74 @@ def create_app(use_mock: bool):
     # --- per-run OD blank (§19.2 / CALIBRATION_PROTOCOL §5.4) ----------------
 
     @flask_app.route("/api/calibration/od/blank/start", methods=["POST"])
-    @_cal_route()
+    @_cal_route(exclusive=False)
     def api_blank_start():
         body = request.get_json(silent=True) or {}
-        name, status = _loaded_experiment_info()
+        # Which experiment: named in the body, else the only CREATED one.
+        name = body.get("experiment")
         if name is None:
+            name, status = state.engine.first_with_status("created")
+            running = state.engine.running_names()
+            if name is None and running:
+                # Nothing to blank, and something is running: say so, the
+                # way every calibration route always has.
+                return jsonify(
+                    error=(
+                        "calibration is unavailable while an experiment is "
+                        "RUNNING (SPEC §19.6) and no CREATED experiment is "
+                        "waiting for a blank — running: "
+                        + ", ".join(_owner_label(n) for n in running)
+                    ),
+                    code="experiment_running",
+                    experiments=running,
+                ), 409
+        if name is None or state.engine.get_run(name) is None:
             return jsonify(
                 error="no experiment is loaded — create one first; the blank "
                       "is taken against a CREATED experiment immediately "
                       "before start",
                 code="conflict",
             ), 409
+        status = state.engine.get_run(name).status_string
         config_path = EXPERIMENTS_DIR / name / "config.json"
         try:
             config = json.loads(config_path.read_text(encoding="utf-8"))
         except Exception:
             return jsonify(error=f"failed to read {config_path}"), 500
-        params = config.get("parameters", {})
-        stir_pwm = body.get("stir_pwm", params.get("stir_rate", 10))
+        # stir_pwm is an optional claim checked against every vial's own
+        # group stir rate; without it each vial is simply expected at its
+        # group's rate (see CalibrationService.blank_start).
+        stir_pwm = body.get("stir_pwm")
         led_power = body.get("led_power", OD_LED_POWER)
         return jsonify(cal_service.blank_start(
             experiment=name,
             config=config,
             engine_status=status,
             led_power=int(led_power),
-            stir_pwm=int(stir_pwm),
+            stir_pwm=None if stir_pwm is None else int(stir_pwm),
             expected_led_power=OD_LED_POWER,
             n_samples=int(body.get("n_samples", 5)),
         ))
 
     @flask_app.route("/api/calibration/od/blank/dark", methods=["POST"])
-    @_cal_route()
+    @_cal_route(exclusive=False)
     def api_blank_dark():
         body = request.get_json(silent=True) or {}
         return jsonify(cal_service.blank_dark(body.get("session", "")))
 
     @flask_app.route("/api/calibration/od/blank/measure", methods=["POST"])
-    @_cal_route()
+    @_cal_route(exclusive=False)
     def api_blank_measure():
         body = request.get_json(silent=True) or {}
         return jsonify(cal_service.blank_measure(body.get("session", "")))
 
     @flask_app.route("/api/calibration/od/blank/commit", methods=["POST"])
-    @_cal_route()
+    @_cal_route(exclusive=False)
     def api_blank_commit():
         body = request.get_json(silent=True) or {}
-        name, _status = _loaded_experiment_info()
+        # The experiment the open session was started for -- not "whatever
+        # is loaded", which with parallel experiments may be several.
+        name = cal_service.blank_experiment()
         result = cal_service.blank_commit(
             body.get("session", ""),
             exclude_vials=body.get("exclude_vials"),
@@ -1810,7 +1988,7 @@ def create_app(use_mock: bool):
         except Exception:
             log.exception("apply_od_blank after commit failed")
         # A new blank changes the per-vial OD floors the growth estimator uses.
-        _push_growth_context(state.engine.loaded_experiment)
+        _push_growth_context(name)
         # Provenance: the run must record which blank it used (§19.1).
         if name is not None:
             try:
@@ -1831,7 +2009,7 @@ def create_app(use_mock: bool):
         return jsonify(result)
 
     @flask_app.route("/api/calibration/od/blank/abort", methods=["POST"])
-    @_cal_route()
+    @_cal_route(exclusive=False)
     def api_blank_abort():
         body = request.get_json(silent=True) or {}
         return jsonify(cal_service.blank_abort(body.get("session", "")))
@@ -1962,20 +2140,29 @@ def create_app(use_mock: bool):
         chosen by maximum R², which makes the reported R² an optimistic bound
         rather than an unbiased fit statistic.
         """
-        name = state.engine.loaded_experiment
-        if name is None or not state.engine.is_running:
+        # ?experiment=<name> scopes to one; otherwise every running
+        # experiment's vials (disjoint, so one per_vial map holds them all).
+        wanted = request.args.get("experiment")
+        running = state.engine.running_names()
+        if wanted is not None:
+            running = [n for n in running if n == wanted]
+        if not running:
             return jsonify(
-                experiment=name,
+                experiment=wanted or state.engine.loaded_experiment,
                 running=False,
                 per_vial={},
                 message="no experiment is running",
             )
+        per_vial: dict = {}
+        for n in running:
+            per_vial.update(state.engine.run(n).growth_snapshot())
         return jsonify(
-            experiment=name,
+            experiment=running[0] if len(running) == 1 else running,
+            experiments=running,
             running=True,
             timestamp=_now_iso(),
             recompute_interval_seconds=growth.RECOMPUTE_INTERVAL_SECONDS,
-            per_vial=state.engine.growth_snapshot(),
+            per_vial=per_vial,
         )
 
     @flask_app.route("/api/experiments/<name>/reconcile", methods=["POST"])
@@ -1983,11 +2170,8 @@ def create_app(use_mock: bool):
         """O4: compare measured start/end masses against the software's
         accumulated duration x flow_rate volumes. The only check that
         validates the whole open-loop volume chain end to end."""
-        if (
-            state.engine is not None
-            and state.engine.loaded_experiment == name
-            and state.engine.is_running
-        ):
+        run = state.engine.get_run(name) if state.engine is not None else None
+        if run is not None and run.is_running:
             return jsonify(
                 error="stop the experiment before reconciling — the masses "
                       "are end-of-run measurements",
@@ -2028,13 +2212,17 @@ def create_app(use_mock: bool):
 
     # --------------------- WebSocket sensor broadcast loop -------------------
 
-    def _experiment_summary() -> dict | None:
-        """Compact experiment status for the sensor_update payload.
-        Returns None when nothing is loaded; otherwise a small dict the
-        dashboard can read without polling /api/experiments."""
-        if state.engine is None or state.engine.loaded_experiment is None:
+    def _experiment_summary(name: str | None = None) -> dict | None:
+        """Compact status of one loaded experiment (the first, by default)
+        for the sensor_update payload. Returns None when nothing is loaded;
+        otherwise a small dict the dashboard can read without polling
+        /api/experiments."""
+        if state.engine is None:
             return None
-        s = state.engine.status()
+        name = name or state.engine.loaded_experiment
+        if name is None or state.engine.get_run(name) is None:
+            return None
+        s = state.engine.status(name)
         media = s.get("media")
         media_summary = None
         if media is not None:
@@ -2051,7 +2239,7 @@ def create_app(use_mock: bool):
             }
         escalation_pending: list[int] = []
         try:
-            escalation_pending = state.engine.escalation_pending_vials()
+            escalation_pending = state.engine.run(name).escalation_pending_vials()
         except Exception:
             log.exception("escalation_pending_vials failed")
         # Trim to the fields the dashboard actually needs at 10 s cadence.
@@ -2060,6 +2248,16 @@ def create_app(use_mock: bool):
             "status": s.get("status"),
             "mode": s.get("mode"),
             "vials": s.get("vials", []),
+            "operator": s.get("operator") or "",
+            "expected_end": s.get("expected_end"),
+            # Vial groups: small (name, mode, vials) so the dashboard can
+            # colour cards per group without polling /status.
+            "groups": [
+                {"name": g["name"], "mode": g["mode"], "vials": g["vials"]}
+                for g in s.get("groups") or []
+            ],
+            "grouped": bool(s.get("grouped")),
+            "preconditioned": bool(s.get("preconditioned")),
             "elapsed_hours": s.get("elapsed_hours"),
             "media_summary": media_summary,
             "maintenance": s.get("maintenance"),
@@ -2081,6 +2279,11 @@ def create_app(use_mock: bool):
         the command line.
         """
         o = state.last_od
+        # One summary per loaded experiment, built once per tick.
+        experiments = [
+            summary for n in state.engine.loaded_names()
+            if (summary := _experiment_summary(n)) is not None
+        ]
         od_age = None
         if state.last_od_monotonic is not None:
             od_age = round(time.monotonic() - state.last_od_monotonic, 1)
@@ -2102,7 +2305,12 @@ def create_app(use_mock: bool):
                 "timestamp": state.last_od_timestamp,
                 "age_seconds": od_age,
             },
-            "experiment": _experiment_summary(),
+            # The first loaded experiment, in the shape the dashboard has
+            # always read, plus one compact entry per loaded experiment and
+            # the machine hold (parallel experiments).
+            "experiment": experiments[0] if experiments else None,
+            "experiments": experiments,
+            "machine_hold": state.engine.machine_hold,
             # SPEC 17 growth estimates. Recomputed on a 60 s throttle inside
             # the engine, so most ticks re-send an unchanged block -- cheap,
             # and it keeps the dashboard from needing a second poll.
@@ -2118,6 +2326,10 @@ def create_app(use_mock: bool):
                 "od_seconds": OD_INTERVAL_SECONDS,
             },
         }
+
+    # Exposed like classify_bus_reads below, so tests can build one payload
+    # without waiting a base tick for the sensor thread.
+    state.sensor_update_payload = _sensor_update_payload
 
     def _execute_pump_actions(actions, ts_iso: str) -> None:
         """Fire one cycle's ``(vial, PumpAction)`` tuples, as returned by
@@ -2522,8 +2734,7 @@ def create_app(use_mock: bool):
     # Runs after the sensor thread has started so the engine's run_cycle
     # ticks will pick up immediately.
     try:
-        resumed = state.engine.resume_on_startup()
-        if resumed:
+        for resumed in state.engine.resume_on_startup():
             log.info("resumed experiment '%s' from previous server run", resumed)
             # The blank re-anchor lives in memory; a restart must re-apply it
             # or the resumed run's OD silently reverts to the offset curve.
@@ -2553,9 +2764,9 @@ def create_app(use_mock: bool):
         # data_logger.stop_experiment call.
         if state.engine is not None:
             try:
-                state.engine.stop_experiment(reason="shutdown")
+                state.engine.stop_all(reason="shutdown")
             except Exception:
-                log.exception("shutdown: engine.stop_experiment failed")
+                log.exception("shutdown: stopping experiments failed")
         try:
             manager.emergency_shutdown()
         except Exception:

@@ -53,6 +53,7 @@ from serial_manager import (
     OD_LED_MAX,
     ODReading,
     SerialManager,
+    led_power_vector,
 )
 
 
@@ -232,10 +233,21 @@ class MockSerialManager:
                 od_cal[2, v] = float(c_run)
             self.od_cal = od_cal
 
-    def clear_od_blank(self) -> None:
+    def clear_od_blank(self, vials=None) -> None:
+        """Parity with SerialManager.clear_od_blank (all vials, or only
+        ``vials``)."""
         with self._lock:
-            if self._od_cal_base is not None:
+            if self._od_cal_base is None:
+                return
+            if vials is None:
                 self.od_cal = self._od_cal_base.copy()
+                return
+            od_cal = self.od_cal.copy()
+            for vial in vials:
+                v = int(vial)
+                if 0 <= v < N_VIALS:
+                    od_cal[2, v] = self._od_cal_base[2, v]
+            self.od_cal = od_cal
 
     # Calibration helpers retained for the round-trip test and any
     # external utility that wants to convert between physical units and
@@ -320,20 +332,20 @@ class MockSerialManager:
         synthesized: LED 0 returns a dark floor + read noise; LED > 0 inverts
         the loaded calibration from the current simulated OD (falling back to
         a plausible constant when uncalibrated) + read noise."""
-        led = int(np.clip(led_power, 0, OD_LED_MAX))
+        leds = led_power_vector(led_power)
         n = max(1, int(n_samples))
         with self._lock:
             self._advance()
-            if led == 0:
-                base = np.full(N_VIALS, self.mock_dark_counts)
-                noise_sd = self.mock_dark_noise_sd
-            elif self.od_cal is not None:
-                base = self._od_abs_to_raw(np.asarray(self.od_abs, dtype=float))
-                noise_sd = self.mock_signal_noise_sd
+            dark = leds == 0
+            if self.od_cal is not None:
+                lit = self._od_abs_to_raw(np.asarray(self.od_abs, dtype=float))
             else:
-                base = np.full(N_VIALS, self.mock_uncal_signal_counts)
-                noise_sd = self.mock_signal_noise_sd
-            samples = base[None, :] + self._rng.normal(0.0, noise_sd, (n, N_VIALS))
+                lit = np.full(N_VIALS, float(self.mock_uncal_signal_counts))
+            # Per vial: a dark LED reads the dark floor, a lit one the signal.
+            base = np.where(dark, float(self.mock_dark_counts), lit)
+            noise_sd = np.where(dark, self.mock_dark_noise_sd, self.mock_signal_noise_sd)
+            self.last_collect_led_powers = leds.tolist()
+            samples = base[None, :] + self._rng.normal(0.0, 1.0, (n, N_VIALS)) * noise_sd[None, :]
         return {
             "median": np.median(samples, axis=0).tolist(),
             "sd": np.std(samples, axis=0).tolist(),

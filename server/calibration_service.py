@@ -39,6 +39,8 @@ from typing import Any, Callable, Optional
 
 import numpy as np
 
+import run_config
+
 N_VIALS = 16
 N_PUMPS = 32  # canonical pump index: 0..15 influx vial i, 16..31 efflux vial i-16
 
@@ -861,6 +863,11 @@ class TempStabilityTracker:
 # Per-run OD blank session (O2)
 # ---------------------------------------------------------------------------
 
+# A blank session idle longer than this may be replaced by another
+# experiment's (the procedure itself takes ~10 minutes, §5.4).
+BLANK_SESSION_STALE_SECONDS = 60 * 60
+
+
 class OdBlankSession:
     """State for one §5.4 dark/blank sequence. Deliberately in-memory: the
     whole procedure is ~10 minutes at the bench, and a server restart
@@ -873,15 +880,17 @@ class OdBlankSession:
         experiment: str,
         vials: list[int],
         led_power: int,
-        stir_pwm: int,
+        stir_by_vial: dict,
         targets_c: dict,
         n_samples: int = 5,
     ) -> None:
         self.id = uuid.uuid4().hex[:12]
         self.experiment = experiment
+        self.started_monotonic_wall = time.time()
         self.vials = list(vials)
         self.led_power = int(led_power)
-        self.stir_pwm = int(stir_pwm)
+        # Per vial: vial groups may stir at different rates.
+        self.stir_by_vial = {int(k): int(v) for k, v in stir_by_vial.items()}
         self.targets_c = dict(targets_c)
         self.n_samples = int(n_samples)
         self.created_at = _iso_now()
@@ -1211,27 +1220,55 @@ class CalibrationService:
         config: dict,
         engine_status: str,
         led_power: int,
-        stir_pwm: int,
+        stir_pwm: Optional[int],
         expected_led_power: int,
         n_samples: int = 5,
     ) -> dict:
         """Open a blank session for the loaded CREATED experiment, enforcing
         the §13 condition-match guard: a blank at a different LED power or
-        stir PWM than the run is not a blank."""
+        stir PWM than the run is not a blank.
+
+        Each vial is expected at its own group's stir rate (vial groups,
+        ``run_config.py``). ``stir_pwm``, when given, is the operator's claim
+        of one PWM for every vial and must match every vial's group; it is
+        optional because an experiment whose groups stir differently has no
+        single right answer. The stir the manager is actually sending is
+        reported beside the expectation (``stir_mismatch``) as a warning, not
+        a refusal -- the thermal-settling check is the hard gate."""
         with self._lock:
             if engine_status != "created":
                 raise CalibrationConflict(
                     "the OD blank is taken against a CREATED experiment, "
                     f"immediately before start; engine status is '{engine_status}'"
                 )
-            params = (config or {}).get("parameters", {})
-            run_stir = int(params.get("stir_rate", 10))
-            if int(stir_pwm) != run_stir:
-                raise ValueError(
-                    f"stir_pwm {stir_pwm} != the run's stir_rate {run_stir} — "
-                    "a blank taken at a different stir PWM is not a blank "
-                    "(Principle 1)"
-                )
+            # One blank session at a time, machine-wide. With parallel
+            # experiments a second operator starting a blank would otherwise
+            # silently replace the first one's session mid-procedure.
+            other = self._blank
+            if other is not None and other.experiment != experiment:
+                age = time.time() - other.started_monotonic_wall
+                if age < BLANK_SESSION_STALE_SECONDS:
+                    raise CalibrationConflict(
+                        f"an OD blank for '{other.experiment}' is in progress "
+                        f"(started {age / 60:.0f} min ago) -- finish or abort "
+                        "it first"
+                    )
+            expected_stir = run_config.config_stir_by_vial(config or {})
+            if stir_pwm is not None:
+                rates = sorted(set(expected_stir.values()))
+                if len(rates) == 1 and int(stir_pwm) != rates[0]:
+                    raise ValueError(
+                        f"stir_pwm {stir_pwm} != the run's stir_rate {rates[0]} — "
+                        "a blank taken at a different stir PWM is not a blank "
+                        "(Principle 1)"
+                    )
+                if len(rates) > 1:
+                    raise ValueError(
+                        f"this run's groups stir at different rates {rates}, so "
+                        f"no single stir_pwm ({stir_pwm}) matches every vial — "
+                        "omit stir_pwm; each vial is checked against its own "
+                        "group's rate"
+                    )
             if int(led_power) != int(expected_led_power):
                 raise ValueError(
                     f"led_power {led_power} != the run's LED power "
@@ -1243,16 +1280,17 @@ class CalibrationService:
             vials = sorted(int(v) for v in (config or {}).get("vials", []))
             if not vials:
                 raise ValueError("experiment has no vials")
-            temp_param = params.get("temperature_c", params.get("temperature", 37.0))
-            if isinstance(temp_param, (list, tuple)):
-                targets = {v: float(temp_param[v]) for v in vials}
-            else:
-                targets = {v: float(temp_param) for v in vials}
+            # Per vial, from each vial's group (scalar or 16-list
+            # temperature_c, legacy `temperature`, then 37 °C).
+            all_targets = run_config.config_temperature_c_by_vial(config or {})
+            targets = {v: all_targets[v] for v in vials}
+            stir_by_vial = {v: expected_stir.get(v, run_config.DEFAULT_STIR_RATE)
+                            for v in vials}
             self._blank = OdBlankSession(
                 experiment=experiment,
                 vials=vials,
                 led_power=int(led_power),
-                stir_pwm=int(stir_pwm),
+                stir_by_vial=stir_by_vial,
                 targets_c=targets,
                 n_samples=int(n_samples),
             )
@@ -1262,7 +1300,33 @@ class CalibrationService:
                 "vials": vials,
                 "n_samples": self._blank.n_samples,
                 "thermal": self.tracker.settled(vials, targets),
+                "stir_mismatch": self._stir_mismatch(stir_by_vial),
             }
+
+    def _stir_mismatch(self, expected: dict) -> dict:
+        """Vials whose actually-commanded stir differs from the run's.
+
+        Read from the manager's last-sent stir vector. Empty when they agree,
+        or when the manager does not expose one."""
+        actual = getattr(self.manager, "stir_speed", None)
+        if actual is None:
+            return {}
+        try:
+            actual = [int(x) for x in list(actual)]
+        except Exception:
+            return {}
+        return {
+            str(v): {"expected": int(e), "actual": actual[v]}
+            for v, e in expected.items()
+            if 0 <= v < len(actual) and actual[v] != int(e)
+        }
+
+    def blank_experiment(self) -> Optional[str]:
+        """The experiment the open blank session was started for, if any.
+        With parallel experiments the commit must re-anchor THAT run, not
+        whichever happens to be loaded first."""
+        with self._lock:
+            return None if self._blank is None else self._blank.experiment
 
     def _require_blank(self, session_id: str) -> OdBlankSession:
         if self._blank is None:
@@ -1276,7 +1340,10 @@ class CalibrationService:
     def blank_dark(self, session_id: str = "") -> dict:
         with self._lock:
             s = self._require_blank(session_id)
-            stats = self.manager.collect_od_raw(0, n_samples=s.n_samples)
+            # Dark only THIS run's vials. With parallel experiments another
+            # run's LEDs must stay lit -- its next OD read follows this one.
+            leds = [0 if v in s.vials else s.led_power for v in range(N_VIALS)]
+            stats = self.manager.collect_od_raw(leds, n_samples=s.n_samples)
             s.dark = stats
             return {"session": s.id, "phase": "dark", **stats}
 
@@ -1447,7 +1514,15 @@ class CalibrationService:
                 source=f"per-run-blank-x{s.n_samples}",
                 conditions={
                     "led_power": s.led_power,
-                    "stir_pwm": s.stir_pwm,
+                    # Scalar when every vial stirs alike (the pre-groups
+                    # shape); None with the per-vial map when groups differ.
+                    "stir_pwm": (
+                        next(iter(set(s.stir_by_vial.values())))
+                        if len(set(s.stir_by_vial.values())) == 1 else None
+                    ),
+                    "stir_pwm_by_vial": {
+                        str(k): v for k, v in s.stir_by_vial.items()
+                    },
                     "target_temp_c": {str(k): v for k, v in s.targets_c.items()},
                     "parent_od_cal": od_env.get("version"),
                     "dark_subtracted": False,

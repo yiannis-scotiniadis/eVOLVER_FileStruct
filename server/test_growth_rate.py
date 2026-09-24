@@ -841,9 +841,12 @@ def test_api_growth_rate_idle_and_running():
         # its engine on `time.time`, so the clock is swapped for one that
         # advances a tick per cycle -- otherwise 500 iterations land inside
         # the same second and every span is zero.
-        clock = [state.engine._clock()]
-        state.engine._clock = lambda: clock[0]
-        state.engine._growth_run_start = clock[0]
+        # Parallel experiments: the app holds a supervisor; the clock and
+        # growth origin belong to the experiment's own engine.
+        run = state.engine.run("ApiGrowth")
+        clock = [run._clock()]
+        run._clock = lambda: clock[0]
+        run._growth_run_start = clock[0]
         rng = random.Random(SEED)
         od = 0.25
         for i in range(500):

@@ -36,6 +36,7 @@ from typing import Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import growth_rate as growth  # noqa: E402
+import run_config  # noqa: E402
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 EXPERIMENTS_DIR = PROJECT_ROOT / "experiments"
@@ -149,8 +150,12 @@ def replay_vial(
     samples = load_od_series(exp_dir, vial)
     if not samples:
         return []
-    params = config.get("parameters") or {}
-    mode = config.get("mode", "turbidostat")
+    # Vial groups: the vial's own group supplies its mode and its merged
+    # parameters. A config without groups is one implicit group, so this is
+    # the run-level mode and parameters exactly as before.
+    group = run_config.group_by_vial(run_config.groups_from_config(config)).get(vial)
+    params = dict(group.parameters) if group else (config.get("parameters") or {})
+    mode = (group.mode if group else None) or config.get("mode", "turbidostat")
     volume_ml = float(params.get("volume_ml", growth.DEFAULT_VOLUME_ML))
     events = load_dilution_events(exp_dir, vial)
 

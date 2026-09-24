@@ -16,6 +16,10 @@ __pycache__/
 experiments/*
 !experiments/.gitkeep
 
+# Machine-scoped runtime state (parallel experiments): shared vessel levels
+# and the machine hold. Per-rig, like experiments/ -- never tracked.
+machine/
+
 # Rotating server logs (SPEC §20.1). The bare *.log rule above misses the
 # rotated siblings (evolver.log.1, .2, ...), so ignore the directory.
 logs/

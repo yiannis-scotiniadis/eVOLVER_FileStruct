@@ -751,6 +751,42 @@
       color: var(--text);
     }
     .exp-bar-actions { display: flex; gap: 8px; }
+
+    /* Parallel experiments: one chip per loaded experiment. The selected one
+       is the "lens" the status bar, media, maintenance and morbidostat panels
+       below show. */
+    .run-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      padding: 0 18px 6px;
+    }
+    .run-row:empty { display: none; }
+    .run-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      border: 1px solid var(--border-strong);
+      border-radius: 999px;
+      background: var(--card);
+      font-size: 12px;
+      cursor: pointer;
+    }
+    .run-chip .swatch { width: 10px; height: 10px; border-radius: 50%; }
+    .run-chip .who { color: var(--text-muted); }
+    .run-chip .st {
+      font-size: 10px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-muted);
+    }
+    .run-chip.selected {
+      border-color: var(--status-info);
+      background: rgba(37, 99, 235, 0.06);
+    }
+    .exp-section-head .hold-btn { font-size: 12px; padding: 4px 10px; }
     .btn-danger {
       background: var(--danger);
       border-color: var(--danger);
@@ -988,6 +1024,99 @@
       border-radius: 4px;
       background: var(--bg);
       color: var(--text-muted);
+    }
+
+    /* Vial groups (wizard steps 5-6): one experiment, several modes. */
+    .group-bar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      align-items: center;
+      margin: 0 0 12px;
+    }
+    .group-bar:empty { display: none; }
+    .group-tab {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 5px 10px;
+      border: 1px solid var(--border-strong);
+      border-radius: 999px;
+      background: var(--card);
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .group-tab .swatch { width: 10px; height: 10px; border-radius: 50%; }
+    .group-tab .count { color: var(--text-muted); font-weight: 500; }
+    .group-tab.active {
+      border-color: var(--status-info);
+      background: rgba(37, 99, 235, 0.06);
+    }
+    .group-add {
+      font-size: 12px;
+      padding: 5px 10px;
+    }
+    .group-editor {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 8px;
+      align-items: center;
+      margin-bottom: 8px;
+    }
+    .group-editor input {
+      padding: 6px 8px;
+      border: 1px solid var(--border-strong);
+      border-radius: 4px;
+      font-size: 13px;
+    }
+    .group-vials {
+      display: grid;
+      grid-template-columns: repeat(8, 1fr);
+      gap: 4px;
+      margin: 4px 0 14px;
+    }
+    .group-vial {
+      padding: 6px 0;
+      border: 1px solid var(--border-strong);
+      border-radius: 4px;
+      background: var(--card);
+      font-size: 11px;
+      font-weight: 600;
+      cursor: pointer;
+      text-align: center;
+      font-variant-numeric: tabular-nums;
+    }
+    .group-vial.in-active { color: #fff; }
+    .group-vial[disabled] { opacity: 0.35; cursor: not-allowed; }
+    .params-heading {
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      margin: 14px 0 0;
+    }
+    .params-heading:first-child { margin-top: 0; }
+    .review-group {
+      display: inline-block;
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      margin-right: 6px;
+      vertical-align: -1px;
+    }
+    /* Dashboard: group chip on a vial card */
+    .vial-group {
+      display: inline-block;
+      margin-left: 6px;
+      padding: 1px 6px;
+      border-radius: 999px;
+      font-size: 10px;
+      font-weight: 600;
+      color: #fff;
+      vertical-align: 1px;
+      letter-spacing: 0.01em;
     }
 
     /* Review pane */
@@ -1289,6 +1418,10 @@
     /* Consumables interlock (SPEC §15): won't auto-resume, so it reads as
        more severe than a manually-requested pause. */
     .maint-banner.consumables { background: var(--status-critical); }
+    /* Machine hold: every experiment's pumps, not one -- a distinct colour
+       so it is never mistaken for one experiment's maintenance. */
+    .maint-banner.machine-banner { background: #334155; }
+    .maint-banner.machine-banner .btn { color: #334155; }
     .maint-banner .icon {
       display: inline-flex;
       align-items: center;
@@ -1814,6 +1947,17 @@
     </span>
   </div>
 
+  <div class="maint-banner machine-banner" id="machine-banner" role="status" aria-live="polite">
+    <span class="icon" aria-hidden="true">✋</span>
+    <span class="text">
+      <strong>MACHINE HOLD</strong> — pumps held for every experiment.
+      <span class="countdown" id="machine-countdown"></span>
+    </span>
+    <span class="actions">
+      <button class="btn" id="machine-release-btn" type="button">Release</button>
+    </span>
+  </div>
+
   <main>
     <div class="section-head">
       <h2 class="section-title">Vials</h2>
@@ -1823,8 +1967,13 @@
 
     <section class="exp-section" aria-labelledby="exp-section-title">
       <div class="exp-section-head">
-        <h2 class="exp-section-title" id="exp-section-title">Experiment</h2>
+        <h2 class="exp-section-title" id="exp-section-title">Experiments</h2>
+        <button class="btn hold-btn" id="machine-hold-btn" type="button" hidden
+                title="Hold every experiment's pumps while you work on the machine (auto-resumes after 30 min)">
+          Hold all pumps
+        </button>
       </div>
+      <div class="run-row" id="run-row" role="tablist" aria-label="Loaded experiments"></div>
       <div class="exp-bar" id="exp-bar" data-status="idle" role="status">
         <span class="dot" aria-hidden="true"></span>
         <span class="exp-bar-text" id="exp-bar-text">
@@ -2160,7 +2309,7 @@
         <div class="wizard-step" data-step="2">2 · Media</div>
         <div class="wizard-step" data-step="3">3 · Vials</div>
         <div class="wizard-step" data-step="4">4 · Waste</div>
-        <div class="wizard-step" data-step="5">5 · Mode</div>
+        <div class="wizard-step" data-step="5">5 · Mode &amp; groups</div>
         <div class="wizard-step" data-step="6">6 · Parameters</div>
         <div class="wizard-step" data-step="7">7 · Review</div>
       </div>
@@ -2181,6 +2330,19 @@
             <textarea id="exp-notes" rows="3"
                       placeholder="Strain, media, expected duration…"></textarea>
           </div>
+          <div class="field-row">
+            <label class="field-label" for="exp-operator">Operator</label>
+            <input type="text" id="exp-operator" placeholder="Your name"
+                   autocomplete="off" maxlength="64">
+            <span class="field-help">
+              Shown on this experiment's vials, so whoever else is using the
+              machine knows whose they are.
+            </span>
+          </div>
+          <div class="field-row">
+            <label class="field-label" for="exp-expected-end">Expected end (optional)</label>
+            <input type="datetime-local" id="exp-expected-end">
+          </div>
         </div>
         <div class="wizard-pane" data-pane="2">
           <p class="field-help" style="margin: 0 0 12px;">
@@ -2188,6 +2350,14 @@
           </p>
           <div class="bottle-list" id="bottle-list"></div>
           <button class="btn add-bottle" id="add-bottle-btn" type="button">+ Add bottle</button>
+          <div class="field-row" id="share-bottle-row" hidden style="margin-top: 12px;">
+            <label class="field-label" for="share-bottle-select">Or share a bottle another experiment uses</label>
+            <div style="display:flex; gap:8px;">
+              <select id="share-bottle-select" style="flex:1"></select>
+              <button class="btn" id="share-bottle-btn" type="button">+ Share</button>
+            </div>
+            <span class="field-help">A shared bottle has one level: both experiments draw it down.</span>
+          </div>
         </div>
         <div class="wizard-pane" data-pane="3">
           <p class="field-help" style="margin: 0 0 12px;">
@@ -2197,6 +2367,12 @@
           <div class="legend" id="vial-bottle-legend"></div>
         </div>
         <div class="wizard-pane" data-pane="4">
+          <div class="waste-row" id="share-waste-row" hidden>
+            <div class="pl">Carboy</div>
+            <select id="w-vessel">
+              <option value="">A new carboy for this experiment</option>
+            </select>
+          </div>
           <div class="waste-row">
             <div class="pl">Container name (optional)</div>
             <input type="text" id="w-name" placeholder="Waste carboy" autocomplete="off">
@@ -2211,6 +2387,23 @@
           </div>
         </div>
         <div class="wizard-pane" data-pane="5">
+          <!-- Vial groups: one experiment whose vials run different modes or
+               parameters. With a single group this pane looks and submits
+               exactly as a single-mode experiment. -->
+          <div class="group-bar" id="group-bar-mode"></div>
+          <div id="group-editor-wrap" hidden>
+            <div class="group-editor">
+              <input type="text" id="group-name" maxlength="32"
+                     autocomplete="off" aria-label="Group name"
+                     placeholder="group name (a-z, 0-9, _ or -)">
+              <button class="btn" id="group-remove" type="button">Remove group</button>
+            </div>
+            <p class="field-help" style="margin: 0 0 4px;">
+              Click a vial to move it into this group. Vials not moved stay in
+              the first group.
+            </p>
+            <div class="group-vials" id="group-vials"></div>
+          </div>
           <div class="mode-grid" id="mode-grid">
             <button class="mode-card selected"
                     type="button"
@@ -2234,6 +2427,8 @@
           </div>
         </div>
         <div class="wizard-pane" data-pane="6">
+          <div class="group-bar" id="group-bar-params"></div>
+          <div class="params-heading" id="params-group-heading" hidden></div>
           <div class="params-shared">
             <div class="param-row">
               <div class="pl">Temperature</div>
@@ -2244,16 +2439,6 @@
               <div class="pl">Stir rate</div>
               <div class="pv" id="pv-stir">10</div>
               <input type="range" id="p-stir" min="0" max="15" step="1" value="10">
-            </div>
-            <div class="param-row">
-              <div class="pl">Vial volume</div>
-              <div class="pv" id="pv-vol">25 mL</div>
-              <input type="range" id="p-vol" min="10" max="40" step="1" value="25">
-            </div>
-            <div class="param-row" title="Seconds the efflux pump keeps running after each dilution's influx stops, so the efflux straw pins the working volume (SPEC §16.2). 0 disables volume regulation.">
-              <div class="pl">Efflux overrun</div>
-              <div class="pv" id="pv-effx">2 s</div>
-              <input type="range" id="p-effx" min="0" max="10" step="1" value="2">
             </div>
           </div>
           <div class="params-mode" data-params-mode="turbidostat">
@@ -2320,6 +2505,21 @@
               <div class="pl">Growth window</div>
               <div class="pv" id="pv-growthwin">30 min</div>
               <input type="range" id="p-growthwin" min="10" max="120" step="5" value="30">
+            </div>
+          </div>
+          <!-- Run-wide: straw height and overrun are fluidics facts, the same
+               for every vial whatever group it is in (run_config.RUN_WIDE_KEYS). -->
+          <div class="params-heading" id="params-run-heading" hidden>Run-wide · all vials</div>
+          <div class="params-run">
+            <div class="param-row">
+              <div class="pl">Vial volume</div>
+              <div class="pv" id="pv-vol">25 mL</div>
+              <input type="range" id="p-vol" min="10" max="40" step="1" value="25">
+            </div>
+            <div class="param-row" title="Seconds the efflux pump keeps running after each dilution's influx stops, so the efflux straw pins the working volume (SPEC §16.2). 0 disables volume regulation.">
+              <div class="pl">Efflux overrun</div>
+              <div class="pv" id="pv-effx">2 s</div>
+              <input type="range" id="p-effx" min="0" max="10" step="1" value="2">
             </div>
           </div>
         </div>
@@ -2670,38 +2870,69 @@
       renderOdAge(msg);
       if (modalState.vial !== null) renderModalReadings();
 
-      // Server includes a compact experiment summary on every sensor tick
-      // so the dashboard's status section updates without polling.
-      if (msg.experiment && msg.experiment.name) {
-        expState.name = msg.experiment.name;
-        expState.status = msg.experiment.status;
-        expState.vials = msg.experiment.vials || [];
-        if (typeof msg.experiment.elapsed_hours === "number") {
-          expState.elapsed_hours = msg.experiment.elapsed_hours;
+      // Server includes a compact summary of EVERY loaded experiment on each
+      // sensor tick (parallel experiments), so the status section, run chips
+      // and card ownership update without polling. The lens (selected
+      // experiment) feeds the single-experiment panels.
+      const runs = Array.isArray(msg.experiments)
+        ? msg.experiments.filter(Boolean)
+        : (msg.experiment ? [msg.experiment] : []);
+      if ("machine_hold" in msg) {
+        runsState.machineHold = msg.machine_hold;
+      }
+      const knewBefore = runsState.list.map(r => r.name).join(",");
+      runsState.list = runs;
+      const lensBefore = runsState.selected;
+      _reconcileLens();
+      renderRunRow();
+      renderMachineBanner();
+      const lens = runs.find(r => r.name === runsState.selected);
+      if (lens) {
+        if (lens.name !== expState.name || lensBefore !== runsState.selected
+            || knewBefore !== runs.map(r => r.name).join(",")) {
+          // A different experiment (or a new set of them): pull its full
+          // status (media, per-vial) rather than patch a stale snapshot.
+          refreshExperimentStatus();
+          return;
+        }
+        expState.status = lens.status;
+        expState.vials = lens.vials || [];
+        if (typeof lens.elapsed_hours === "number") {
+          expState.elapsed_hours = lens.elapsed_hours;
         }
         // Authoritative maintenance state from the server keeps the banner
         // countdown drift-free (the client-side ticker just fills the gap
         // between base-tick updates).
-        if (msg.experiment.maintenance) {
-          expState.maintenance = msg.experiment.maintenance;
+        if (lens.maintenance) {
+          expState.maintenance = lens.maintenance;
         }
+        if (Array.isArray(lens.groups)) {
+          expState.groups = lens.groups;
+          expState.grouped = !!lens.grouped;
+        }
+        if (typeof lens.preconditioned === "boolean") {
+          expState.preconditioned = lens.preconditioned;
+        }
+        expState.operator = lens.operator || "";
         renderExpBar();
         applyVialLocks();
         renderMaintenanceBanner();
         // Merge media-percent updates into the cached snapshot (full bottle
         // metadata stays in expState.media from the /status fetch).
-        _applyMediaSummary(msg.experiment.media_summary);
-        if (Array.isArray(msg.experiment.escalation_pending_vials)) {
-          expState.escalationPendingVials = msg.experiment.escalation_pending_vials;
+        _applyMediaSummary(lens.media_summary);
+        if (Array.isArray(lens.escalation_pending_vials)) {
+          expState.escalationPendingVials = lens.escalation_pending_vials;
         }
-        if (typeof msg.experiment.mode === "string") {
-          expState.mode = msg.experiment.mode;
+        if (typeof lens.mode === "string") {
+          expState.mode = lens.mode;
         }
         renderMorbidostatPanel();
-      } else if (expState.name && !msg.experiment) {
+      } else if (expState.name) {
         // Server reports no loaded experiment but we still have state cached;
         // a stop must have happened. Refresh from the authoritative source.
         refreshExperimentStatus();
+      } else {
+        applyVialLocks();
       }
     }
 
@@ -3319,6 +3550,10 @@
     // Experiment state, status bar, vial locks, and setup wizard
     // =================================================================
 
+    // Vial-group colours (dashboard chips, status bar, setup wizard). Distinct
+    // from BOTTLE_PALETTE (media) and PLOT_COLORS (per-vial traces).
+    const GROUP_PALETTE = ["#0f766e", "#b45309", "#6d28d9", "#be123c", "#1d4ed8", "#4d7c0f"];
+
     // Snapshot of the currently-loaded experiment, refreshed on connect
     // and on every `experiment_event` from the server.
     const expState = {
@@ -3333,7 +3568,150 @@
       morbidostat: null, // {per_vial: {"3": {drug_conc, growth_rate_per_hour, ...}}}
       perVial: {},       // {"0": {..., consumables_blocked: null|"media_empty"|"waste_full"}} from /status
       escalationPendingVials: [], // from sensor_update.experiment.escalation_pending_vials
+      groups: [],        // [{name, mode, vials}] -- vial groups (one implicit group when not grouped)
+      grouped: false,    // true when the experiment has explicit groups
+      preconditioned: false, // CREATED run holding its vials at run conditions
     };
+
+    // Vials the engine is driving right now: a RUNNING experiment's, or a
+    // CREATED one's while it holds run conditions for the OD blank. The
+    // server refuses manual control of exactly these (409).
+    // ---- Parallel experiments ----
+    // Every loaded experiment, compact (from sensor_update.experiments or
+    // GET /api/machine), plus which one is the LENS: expState above is the
+    // selected experiment, and every single-experiment panel below (status
+    // bar, media, maintenance, morbidostat, blank) shows that one. Vial cards
+    // show and lock by OWNER, whichever experiment that is.
+    const RUN_PALETTE = ["#1d4ed8", "#b45309", "#0f766e", "#be123c", "#6d28d9", "#4d7c0f", "#0e7490", "#a21caf"];
+    const runsState = {
+      list: [],          // [{name, status, operator, vials, groups, grouped, preconditioned, maintenance, ...}]
+      selected: null,    // the lens experiment's name
+      machineHold: null, // {active, reason, auto_resume_in_seconds, queued_pump_count} | null
+    };
+    try { runsState.selected = localStorage.getItem("evolver.lens") || null; } catch (_e) { /* private mode */ }
+
+    function _runIndex(name) {
+      return runsState.list.findIndex(r => r.name === name);
+    }
+    function _runColor(name) {
+      const idx = _runIndex(name);
+      return RUN_PALETTE[(idx < 0 ? 0 : idx) % RUN_PALETTE.length];
+    }
+    function _ownerRun(vial) {
+      return runsState.list.find(r =>
+        ["created", "running", "error"].includes(r.status)
+        && (r.vials || []).includes(vial)) || null;
+    }
+    function _drives(run) {
+      return run && (run.status === "running"
+        || (run.status === "created" && run.preconditioned));
+    }
+    // Vials an experiment is driving right now -- the ones the server
+    // refuses manual control of (409).
+    function _engineDrivenVials() {
+      const out = new Set();
+      runsState.list.forEach(r => { if (_drives(r)) (r.vials || []).forEach(v => out.add(v)); });
+      // The lens may be fresher than the list between pushes.
+      if (_drives(expState)) (expState.vials || []).forEach(v => out.add(v));
+      return out;
+    }
+    function _groupIndexOfVial(vial, run) {
+      const r = run || expState;
+      return (r.groups || []).findIndex(g => (g.vials || []).includes(vial));
+    }
+    function _hasMorbidostat() {
+      return expState.mode === "morbidostat"
+        || (expState.groups || []).some(g => g.mode === "morbidostat");
+    }
+    function selectRun(name) {
+      runsState.selected = name;
+      try { if (name) localStorage.setItem("evolver.lens", name); } catch (_e) { /* ignore */ }
+      renderRunRow();
+      refreshExperimentStatus();
+    }
+
+    const runRowEl = document.getElementById("run-row");
+    const machineHoldBtn = document.getElementById("machine-hold-btn");
+    function renderRunRow() {
+      runRowEl.innerHTML = "";
+      // One experiment needs no chooser; the status bar already names it.
+      if (runsState.list.length < 2) return;
+      runsState.list.forEach(r => {
+        const chip = document.createElement("button");
+        chip.type = "button";
+        chip.className = "run-chip" + (r.name === runsState.selected ? " selected" : "");
+        chip.setAttribute("role", "tab");
+        chip.setAttribute("aria-selected", r.name === runsState.selected ? "true" : "false");
+        chip.innerHTML = `<span class="swatch" style="background:${_runColor(r.name)}"></span>`
+          + `<strong>${escapeHtml(r.name)}</strong>`
+          + (r.operator ? ` <span class="who">· ${escapeHtml(r.operator)}</span>` : "")
+          + ` <span class="st">${escapeHtml(r.status)}${r.preconditioned ? " · held" : ""}</span>`;
+        chip.title = `Vials ${(r.vials || []).join(", ")}`
+          + (r.expected_end ? ` · expected end ${r.expected_end}` : "");
+        chip.addEventListener("click", () => selectRun(r.name));
+        runRowEl.appendChild(chip);
+      });
+    }
+
+    // Keep the lens pointing at a loaded experiment.
+    function _reconcileLens() {
+      const names = runsState.list.map(r => r.name);
+      if (!names.includes(runsState.selected)) {
+        runsState.selected = names.length ? names[0] : null;
+      }
+    }
+
+    // ---- Machine hold ----
+    const machineBanner = document.getElementById("machine-banner");
+    const machineCountdownEl = document.getElementById("machine-countdown");
+    function renderMachineBanner() {
+      const h = runsState.machineHold;
+      const anyRunning = runsState.list.some(r => r.status === "running");
+      machineHoldBtn.hidden = !anyRunning || !!(h && h.active);
+      if (!h || !h.active) {
+        machineBanner.classList.remove("show");
+        machineCountdownEl.textContent = "";
+        return;
+      }
+      machineBanner.classList.add("show");
+      const seconds = Math.max(0, Math.floor(Number(h.auto_resume_in_seconds) || 0));
+      const queued = Number(h.queued_pump_count || 0);
+      machineCountdownEl.textContent =
+        `Auto-resume in ${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`
+        + (queued > 0 ? ` · ${queued} dilution${queued === 1 ? "" : "s"} held` : "");
+    }
+    setInterval(() => {
+      const h = runsState.machineHold;
+      if (h && h.active && h.auto_resume_in_seconds > 0) {
+        h.auto_resume_in_seconds = Math.max(0, h.auto_resume_in_seconds - 1);
+        renderMachineBanner();
+      }
+    }, 1000);
+    machineHoldBtn.addEventListener("click", async () => {
+      const running = runsState.list.filter(r => r.status === "running").map(r => r.name);
+      if (!confirm(`Hold the pumps of EVERY experiment (${running.join(", ")}) while you ` +
+                   "work on the machine? Heaters, stir and readings continue; dilutions " +
+                   "are held and fire on release. Auto-resumes after 30 min.")) return;
+      try {
+        const d = await postJson("/api/machine/hold", {});
+        runsState.machineHold = d.machine_hold;
+        renderMachineBanner();
+        showToast("Machine hold — pumps held for every experiment", "ok");
+      } catch (err) {
+        showToast(`Hold failed: ${err.message}`, "error");
+      }
+    });
+    document.getElementById("machine-release-btn").addEventListener("click", async () => {
+      try {
+        const d = await postJson("/api/machine/release", {});
+        runsState.machineHold = null;
+        renderMachineBanner();
+        const fired = d.fired || 0;
+        showToast(fired ? `Released — fired ${fired} held dilution${fired === 1 ? "" : "s"}` : "Released", "ok");
+      } catch (err) {
+        showToast(`Release failed: ${err.message}`, "error");
+      }
+    });
 
     const expBar = document.getElementById("exp-bar");
     const expBarText = document.getElementById("exp-bar-text");
@@ -3343,7 +3721,17 @@
     // --- Render the experiment section ---
     function renderExpBar() {
       expBar.dataset.status = expState.status;
-      const name = expState.name ? `<strong>${escapeHtml(expState.name)}</strong>` : "";
+      const name = expState.name
+        ? `<strong>${escapeHtml(expState.name)}</strong>`
+          + (expState.operator ? ` <span class="muted">(${escapeHtml(expState.operator)})</span>` : "")
+        : "";
+      // Vial groups: name each group with its mode and colour so the bar
+      // reads as the legend for the card chips.
+      const groupStr = expState.grouped && (expState.groups || []).length
+        ? " · " + expState.groups.map((g, idx) =>
+            `<span class="vial-group" style="background:${_groupColor(idx)}">`
+            + `${escapeHtml(g.name)} · ${escapeHtml(g.mode)}</span>`).join("")
+        : "";
       const pumpStr = expState.pumpCount > 0
         ? ` · <span class="pump-count">${expState.pumpCount} pump${expState.pumpCount === 1 ? "" : "s"}</span>`
         : "";
@@ -3355,7 +3743,7 @@
           const elapsedStr = (typeof elapsed === "number")
             ? `${elapsed.toFixed(2)} h elapsed`
             : "live";
-          text = `Experiment ${name} running — <span class="muted">${elapsedStr} · ${expState.vials.length} vials${pumpStr}</span>`;
+          text = `Experiment ${name} running — <span class="muted">${elapsedStr} · ${expState.vials.length} vials${pumpStr}</span>${groupStr}`;
           const maintBtn = (expState.maintenance && expState.maintenance.active)
             ? ""  // banner has the resume button when in maintenance
             : `<button class="btn" id="exp-maint-btn" type="button">Maintenance</button>`;
@@ -3365,8 +3753,10 @@
           break;
         }
         case "created":
-          text = `Experiment ${name} created (not started) — <span class="muted">${expState.vials.length} vials</span>`;
-          actions = `<button class="btn btn-primary" id="exp-start-btn" type="button">Start</button>
+          text = `Experiment ${name} created (not started) — <span class="muted">${expState.vials.length} vials${
+            expState.preconditioned ? " · holding run conditions" : ""}</span>${groupStr}`;
+          actions = `<button class="btn" id="exp-new-btn" type="button">New experiment</button>
+                     <button class="btn btn-primary" id="exp-start-btn" type="button">Start</button>
                      <button class="btn" id="exp-delete-btn" type="button">Delete</button>`;
           break;
         case "stopped":
@@ -3404,7 +3794,7 @@
 
     // --- Refresh vial card locks based on expState ---
     function applyVialLocks() {
-      const lockedSet = new Set(expState.status === "running" ? expState.vials : []);
+      const lockedSet = _engineDrivenVials();
       const v2b = (expState.media && expState.media.vial_to_bottle) || {};
       const bottleIdxById = {};
       if (expState.media && expState.media.bottles) {
@@ -3415,7 +3805,7 @@
         if (!card) continue;
         if (lockedSet.has(i)) {
           card.classList.add("locked");
-          card.dataset.exp = expState.name || "";
+          card.dataset.exp = (_ownerRun(i) || expState).name || "";
           const blockedReason = (expState.perVial[String(i)] || {}).consumables_blocked || null;
           _setVialBottleDot(card, i, v2b, bottleIdxById, blockedReason);
         } else {
@@ -3423,6 +3813,7 @@
           card.removeAttribute("data-exp");
           _clearVialBottleDot(card);
         }
+        _setVialGroupChip(card, i);
       }
       // If the vial modal is open on a locked vial, refresh its disabled state.
       if (modalState.vial !== null) updateModalLockedState();
@@ -3458,6 +3849,33 @@
         dot.style.background = color;
         dot.title = `Media: ${bid}`;
       }
+    }
+    // The chip names who a vial belongs to: with several experiments loaded,
+    // the experiment (and its group); with one, its group when grouped.
+    function _setVialGroupChip(card, vial) {
+      const nameEl = card.querySelector(".vial-name");
+      if (!nameEl) return;
+      let chip = nameEl.querySelector(".vial-group");
+      const run = _ownerRun(vial);
+      const several = runsState.list.length > 1;
+      const gi = run && run.grouped ? _groupIndexOfVial(vial, run) : -1;
+      if (!run || (!several && gi < 0)) {
+        if (chip) chip.remove();
+        return;
+      }
+      if (!chip) {
+        chip = document.createElement("span");
+        chip.className = "vial-group";
+        nameEl.appendChild(chip);
+      }
+      const g = gi >= 0 ? run.groups[gi] : null;
+      chip.textContent = several
+        ? (g ? `${run.name} · ${g.name}` : run.name)
+        : g.name;
+      chip.style.background = several ? _runColor(run.name) : _groupColor(gi);
+      chip.title = `Experiment "${run.name}"`
+        + (run.operator ? ` (${run.operator})` : "")
+        + (g ? ` · group "${g.name}", ${g.mode}` : ` · ${run.mode || ""}`);
     }
     function _clearVialBottleDot(card) {
       const dot = card.querySelector(".bottle-dot");
@@ -3513,9 +3931,10 @@
     startMaintCountdown();
 
     async function enterMaintenance() {
-      if (!confirm("Enter maintenance mode? Pumps will be suppressed until you resume.")) return;
+      if (!confirm(`Enter maintenance mode for "${expState.name}"? Its pumps will be ` +
+                   "suppressed until you resume; other experiments keep running.")) return;
       try {
-        await postJson("/api/maintenance/enter", {});
+        await postJson(`/api/experiments/${encodeURIComponent(expState.name)}/maintenance/enter`, {});
         showToast("Maintenance mode entered — pumps disabled", "ok");
         await refreshExperimentStatus();
       } catch (err) {
@@ -3524,7 +3943,7 @@
     }
     async function exitMaintenance() {
       try {
-        const r = await postJson("/api/maintenance/exit", {});
+        const r = await postJson(`/api/experiments/${encodeURIComponent(expState.name)}/maintenance/exit`, {});
         const fired = r.fired || 0;
         showToast(
           fired > 0
@@ -3631,7 +4050,7 @@
     async function applyRefill(thenResume) {
       const payload = collectRefillPayload();
       try {
-        await postJson("/api/maintenance/refill", payload);
+        await postJson(`/api/experiments/${encodeURIComponent(expState.name)}/maintenance/refill`, payload);
         showToast("Levels updated", "ok");
         if (thenResume) {
           await exitMaintenance();
@@ -3779,7 +4198,7 @@
     function renderMorbidostatPanel() {
       if (
         !expState.morbidostat
-        || expState.mode !== "morbidostat"
+        || !_hasMorbidostat()
         || expState.status !== "running"
       ) {
         morbidostatPanel.classList.remove("show");
@@ -3865,12 +4284,21 @@
 
     function updateModalLockedState() {
       const i = modalState.vial;
-      const lockedSet = new Set(expState.status === "running" ? expState.vials : []);
+      const lockedSet = _engineDrivenVials();
       const isLocked = i !== null && lockedSet.has(i);
       const note = document.getElementById("locked-note");
       if (isLocked) {
-        note.textContent = `Vial ${i} is controlled by experiment "${expState.name}". ` +
-                           `Stop the experiment to take manual control.`;
+        const run = _ownerRun(i) || expState;
+        const gi = run.grouped ? _groupIndexOfVial(i, run) : -1;
+        const groupStr = gi >= 0
+          ? ` (group "${run.groups[gi].name}", ${run.groups[gi].mode})` : "";
+        const who = run.operator ? ` (${run.operator})` : "";
+        note.textContent = run.status === "created"
+          ? `Vial ${i}${groupStr} is being held at run conditions by experiment ` +
+            `"${run.name}"${who} for its OD blank. Start or stop the experiment ` +
+            `to change it.`
+          : `Vial ${i}${groupStr} is controlled by experiment "${run.name}"${who}. ` +
+            `Stop the experiment to take manual control.`;
         note.classList.add("show");
       } else {
         note.classList.remove("show");
@@ -3889,15 +4317,17 @@
     // --- Fetch the current experiment ---
     async function refreshExperimentStatus() {
       try {
-        const res = await fetch("/api/experiments");
+        // Every loaded experiment + the machine hold (parallel experiments);
+        // the lens is the selected one, else the first loaded.
+        const res = await fetch("/api/machine");
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
-        // Find any running, else created, else most recent stopped.
-        const list = data.experiments || [];
-        const running = list.find(e => e.status === "running");
-        const created = list.find(e => e.status === "created");
-        const errored = list.find(e => e.status === "error");
-        const loaded = running || created || errored;
+        runsState.list = data.experiments || [];
+        runsState.machineHold = data.machine_hold || null;
+        _reconcileLens();
+        renderRunRow();
+        renderMachineBanner();
+        const loaded = runsState.list.find(r => r.name === runsState.selected) || null;
         if (loaded) {
           // Get richer status from the per-experiment endpoint.
           try {
@@ -3913,6 +4343,10 @@
               expState.maintenance = s.maintenance || null;
               expState.morbidostat = s.morbidostat || null;
               expState.perVial = s.per_vial || {};
+              expState.groups = s.groups || [];
+              expState.grouped = !!s.grouped;
+              expState.preconditioned = !!s.preconditioned;
+              expState.operator = s.operator || "";
             } else {
               expState.name = loaded.name;
               expState.status = loaded.status;
@@ -3923,6 +4357,9 @@
               expState.maintenance = null;
               expState.morbidostat = null;
               expState.perVial = {};
+              expState.groups = [];
+              expState.grouped = false;
+              expState.preconditioned = false;
             }
           } catch {
             expState.name = loaded.name;
@@ -3933,6 +4370,9 @@
             expState.maintenance = null;
             expState.morbidostat = null;
             expState.perVial = {};
+            expState.groups = [];
+            expState.grouped = false;
+            expState.preconditioned = false;
           }
         } else {
           expState.name = null;
@@ -3944,6 +4384,9 @@
           expState.morbidostat = null;
           expState.perVial = {};
           expState.escalationPendingVials = [];
+          expState.groups = [];
+          expState.grouped = false;
+          expState.preconditioned = false;
         }
         renderExpBar();
         applyVialLocks();
@@ -4010,6 +4453,11 @@
       if (!expState.name) return;
       if (!confirm(`Delete experiment "${expState.name}" and all its data? This cannot be undone.`)) return;
       try {
+        if (expState.status === "created") {
+          // A loaded CREATED experiment cannot be deleted directly; stopping
+          // it first also parks any vials it was holding at run conditions.
+          await postJson(`/api/experiments/${encodeURIComponent(expState.name)}/stop`, {});
+        }
         const res = await fetch(`/api/experiments/${encodeURIComponent(expState.name)}`,
                                  { method: "DELETE" });
         const data = await res.json().catch(() => ({}));
@@ -4056,39 +4504,84 @@
       return idx >= 0 ? _bottleColor(idx) : "#9ca3af";
     }
 
+    // ---- Vial groups (ROADMAP Session Y / server/run_config.py) ----
+    // An experiment is one or more groups; each group has its own mode and
+    // its own copy of every per-group parameter below. With one group the
+    // wizard submits the legacy single-mode body, so a plain experiment is
+    // unchanged on disk.
+    //
+    // Adding a control mode to the wizard means one entry in each of:
+    // a mode card + params pane (HTML), MODE_PARAMS (API keys),
+    // MODE_REVIEW_ROWS (review step) and MODE_VALIDATORS (step 6).
+    const GROUP_NAME_RE = /^[a-z][a-z0-9_-]{0,31}$/;
+    // Keys that are the SAME for every vial whatever its group: the straw
+    // height and the overrun that engages it (run_config.RUN_WIDE_KEYS).
+    const RUN_WIDE_PARAM_KEYS = new Set(["volume", "efflux_extra"]);
+    // Per-group parameter defaults, filled from the HTML sliders' initial
+    // values by bindParamSlider so the defaults live in one place.
+    const GROUP_PARAM_DEFAULTS = {};
+
     const wizardState = {
       step: 1,
       name: "",
       notes: "",
-      mode: "turbidostat",
       params: {
-        // Shared across all modes
-        temperature: 37,
-        stir: 10,
-        volume: 25,         // mL
-        efflux_extra: 2,    // s of efflux past influx (straw pins volume)
-        // Turbidostat
-        lower: 0.20,
-        upper: 0.40,
-        wait: 15,           // minutes
-        // Chemostat
-        D: 0.5,             // dilution rate (vol/hr)
-        T: 60,              // bolus interval (seconds)
-        // Morbidostat
-        target_od: 0.40,
-        od_lower_m: 0.20,
-        wait_m: 15,         // minutes
-        drug_conc: 1.0,
-        drug_step: 2.0,
-        mu_thresh: 0.40,    // per hour
-        growth_window: 30,  // minutes
+        volume: 25,         // mL -- run-wide
+        efflux_extra: 2,    // s of efflux past influx (straw pins volume) -- run-wide
       },
+      // [{gid, name, mode, params: {temperature, stir, lower, upper, wait,
+      //   D, T, target_od, od_lower_m, wait_m, drug_conc, drug_step,
+      //   mu_thresh, growth_window}}]
+      groups: [],
+      activeGid: null,
+      // vial -> gid. A vial absent here (or pointing at a removed group)
+      // belongs to the FIRST group, so a single group always holds every
+      // experiment vial without bookkeeping.
+      vialGroup: {},
+      nextGid: 1,
       media: {
         bottles: [],           // {id, name, contents, initial_volume_ml, low_volume_alert_ml}
         vialToBottle: {},      // {"0": "bottle_a", ...}
         waste: { name: "", capacity_ml: 4000, high_fill_alert_ml: 3600 },
       },
     };
+
+    function _groupColor(index) {
+      return GROUP_PALETTE[index % GROUP_PALETTE.length];
+    }
+    function _activeGroup() {
+      return wizardState.groups.find(g => g.gid === wizardState.activeGid)
+        || wizardState.groups[0];
+    }
+    function _groupOfVial(vial) {
+      const gid = wizardState.vialGroup[String(vial)];
+      return wizardState.groups.find(g => g.gid === gid) || wizardState.groups[0];
+    }
+    function _groupVials(group) {
+      return _derivedVials().filter(v => _groupOfVial(v) === group);
+    }
+    function _isGrouped() {
+      return wizardState.groups.length > 1;
+    }
+    function _suggestGroupName() {
+      const used = new Set(wizardState.groups.map(g => g.name));
+      for (let i = 1; i < 100; i++) {
+        if (!used.has(`group_${i}`)) return `group_${i}`;
+      }
+      return `group_${Date.now()}`;
+    }
+    function _newGroup(copyFrom) {
+      const g = {
+        gid: wizardState.nextGid++,
+        name: _suggestGroupName(),
+        mode: copyFrom ? copyFrom.mode : "turbidostat",
+        // A new group starts as a copy of the one it was split from, so a
+        // temperature or dilution-rate series is one slider per group.
+        params: { ...(copyFrom ? copyFrom.params : GROUP_PARAM_DEFAULTS) },
+      };
+      wizardState.groups.push(g);
+      return g;
+    }
     function _derivedVials() {
       return Object.keys(wizardState.media.vialToBottle)
         .map(Number).sort((a, b) => a - b);
@@ -4107,7 +4600,10 @@
       wizardState.step = 1;
       wizardState.name = "";
       wizardState.notes = "";
-      wizardState.mode = "turbidostat";
+      wizardState.groups = [];
+      wizardState.vialGroup = {};
+      wizardState.nextGid = 1;
+      wizardState.activeGid = _newGroup(null).gid;
       wizardState.media = {
         bottles: [],
         vialToBottle: {},
@@ -4117,22 +4613,88 @@
       _appendBottle();
       document.getElementById("exp-name").value = "";
       document.getElementById("exp-notes").value = "";
+      let lastOperator = "";
+      try { lastOperator = localStorage.getItem("evolver.operator") || ""; } catch (_e) { /* ignore */ }
+      document.getElementById("exp-operator").value = lastOperator;
+      document.getElementById("exp-expected-end").value = "";
       wasteNameEl.value = "";
       wasteCapacityEl.value = "4000";
       wasteHighEl.value = "3600";
+      wasteVesselEl.value = "";
+      _applyWasteVesselChoice();
       renderBottleList();
       buildVialBottleGrid();
-      // Select default mode card visually
-      [...modeGrid.querySelectorAll(".mode-card")].forEach(c => {
-        c.classList.toggle("selected", c.dataset.mode === wizardState.mode);
-      });
-      // Show the parameter pane that matches the current mode.
-      applyParamPaneVisibility();
+      renderGroupUI();
+      loadShareableVessels();
       gotoStep(1);
       expModal.hidden = false;
       requestAnimationFrame(() => expModal.classList.add("open"));
       document.getElementById("exp-name").focus();
     }
+
+    // ---- Shared vessels (parallel experiments) ----
+    // A bottle or carboy another experiment uses can be shared: one level,
+    // debited by both. The server fills in its size from the vessel registry.
+    const shareBottleRow = document.getElementById("share-bottle-row");
+    const shareBottleSelect = document.getElementById("share-bottle-select");
+    const shareWasteRow = document.getElementById("share-waste-row");
+    const wasteVesselEl = document.getElementById("w-vessel");
+    let shareableVessels = [];
+
+    function _vesselLabel(v) {
+      const users = (v.users || []).length ? ` · used by ${v.users.join(", ")}` : "";
+      if (v.kind === "waste") {
+        return `${v.name || v.id} — ${Math.round(v.level_ml || 0)} / ${Math.round(v.capacity_ml || 0)} mL full${users}`;
+      }
+      const left = Math.max(0, (v.initial_volume_ml || 0) - (v.level_ml || 0));
+      return `${v.name || v.id} — ${Math.round(left)} mL left${users}`;
+    }
+
+    async function loadShareableVessels() {
+      try {
+        const res = await fetch("/api/vessels");
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        shareableVessels = (await res.json()).vessels || [];
+      } catch (_e) {
+        shareableVessels = [];
+      }
+      // Only vessels a loaded experiment is using are worth offering.
+      const inUse = shareableVessels.filter(v => (v.users || []).length);
+      const media = inUse.filter(v => v.kind === "media");
+      const waste = inUse.filter(v => v.kind === "waste");
+      shareBottleSelect.innerHTML = media.map(v =>
+        `<option value="${escapeHtml(v.id)}">${escapeHtml(_vesselLabel(v))}</option>`).join("");
+      shareBottleRow.hidden = media.length === 0;
+      wasteVesselEl.innerHTML = `<option value="">A new carboy for this experiment</option>`
+        + waste.map(v =>
+          `<option value="${escapeHtml(v.id)}">Share: ${escapeHtml(_vesselLabel(v))}</option>`).join("");
+      shareWasteRow.hidden = waste.length === 0;
+    }
+
+    function _applyWasteVesselChoice() {
+      const shared = !!wasteVesselEl.value;
+      [wasteNameEl, wasteCapacityEl, wasteHighEl].forEach(el => { el.disabled = shared; });
+    }
+    wasteVesselEl.addEventListener("change", _applyWasteVesselChoice);
+
+    document.getElementById("share-bottle-btn").addEventListener("click", () => {
+      const vid = shareBottleSelect.value;
+      const v = shareableVessels.find(x => x.id === vid);
+      if (!v) return;
+      if (wizardState.media.bottles.some(b => b.vessel === vid)) {
+        showToast("That bottle is already in this experiment.", "error");
+        return;
+      }
+      wizardState.media.bottles.push({
+        id: _nextBottleId(),
+        vessel: vid,
+        name: v.name || vid,
+        contents: v.contents || "",
+        initial_volume_ml: v.initial_volume_ml || 0,
+        low_volume_alert_ml: v.low_volume_alert_ml || 0,
+      });
+      renderBottleList();
+    });
 
     function _appendBottle() {
       const id = _nextBottleId();
@@ -4171,6 +4733,8 @@
       wizardNext.textContent = step === REVIEW_STEP ? "Create & Start" : "Next";
       // Refresh the vial grid whenever we land on it (bottles list may have changed).
       if (step === 3) buildVialBottleGrid();
+      // Groups draw from the vials assigned in step 3, so re-render on entry.
+      if (step === 5 || step === 6) renderGroupUI();
       if (step === REVIEW_STEP) renderReview();
     }
 
@@ -4194,6 +4758,18 @@
           showToast("Name must start with alphanumeric, then [a-zA-Z0-9_-], up to 64 chars.", "error");
           return false;
         }
+        if (runsState.list.some(r => r.name === wizardState.name)) {
+          showToast(`An experiment named "${wizardState.name}" is already loaded.`, "error");
+          return false;
+        }
+        wizardState.operator = document.getElementById("exp-operator").value.trim();
+        if (!wizardState.operator) {
+          showToast("Enter the operator's name, so others can see whose vials these are.", "error");
+          return false;
+        }
+        try { localStorage.setItem("evolver.operator", wizardState.operator); } catch (_e) { /* ignore */ }
+        const endVal = document.getElementById("exp-expected-end").value;
+        wizardState.expectedEnd = endVal ? new Date(endVal).toISOString() : null;
       }
       if (step === 2) {
         // Media bottles
@@ -4203,6 +4779,7 @@
           return false;
         }
         for (const b of wizardState.media.bottles) {
+          if (b.vessel) continue;  // a shared vessel brings its own name and size
           if (!b.name.trim()) {
             showToast("Every bottle needs a name.", "error");
             return false;
@@ -4219,7 +4796,10 @@
           return false;
         }
       }
-      if (step === 4) {
+      if (step === 4 && wasteVesselEl.value) {
+        // Shared carboy: its size and alert level are the vessel's.
+        wizardState.media.waste = { vessel: wasteVesselEl.value };
+      } else if (step === 4) {
         const cap = parseFloat(wasteCapacityEl.value);
         const high = parseFloat(wasteHighEl.value);
         if (!(cap > 0)) {
@@ -4237,34 +4817,39 @@
         };
       }
       if (step === 5) {
-        if (!["turbidostat", "chemostat", "morbidostat"].includes(wizardState.mode)) {
-          showToast(`Mode "${wizardState.mode}" is not implemented.`, "error");
-          return false;
+        const names = new Set();
+        for (const g of wizardState.groups) {
+          if (!MODE_PARAMS[g.mode]) {
+            showToast(`Mode "${g.mode}" is not implemented.`, "error");
+            return false;
+          }
+          if (!_isGrouped()) continue;
+          if (!GROUP_NAME_RE.test(g.name)) {
+            showToast(`Group name "${g.name}" must start with a-z, then a-z, 0-9, _ or -.`, "error");
+            wizardState.activeGid = g.gid;
+            renderGroupUI();
+            return false;
+          }
+          if (names.has(g.name)) {
+            showToast(`Two groups are named "${g.name}".`, "error");
+            return false;
+          }
+          names.add(g.name);
+          if (_groupVials(g).length === 0) {
+            showToast(`Group "${g.name}" has no vials — move some in or remove it.`, "error");
+            wizardState.activeGid = g.gid;
+            renderGroupUI();
+            return false;
+          }
         }
       }
       if (step === 6) {
-        const p = wizardState.params;
-        if (wizardState.mode === "turbidostat") {
-          if (p.lower >= p.upper) {
-            showToast("Lower OD threshold must be less than upper.", "error");
-            return false;
-          }
-        } else if (wizardState.mode === "chemostat") {
-          if (!(p.D > 0)) {
-            showToast("Dilution rate must be > 0.", "error");
-            return false;
-          }
-          if (!(p.T > 0)) {
-            showToast("Bolus interval must be > 0.", "error");
-            return false;
-          }
-        } else if (wizardState.mode === "morbidostat") {
-          if (p.od_lower_m >= p.target_od) {
-            showToast("Lower OD must be less than target OD.", "error");
-            return false;
-          }
-          if (!(p.drug_step > 1.0)) {
-            showToast("Escalation step must be > 1.0x.", "error");
+        for (const g of wizardState.groups) {
+          const problem = (MODE_VALIDATORS[g.mode] || (() => null))(g.params);
+          if (problem) {
+            showToast(_isGrouped() ? `Group "${g.name}": ${problem}` : problem, "error");
+            wizardState.activeGid = g.gid;
+            renderGroupUI();
             return false;
           }
         }
@@ -4272,12 +4857,195 @@
       return true;
     }
 
-    // Show only the parameter pane matching the currently-selected mode.
+    // Per-mode wizard behaviour, keyed by mode name. The API parameter
+    // names for a group's mode-specific settings:
+    const MODE_PARAMS = {
+      turbidostat: q => ({
+        od_lower_thresh: q.lower,
+        od_upper_thresh: q.upper,
+        pump_wait_minutes: q.wait,
+      }),
+      chemostat: q => ({
+        dilution_rate_per_hour: q.D,
+        bolus_interval_seconds: q.T,
+      }),
+      morbidostat: q => ({
+        target_od: q.target_od,
+        od_lower: q.od_lower_m,
+        pump_wait_minutes: q.wait_m,
+        initial_drug_conc: q.drug_conc,
+        drug_step: q.drug_step,
+        adaptation_threshold_per_hour: q.mu_thresh,
+        growth_window_seconds: q.growth_window * 60,
+      }),
+    };
+    // Client-side sanity checks (the server re-validates everything).
+    const MODE_VALIDATORS = {
+      turbidostat: q => (q.lower >= q.upper
+        ? "Lower OD threshold must be less than upper." : null),
+      chemostat: q => (!(q.D > 0) ? "Dilution rate must be > 0."
+        : !(q.T > 0) ? "Bolus interval must be > 0." : null),
+      morbidostat: q => (q.od_lower_m >= q.target_od
+        ? "Lower OD must be less than target OD."
+        : !(q.drug_step > 1.0) ? "Escalation step must be > 1.0x." : null),
+    };
+    const MODE_REVIEW_ROWS = {
+      turbidostat: q => `
+        <dt>OD bounds</dt><dd>${q.lower.toFixed(2)} -> ${q.upper.toFixed(2)}</dd>
+        <dt>Pump wait</dt><dd>${q.wait} min</dd>`,
+      chemostat: q => `
+        <dt>Dilution rate</dt><dd>${q.D.toFixed(2)} vol/hr</dd>
+        <dt>Bolus interval</dt><dd>${q.T} s</dd>`,
+      morbidostat: q => `
+        <dt>Target OD</dt><dd>${q.target_od.toFixed(2)}</dd>
+        <dt>OD lower (math)</dt><dd>${q.od_lower_m.toFixed(2)}</dd>
+        <dt>Pump wait</dt><dd>${q.wait_m} min</dd>
+        <dt>Drug conc / step</dt><dd>${q.drug_conc.toFixed(2)}x -> x${q.drug_step.toFixed(1)} per escalation</dd>
+        <dt>Adaptation threshold</dt><dd>${q.mu_thresh.toFixed(2)} /hr</dd>
+        <dt>Growth window</dt><dd>${q.growth_window} min</dd>`,
+    };
+
+    // Show only the parameter pane matching the active group's mode.
     function applyParamPaneVisibility() {
+      const mode = _activeGroup().mode;
       document.querySelectorAll(".params-mode").forEach(el => {
-        el.hidden = el.dataset.paramsMode !== wizardState.mode;
+        el.hidden = el.dataset.paramsMode !== mode;
       });
     }
+
+    // ---- Group UI (steps 5 and 6) ----
+    const groupBarMode = document.getElementById("group-bar-mode");
+    const groupBarParams = document.getElementById("group-bar-params");
+    const groupEditorWrap = document.getElementById("group-editor-wrap");
+    const groupNameEl = document.getElementById("group-name");
+    const groupRemoveBtn = document.getElementById("group-remove");
+    const groupVialsEl = document.getElementById("group-vials");
+    const paramsGroupHeading = document.getElementById("params-group-heading");
+    const paramsRunHeading = document.getElementById("params-run-heading");
+
+    function _renderGroupBar(el, withAdd) {
+      el.innerHTML = "";
+      const grouped = _isGrouped();
+      if (grouped) {
+        wizardState.groups.forEach((g, idx) => {
+          const tab = document.createElement("button");
+          tab.type = "button";
+          tab.className = "group-tab" + (g === _activeGroup() ? " active" : "");
+          tab.innerHTML = `<span class="swatch" style="background:${_groupColor(idx)}"></span>`
+            + `${escapeHtml(g.name || "(unnamed)")}`
+            + ` <span class="count">${escapeHtml(g.mode)} · ${_groupVials(g).length}</span>`;
+          tab.addEventListener("click", () => {
+            wizardState.activeGid = g.gid;
+            renderGroupUI();
+          });
+          el.appendChild(tab);
+        });
+      }
+      if (withAdd) {
+        const add = document.createElement("button");
+        add.type = "button";
+        add.className = "btn group-add";
+        add.textContent = grouped ? "+ Add group" : "+ Split vials into groups";
+        add.title = "Run some vials under a different mode or different parameters";
+        add.addEventListener("click", () => {
+          const g = _newGroup(_activeGroup());
+          wizardState.activeGid = g.gid;
+          renderGroupUI();
+          groupNameEl.focus();
+          groupNameEl.select();
+        });
+        el.appendChild(add);
+      }
+    }
+
+    function _renderGroupVials() {
+      groupVialsEl.innerHTML = "";
+      const active = _activeGroup();
+      const inExperiment = new Set(_derivedVials());
+      for (let i = 0; i < N_VIALS; i++) {
+        const cell = document.createElement("button");
+        cell.type = "button";
+        cell.className = "group-vial";
+        cell.textContent = String(i);
+        if (!inExperiment.has(i)) {
+          cell.disabled = true;
+          cell.title = "Not in this experiment (no media bottle in step 3)";
+        } else {
+          const g = _groupOfVial(i);
+          const color = _groupColor(wizardState.groups.indexOf(g));
+          cell.style.borderColor = color;
+          if (g === active) {
+            cell.classList.add("in-active");
+            cell.style.background = color;
+          }
+          cell.title = `In group "${g.name}"`;
+          cell.addEventListener("click", () => {
+            const first = wizardState.groups[0];
+            if (g === active) {
+              // Clicking a vial already here returns it to the first group.
+              if (active === first) return;
+              delete wizardState.vialGroup[String(i)];
+            } else {
+              wizardState.vialGroup[String(i)] = active.gid;
+            }
+            renderGroupUI();
+          });
+        }
+        groupVialsEl.appendChild(cell);
+      }
+    }
+
+    function _syncParamSliders() {
+      const q = _activeGroup().params;
+      for (const { id, key, format } of PARAM_SLIDERS) {
+        if (RUN_WIDE_PARAM_KEYS.has(key)) continue;
+        const slider = document.getElementById(`p-${id}`);
+        const display = document.getElementById(`pv-${id}`);
+        if (typeof q[key] === "number") slider.value = String(q[key]);
+        display.textContent = format(parseFloat(slider.value));
+      }
+    }
+
+    function renderGroupUI() {
+      if (wizardState.groups.length === 0) return;
+      const active = _activeGroup();
+      const grouped = _isGrouped();
+      _renderGroupBar(groupBarMode, true);
+      _renderGroupBar(groupBarParams, false);
+      groupEditorWrap.hidden = !grouped;
+      if (grouped) {
+        groupNameEl.value = active.name;
+        _renderGroupVials();
+      }
+      [...modeGrid.querySelectorAll(".mode-card")].forEach(c => {
+        c.classList.toggle("selected", c.dataset.mode === active.mode);
+      });
+      paramsGroupHeading.hidden = !grouped;
+      paramsRunHeading.hidden = !grouped;
+      if (grouped) {
+        paramsGroupHeading.textContent =
+          `Group "${active.name}" · ${active.mode} · vials ${_groupVials(active).join(", ") || "—"}`;
+      }
+      _syncParamSliders();
+      applyParamPaneVisibility();
+    }
+
+    groupNameEl.addEventListener("input", () => {
+      _activeGroup().name = groupNameEl.value.trim().toLowerCase();
+      _renderGroupBar(groupBarMode, true);
+      _renderGroupBar(groupBarParams, false);
+    });
+    groupRemoveBtn.addEventListener("click", () => {
+      if (!_isGrouped()) return;
+      const active = _activeGroup();
+      wizardState.groups = wizardState.groups.filter(g => g !== active);
+      // Its vials fall back to the first group (see wizardState.vialGroup).
+      for (const [v, gid] of Object.entries(wizardState.vialGroup)) {
+        if (gid === active.gid) delete wizardState.vialGroup[v];
+      }
+      wizardState.activeGid = wizardState.groups[0].gid;
+      renderGroupUI();
+    });
 
     // ---- Bottle list management (step 2) ----
     function renderBottleList() {
@@ -4287,11 +5055,12 @@
         row.className = "bottle-row";
         row.dataset.idx = String(idx);
         const color = _bottleColor(idx);
+        const shared = !!b.vessel;
         row.innerHTML = `
           <span class="swatch" style="background:${color}"></span>
-          <input type="text" class="b-name" placeholder="Bottle name (e.g. LB)" value="${escapeHtml(b.name)}">
-          <input type="text" class="b-contents" placeholder="Contents (optional)" value="${escapeHtml(b.contents || "")}">
-          <input type="number" class="b-vol" min="1" step="50" value="${b.initial_volume_ml}" title="Initial volume (mL)">
+          <input type="text" class="b-name" placeholder="Bottle name (e.g. LB)" value="${escapeHtml(b.name)}"${shared ? " disabled" : ""}>
+          <input type="text" class="b-contents" placeholder="Contents (optional)" value="${escapeHtml(shared ? `shared · ${b.vessel}` : (b.contents || ""))}"${shared ? " disabled" : ""}>
+          <input type="number" class="b-vol" min="1" step="50" value="${b.initial_volume_ml}" title="${shared ? "Size of the shared bottle" : "Initial volume (mL)"}"${shared ? " disabled" : ""}>
           <button class="remove" type="button" aria-label="Remove">×</button>
         `;
         row.querySelector(".b-name").addEventListener("input", (e) => {
@@ -4325,7 +5094,7 @@
       // before validation (oninput already does this, but be safe).
       bottleListEl.querySelectorAll(".bottle-row").forEach((row, idx) => {
         const b = wizardState.media.bottles[idx];
-        if (!b) return;
+        if (!b || b.vessel) return;  // shared: the vessel's values stand
         b.name = row.querySelector(".b-name").value;
         b.contents = row.querySelector(".b-contents").value;
         const v = parseFloat(row.querySelector(".b-vol").value);
@@ -4341,10 +5110,15 @@
     function buildVialBottleGrid() {
       vialBottleGrid.innerHTML = "";
       vialBottleLegend.innerHTML = "";
-      const lockedOther = new Set(
-        expState.status === "running" || expState.status === "created"
-          ? expState.vials : []
-      );
+      // Vials another loaded experiment holds (created, running or error)
+      // cannot be in this one.
+      const ownerOf = {};
+      runsState.list.forEach(r => {
+        if (["created", "running", "error"].includes(r.status)) {
+          (r.vials || []).forEach(v => { ownerOf[v] = r; });
+        }
+      });
+      const lockedOther = new Set(Object.keys(ownerOf).map(Number));
       // Legend
       wizardState.media.bottles.forEach((b, idx) => {
         const tag = document.createElement("span");
@@ -4379,7 +5153,8 @@
         if (lockedOther.has(i)) {
           cell.classList.add("locked-other");
           cell.disabled = true;
-          cell.title = `Already in experiment "${expState.name}"`;
+          const o = ownerOf[i];
+          cell.title = `In experiment "${o.name}"` + (o.operator ? ` (${o.operator})` : "");
         } else {
           cell.addEventListener("click", () => _cycleVialAssignment(i));
         }
@@ -4403,28 +5178,39 @@
       buildVialBottleGrid();
     }
 
-    // Mode selection (step 5 — was step 3 pre-media)
+    // Mode selection (step 5): sets the ACTIVE group's mode.
     modeGrid.addEventListener("click", (e) => {
       const card = e.target.closest(".mode-card");
       if (!card || card.disabled) return;
-      [...modeGrid.querySelectorAll(".mode-card")].forEach(c => c.classList.remove("selected"));
-      card.classList.add("selected");
-      wizardState.mode = card.dataset.mode;
-      applyParamPaneVisibility();
+      _activeGroup().mode = card.dataset.mode;
+      renderGroupUI();
     });
 
-    // Parameters (step 4)
+    // Parameters (step 6). Run-wide keys write to wizardState.params; every
+    // other key writes to the active group, so switching group tabs swaps
+    // the slider values (see _syncParamSliders).
+    const PARAM_SLIDERS = [];
     function bindParamSlider(id, key, format) {
       const slider = document.getElementById(`p-${id}`);
       const display = document.getElementById(`pv-${id}`);
+      PARAM_SLIDERS.push({ id, key, format });
       slider.addEventListener("input", () => {
         const v = parseFloat(slider.value);
-        wizardState.params[key] = v;
+        if (RUN_WIDE_PARAM_KEYS.has(key)) {
+          wizardState.params[key] = v;
+        } else {
+          _activeGroup().params[key] = v;
+        }
         display.textContent = format(v);
       });
-      // Initialise display
-      display.textContent = format(parseFloat(slider.value));
-      wizardState.params[key] = parseFloat(slider.value);
+      // Initialise display, and record the default from the HTML.
+      const initial = parseFloat(slider.value);
+      display.textContent = format(initial);
+      if (RUN_WIDE_PARAM_KEYS.has(key)) {
+        wizardState.params[key] = initial;
+      } else {
+        GROUP_PARAM_DEFAULTS[key] = initial;
+      }
     }
     bindParamSlider("temp", "temperature", v => `${v.toFixed(1)} °C`);
     bindParamSlider("stir", "stir", v => `${v}`);
@@ -4450,6 +5236,7 @@
     function renderReview() {
       const p = wizardState.params;
       const vials = _derivedVials();
+      const grouped = _isGrouped();
       const bottles = wizardState.media.bottles;
       // Group vials by bottle for a compact display.
       const byBottle = {};
@@ -4467,97 +5254,100 @@
       const w = wizardState.media.waste;
       const sharedRows = `
         <dt>Name</dt><dd>${escapeHtml(wizardState.name)}</dd>
+        <dt>Operator</dt><dd>${escapeHtml(wizardState.operator || "")}${
+          wizardState.expectedEnd ? ` <span class="muted">· until ${escapeHtml(new Date(wizardState.expectedEnd).toLocaleString())}</span>` : ""}</dd>
         <dt>Notes</dt><dd>${escapeHtml(wizardState.notes) || "<span class='muted'>—</span>"}</dd>
         <dt>Vials</dt><dd>${vials.join(", ")}
                           <span class="muted">(${vials.length})</span></dd>
         <dt>Media</dt><dd>${mediaSummary}</dd>
-        <dt>Waste</dt><dd>${escapeHtml(w.name) || "Carboy"} — ${w.capacity_ml} mL (alert at ${w.high_fill_alert_ml})</dd>
-        <dt>Mode</dt><dd>${escapeHtml(wizardState.mode)}</dd>
-        <dt>Temperature</dt><dd>${p.temperature.toFixed(1)} °C</dd>
-        <dt>Stir</dt><dd>${p.stir}</dd>
+        <dt>Waste</dt><dd>${w.vessel
+          ? `shared carboy <strong>${escapeHtml(w.vessel)}</strong>`
+          : `${escapeHtml(w.name) || "Carboy"} — ${w.capacity_ml} mL (alert at ${w.high_fill_alert_ml})`}</dd>
         <dt>Volume</dt><dd>${p.volume} mL</dd>
         <dt>Efflux overrun</dt><dd>${p.efflux_extra} s</dd>
       `;
-      const modeRows = {
-        turbidostat: () => `
-          <dt>OD bounds</dt><dd>${p.lower.toFixed(2)} -> ${p.upper.toFixed(2)}</dd>
-          <dt>Pump wait</dt><dd>${p.wait} min</dd>
-        `,
-        chemostat: () => `
-          <dt>Dilution rate</dt><dd>${p.D.toFixed(2)} vol/hr</dd>
-          <dt>Bolus interval</dt><dd>${p.T} s</dd>
-        `,
-        morbidostat: () => `
-          <dt>Target OD</dt><dd>${p.target_od.toFixed(2)}</dd>
-          <dt>OD lower (math)</dt><dd>${p.od_lower_m.toFixed(2)}</dd>
-          <dt>Pump wait</dt><dd>${p.wait_m} min</dd>
-          <dt>Drug conc / step</dt><dd>${p.drug_conc.toFixed(2)}x -> x${p.drug_step.toFixed(1)} per escalation</dd>
-          <dt>Adaptation threshold</dt><dd>${p.mu_thresh.toFixed(2)} /hr</dd>
-          <dt>Growth window</dt><dd>${p.growth_window} min</dd>
-        `,
-      };
-      const renderRows = modeRows[wizardState.mode] || modeRows.turbidostat;
-      reviewDl.innerHTML = sharedRows + renderRows();
+      const groupRows = wizardState.groups.map((g, idx) => {
+        const q = g.params;
+        const header = grouped
+          ? `<dt>Group</dt><dd><span class="review-group" style="background:${_groupColor(idx)}"></span>`
+            + `<strong>${escapeHtml(g.name)}</strong> — vials [${_groupVials(g).join(", ")}]</dd>`
+          : "";
+        return header + `
+          <dt>Mode</dt><dd>${escapeHtml(g.mode)}</dd>
+          <dt>Temperature</dt><dd>${q.temperature.toFixed(1)} °C</dd>
+          <dt>Stir</dt><dd>${q.stir}</dd>`
+          + (MODE_REVIEW_ROWS[g.mode] || (() => ""))(q);
+      }).join("");
+      reviewDl.innerHTML = sharedRows + groupRows;
     }
 
     // Submit: create then start
     async function submitExperiment() {
       const p = wizardState.params;
-      const sharedParams = {
-        temperature_c: p.temperature,
-        stir_rate: p.stir,
+      // Run-wide: identical for every vial (run_config.RUN_WIDE_KEYS).
+      const runParams = {
         volume_ml: p.volume,
         efflux_extra_seconds: p.efflux_extra,
       };
-      const modeParams = ({
-        turbidostat: () => ({
-          od_lower_thresh: p.lower,
-          od_upper_thresh: p.upper,
-          pump_wait_minutes: p.wait,
-        }),
-        chemostat: () => ({
-          dilution_rate_per_hour: p.D,
-          bolus_interval_seconds: p.T,
-        }),
-        morbidostat: () => ({
-          target_od: p.target_od,
-          od_lower: p.od_lower_m,
-          pump_wait_minutes: p.wait_m,
-          initial_drug_conc: p.drug_conc,
-          drug_step: p.drug_step,
-          adaptation_threshold_per_hour: p.mu_thresh,
-          growth_window_seconds: p.growth_window * 60,
-        }),
-      }[wizardState.mode] || (() => ({})))();
+      const groupParams = g => ({
+        temperature_c: g.params.temperature,
+        stir_rate: g.params.stir,
+        ...(MODE_PARAMS[g.mode] || (() => ({})))(g.params),
+      });
       const body = {
         name: wizardState.name,
         notes: wizardState.notes,
-        mode: wizardState.mode,
         // vials are derived server-side from media.vial_to_bottle, but we
         // send them explicitly for clarity (the server validates the match).
         vials: _derivedVials(),
-        params: { ...sharedParams, ...modeParams },
+        operator: wizardState.operator || "",
+        expected_end: wizardState.expectedEnd || null,
         media: {
-          bottles: wizardState.media.bottles.map(b => ({
-            id: b.id,
-            name: b.name.trim(),
-            contents: (b.contents || "").trim(),
-            initial_volume_ml: b.initial_volume_ml,
-            low_volume_alert_ml: b.low_volume_alert_ml,
-          })),
+          bottles: wizardState.media.bottles.map(b => (b.vessel
+            // Shared: the vessel id; the server fills in its size.
+            ? { id: b.id, vessel: b.vessel }
+            : {
+              id: b.id,
+              name: b.name.trim(),
+              contents: (b.contents || "").trim(),
+              initial_volume_ml: b.initial_volume_ml,
+              low_volume_alert_ml: b.low_volume_alert_ml,
+            })),
           vial_to_bottle: { ...wizardState.media.vialToBottle },
-          waste: {
-            name: wizardState.media.waste.name,
-            capacity_ml: wizardState.media.waste.capacity_ml,
-            high_fill_alert_ml: wizardState.media.waste.high_fill_alert_ml,
-          },
+          waste: wizardState.media.waste.vessel
+            ? { vessel: wizardState.media.waste.vessel }
+            : {
+              name: wizardState.media.waste.name,
+              capacity_ml: wizardState.media.waste.capacity_ml,
+              high_fill_alert_ml: wizardState.media.waste.high_fill_alert_ml,
+            },
         },
       };
+      if (_isGrouped()) {
+        // One experiment, several groups: each names its own mode and
+        // overrides; the top-level mode is derived by the server.
+        body.params = runParams;
+        body.groups = wizardState.groups.map(g => ({
+          name: g.name,
+          mode: g.mode,
+          vials: _groupVials(g),
+          parameters: groupParams(g),
+        }));
+      } else {
+        // A single group is a plain single-mode experiment, exactly as
+        // before groups existed -- the saved config.json is unchanged.
+        const g = wizardState.groups[0];
+        body.mode = g.mode;
+        body.params = { ...runParams, ...groupParams(g) };
+      }
       wizardNext.disabled = true;
       const original = wizardNext.textContent;
       wizardNext.textContent = "Creating…";
       try {
         await postJson("/api/experiments/create", body);
+        // The new experiment becomes the lens.
+        runsState.selected = wizardState.name;
+        try { localStorage.setItem("evolver.lens", wizardState.name); } catch (_e) { /* ignore */ }
         wizardNext.textContent = "Starting…";
         const started = await startExperimentWithBlankGuard(wizardState.name);
         if (started) {
@@ -4935,8 +5725,9 @@
 
     function plotsOnSensorUpdate(msg) {
       if (plotsView.classList.contains("view-hidden")) return;
-      if (!msg.experiment || msg.experiment.name !== plots.exp
-          || msg.experiment.status !== "running") return;
+      const entry = (msg.experiments || [msg.experiment]).find(
+        e => e && e.name === plots.exp);
+      if (!entry || entry.status !== "running") return;
       if (!plots._chartVials || !plots._chartVials.length) return;
       const epoch = tsToEpoch(msg.timestamp);
       if (epoch == null) return;
@@ -4974,7 +5765,8 @@
       }
       // Live pump marker (influx = the dilution event).
       if (msg.type === "pump" && typeof msg.vial === "number"
-          && msg.direction !== "efflux" && plots.exp === expState.name) {
+          && msg.direction !== "efflux"
+          && plots.exp === (msg.experiment || expState.name)) {
         const epoch = Date.now() / 1000;
         const od = latest.od[msg.vial];
         const mark = {
@@ -5016,8 +5808,10 @@
       const tempCard = document.getElementById("modal-temp-card");
       destroyChart(modalTrends.od); modalTrends.od = null;
       destroyChart(modalTrends.temp); modalTrends.temp = null;
-      const exp = expState.name;
-      const inExp = exp && Array.isArray(expState.vials) && expState.vials.includes(vial);
+      // The vial's own experiment, whichever is the lens.
+      const owner = _ownerRun(vial);
+      const exp = owner ? owner.name : expState.name;
+      const inExp = !!owner || (exp && Array.isArray(expState.vials) && expState.vials.includes(vial));
       if (!chartingReady() || !inExp) {
         empty.hidden = false;
         empty.textContent = chartingReady()
@@ -5077,9 +5871,10 @@
 
     function modalTrendsAppend(msg) {
       if (modalState.vial === null || modalTrends.vial === null) return;
-      if (!msg.experiment || msg.experiment.name !== expState.name
-          || msg.experiment.status !== "running") return;
-      if (!Array.isArray(expState.vials) || !expState.vials.includes(modalTrends.vial)) return;
+      const owner = _ownerRun(modalTrends.vial);
+      const entry = owner && (msg.experiments || [msg.experiment]).find(
+        e => e && e.name === owner.name);
+      if (!entry || entry.status !== "running") return;
       const epoch = tsToEpoch(msg.timestamp);
       if (epoch == null) return;
       // Same as plotsOnSensorUpdate: the OD series is stamped with the tick
@@ -5432,7 +6227,10 @@
     async function blankStartSession() {
       const b = calState.blank;
       try {
-        const d = await postJson("/api/calibration/od/blank/start", {});
+        // With parallel experiments, the blank is for the lens experiment
+        // (it must be CREATED); the server refuses anything else.
+        const d = await postJson("/api/calibration/od/blank/start",
+          expState.name && expState.status === "created" ? { experiment: expState.name } : {});
         b.session = d.session;
         b.thermal = d.thermal;
         b.vials = d.vials || [];
@@ -5607,32 +6405,25 @@
     }
 
     async function blankApplyRunConditions() {
-      // Push the run's target temperature + stir PWM onto the experiment's
-      // vials via the ordinary actuator routes (legal: experiment is CREATED,
-      // not RUNNING). Non-experiment vials keep their current setpoints.
+      // The engine holds each vial at ITS group's heater target and stir
+      // PWM (POST /precondition) -- with vial groups those differ per vial,
+      // and the engine then keeps heater safety and the stir re-send running
+      // until the experiment starts or stops. Non-experiment vials are
+      // untouched.
       try {
-        const cfg = await (await fetch(
-          `/api/experiments/${encodeURIComponent(expState.name)}`)).json();
-        const params = cfg.parameters || {};
-        const target = Number(params.temperature_c ?? 37);
-        const stir = Number(params.stir_rate ?? 10);
-        const vialSet = new Set(cfg.vials || []);
-        const values_c = actuatorState.temperatureSetpointRaw.map((raw, vial) => {
-          if (vialSet.has(vial)) return target;
-          return raw >= HEATER_OFF_SETPOINT
-            ? (actuatorState.limits.temp_min_c ?? 22)
-            : Math.max(actuatorState.limits.temp_min_c ?? 22,
-                Math.min(actuatorState.limits.temp_max_c ?? 45,
-                         rawToCelsius(vial, raw)));
-        });
-        await postJson("/api/actuators/temperature", { values_c });
-        const stirValues = actuatorState.stir.map((s, vial) =>
-          vialSet.has(vial) ? stir : s);
-        await postJson("/api/actuators/stir", { values: stirValues });
-        showToast(
-          `Run conditions applied: ${target.toFixed(1)} °C, stir ${stir} on ` +
-          `vials ${[...vialSet].join(", ")} — now equilibrate ≥ 10 min`, "ok");
+        const d = await postJson(
+          `/api/experiments/${encodeURIComponent(expState.name)}/precondition`, {});
+        const byCondition = {};
+        for (const v of d.vials || []) {
+          const t = d.temperature_c[String(v)];
+          const key = `${t == null ? "heater off" : `${Number(t).toFixed(1)} °C`}, stir ${d.stir[String(v)]}`;
+          (byCondition[key] = byCondition[key] || []).push(v);
+        }
+        const summary = Object.entries(byCondition)
+          .map(([k, vs]) => `${k} on vials ${vs.join(", ")}`).join("; ");
+        showToast(`Holding run conditions: ${summary} — now equilibrate ≥ 10 min`, "ok");
         fetchActuatorState();
+        await refreshExperimentStatus();
       } catch (err) {
         showToast(`Apply conditions failed: ${err.message}`, "error");
       }

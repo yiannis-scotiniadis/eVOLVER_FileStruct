@@ -291,7 +291,7 @@ def test_suppressed_pump_is_recorded_with_its_reason():
                json={"allow_missing_od_blank": True})
 
         # The engine emits this shape from _handle_consumables_block (§15).
-        state.engine._broadcast_event({
+        state.engine.run("suppress")._broadcast_event({
             "type": "pump_suppressed", "vial": 0,
             "reason": "media_empty", "bottle_id": "b1",
         })

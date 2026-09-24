@@ -439,6 +439,7 @@ class EventLog:
         if self._data_logger is None:
             return
         try:
+            data = entry.get("data") or {}
             self._data_logger.log_event(
                 timestamp_iso=entry["last_timestamp"],
                 level=entry["level"],
@@ -446,6 +447,9 @@ class EventLog:
                 message=entry["message"],
                 vial=entry["vial"],
                 data=entry.get("data"),
+                # Parallel experiments: an entry that names its experiment
+                # goes to that run's events.csv only (DataLogger.log_event).
+                experiment=data.get("experiment") if isinstance(data, dict) else None,
             )
         except Exception:
             # Never let the observability path take down the caller. This is

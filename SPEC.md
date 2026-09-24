@@ -45,10 +45,10 @@ All members of the Isaacs Lab at Yale, ranging from undergraduate researchers wi
 - [x] Maintenance mode with auto-resume failsafe
 - [x] Crash recovery / resume from `state.json`
 - [ ] Growth rate feedback control mode (disabled in the UI — blocked on §17)
-- [ ] Vial groups: independent modes and parameters within one experiment (ROADMAP Session Y)
+- [x] Vial groups: independent modes and parameters within one experiment (ROADMAP Session Y) — shipped 2026-09-24, §9.1
+- [x] True parallel experiments (independent lifecycles, operators, directories) — shipped 2026-09-24 as a single-threaded supervisor, §9.2
 - [ ] Phase-based experiment protocols (ROADMAP Session Z)
 - [ ] Experiment templates (§23, ROADMAP Session Q)
-- [ ] True parallel experiments — deferred, see `ROADMAP.md` §2 for the reasoning
 
 ### Phase 3: Calibration + monitoring — **STARTED**
 
@@ -405,11 +405,62 @@ POST /api/experiments/create
   }
   Response: {"status": "created", "name": "my_experiment"}
 
+  // Vial groups (§9.1): omit "mode" and give "groups" instead. "params"
+  // then holds run-level defaults (and the run-wide keys: volume_ml,
+  // efflux_extra_seconds, vial_capacity_ml, overflow_margin_ml,
+  // od_acquisition, pump_flow_rates); each group overrides the rest.
+  Body: {
+    "name": "my_experiment",
+    "params": {"volume_ml": 25, "efflux_extra_seconds": 2, "stir_rate": 8},
+    "groups": [
+      {"name": "ctrl", "vials": [0, 1, 2, 3], "mode": "turbidostat",
+       "parameters": {"od_lower_thresh": 0.2, "od_upper_thresh": 0.4}},
+      {"name": "sel", "vials": [8, 9], "mode": "chemostat",
+       "parameters": {"dilution_rate_per_hour": 0.3, "temperature_c": 30}}
+    ]
+  }
+  Response: {"status": "created", "name": "my_experiment",
+             "warnings": ["group 'sel': ...", ...]}   // per-group, prefixed
+
+POST /api/experiments/{name}/precondition
+  // CREATED only. Holds the run's vials at each vial's group heater target
+  // and stir PWM so the per-run OD blank (§19.2) is taken under run
+  // conditions. Heater safety and the stir re-send run while held; manual
+  // actuator writes to those vials return 409. /start takes over; /stop parks.
+  Response: {"status": "preconditioned", "name": "...", "vials": [...],
+             "temperature_c": {"0": 37.0, "8": 30.0, ...},   // null = latched off
+             "stir": {"0": 8, "8": 5, ...}, "preconditioned_at": "..."}
+
 POST /api/experiments/{name}/start
   Response: {"status": "running"}
 
 POST /api/experiments/{name}/stop
   Response: {"status": "stopped", "message": "All actuators zeroed for experiment vials"}
+
+--- parallel experiments (§9.2) ---
+POST /api/experiments/create  also takes
+  "operator": "Ana", "expected_end": "2026-10-02T18:00:00Z",
+  and may SHARE an existing vessel instead of declaring one:
+  "media": {"bottles": [{"id": "lb", "vessel": "alice.lb"}],   // size from the registry
+            "vial_to_bottle": {...}, "waste": {"vessel": "alice.waste"}}
+  409 {"code": "conflict"} when a vial belongs to another loaded experiment (the
+  message names it and its operator), when od_acquisition.agg / dark_subtract differ
+  from a loaded experiment's, or when a morbidostat drug bottle would be shared.
+
+POST /api/experiments/{name}/maintenance/enter | exit | refill
+  // One experiment's maintenance. The older /api/maintenance/* routes mean the only
+  // loaded experiment, and answer 409 {"code": "ambiguous_experiment",
+  // "experiments": [...]} when several are loaded -- as does any call that names none.
+
+GET  /api/machine
+  Response: {"machine_hold": {...} | null, "experiments": [compact per loaded run],
+             "owners": {"0": "alice", "8": "bob", ...}}
+POST /api/machine/hold      {"reason": "..."}   // every experiment's pumps held
+POST /api/machine/release                       // held dilutions fire in one schedule
+  Response: {"status": "released", "fired": 6}
+
+GET    /api/vessels         // every bottle and carboy: level, attribution, users
+DELETE /api/vessels/{id}    // forget one no loaded experiment uses (409 otherwise)
 
 GET /api/experiments/{name}/data
   Query params: ?vial=0&parameter=od&last_n=100
@@ -624,6 +675,14 @@ socket.emit('alert', {
     timestamp: "..."
 });
 
+// Parallel experiments (§9.2): every sensor_update also carries
+//   experiments:  [one compact entry per loaded experiment -- name, status, mode,
+//                  operator, expected_end, vials, groups, preconditioned,
+//                  maintenance, media_summary, ...]
+//   machine_hold: {active, reason, auto_resume_in_seconds, queued_pump_count} | null
+// `experiment` is kept as the FIRST loaded experiment, in its old shape. Every
+// `experiment_event` and `alert` from an experiment carries `experiment: <name>`.
+
 // Server status
 socket.emit('server_status', {
     uptime_hours: 48.3,
@@ -675,6 +734,11 @@ timestamp,elapsed_hours,direction,duration_seconds,od_at_pump
 ```
 
 ### Experiment configuration (`config.json`)
+
+An experiment with vial groups (§9.1) additionally carries `"groups"` — each
+group's `name`, `mode`, `vials` and **its own overrides only** (never the merged
+view) — and a top-level `"mode"` of the shared mode or `"mixed"`. A single-mode
+experiment has no `groups` key and is byte-identical to the example below.
 
 Saved when experiment is created. Serves as a complete record of parameters used.
 
@@ -778,6 +842,113 @@ every 10 seconds:
     6. Update stir rates (resend every cycle to prevent drift)
     7. Pet the watchdog timer
 ```
+
+### 9.1 Vial groups within one experiment
+
+**Status: IMPLEMENTED 2026-09-24 (`ROADMAP.md` Session Y).** `server/run_config.py`
+(pure: normalisation, validation, per-vial target resolution) plus the engine's
+`CONTROL_MODES` registry.
+
+A **group** is a named subset of an experiment's vials with its own control mode
+and its own parameters. Groups partition one experiment: **one lifecycle** (one
+create, start and stop), one directory, one per-run OD blank, one media
+configuration. Anything needing an independent lifecycle is a separate experiment
+(`PARALLEL_EXPERIMENTS.md`).
+
+- **Parameters.** Run-level `parameters` are defaults; a group's `parameters`
+  shallow-override them. Overriding one spelling of an aliased key
+  (`od_lower_thresh`/`od_lower`, `od_upper_thresh`/`od_upper`,
+  `temperature_c`/`temperature`) drops the run default's other spelling, so a
+  group override can never be silently shadowed. Per-vial 16-lists still work at
+  either level.
+- **Run-wide keys** are refused inside a group: `volume_ml` (straw height),
+  `efflux_extra_seconds`, `vial_capacity_ml`, `overflow_margin_ml`,
+  `od_acquisition` (one OD read serves all 16 vials), `pump_flow_rates`.
+- **Back-compat.** A config without `groups` is one implicit group (`"all"`); every
+  pre-groups `config.json` and `state.json` loads and resumes unchanged, and the
+  wizard submits the legacy single-mode body when only one group exists.
+- **Per-vial everything else.** Controllers are built per group; heater target
+  and stir PWM resolve per vial (`_stir_by_vial` replaced the scalar
+  `_setpoint_stir`); the growth service picks its regime from the vial's group
+  mode; `requires_od` was already per controller, so a chemostat group keeps
+  diluting through unusable OD while a turbidostat group beside it stands down.
+- **Validation** runs `validate_control_parameters` once per group. A warning
+  every group raises identically (e.g. the overrun warning) is reported once,
+  unprefixed; the rest are prefixed `group '<name>':`.
+- **Morbidostat bottles.** A bottle feeding a morbidostat group may not feed any
+  other group — confirming an escalation swaps that drug bottle, which would dose
+  the other group too.
+- **`CONTROL_MODES` registry.** Every behavioural lookup of a mode (create-time
+  validation, controller construction at start and resume) goes through
+  `experiment_engine.CONTROL_MODES`; `validate_control_parameters` rejects an
+  unregistered mode instead of silently running only the global checks. A group's
+  `mode` is a key there, so a future mode — e.g. the `"custom"` mode sketched in
+  `CUSTOM_CONTROLLER_DESIGN.md` — becomes usable per group by registering it; a
+  builder receives the whole `run_config.Group`, so per-group state can be keyed
+  by group name.
+- **Preconditioning** (`POST /api/experiments/{name}/precondition`) holds a CREATED
+  experiment's vials at their groups' targets for the per-run blank, running the
+  fast-lane safety subset (heater overrun/critical handling, stir re-send) while
+  held. A vial that latches overtemp while preconditioned stays parked through
+  `start_experiment`.
+- **Records.** `status()` gains `groups`, `grouped`, `preconditioned` and
+  per-vial `group`/`mode`/`stir`/`target_temp_c`; `setpoint_stir` is `None` when
+  groups stir differently. The export bundle gains `vial_groups.csv`
+  (`vial,group,mode`) — a new file, never a new column (CLAUDE.md fact 6).
+
+### 9.2 Parallel experiments
+
+**Status: IMPLEMENTED 2026-09-24.** `server/supervisor.py` (`ExperimentSupervisor`) and
+`server/vessels.py` (`VesselRegistry`). Design and trade-offs: `PARALLEL_EXPERIMENTS.md`,
+`MULTIPLEX_OPTIONS.md`.
+
+Several experiments run at once, each with its own vials, modes (and groups, §9.1),
+lifecycle, directory, operator and expected end. They are **multiplexed, not
+parallelised**: one sensor thread, one tick, one lock.
+
+- **One engine per experiment.** The supervisor holds an `ExperimentEngine` per loaded
+  experiment; each drives only its own vials exactly as a single experiment always has.
+  All engines share one `RLock`, the serial manager, the `DataLogger` and the vessel
+  registry. A standalone engine (tests) owns a private lock and an in-memory registry.
+- **Vial ownership.** A vial belongs to at most one loaded experiment, from create to
+  stop. Create refuses an owned vial (409, naming the experiment and operator). Manual
+  control of a vial an experiment is driving (running, or preconditioned) is refused
+  the same way; free vials stay manual.
+- **One tick for everyone.** `run_cycle` hands every experiment the same sensor arrays
+  and returns all their dilutions, which the sensor loop fires as ONE concurrent pump
+  schedule (§16.3). One experiment raising does not cost the others their tick (it is
+  caught and alerted). Stir is composed across experiments and written **once** per
+  tick (`zv`), still every tick.
+- **Shared settings.** One OD read serves all 16 vials, so `od_acquisition.agg` and
+  `dark_subtract` must agree across loaded experiments (409 at create); `n_samples`
+  takes the maximum.
+- **Shared consumables.** Bottles and carboys are machine-scoped vessels (§15): an
+  experiment may reference another's (`vessel` key), and both then draw on ONE level.
+  Owned vessels (`<experiment>.<bottle>`, `<experiment>.waste`) are created at create —
+  so they can be shared before their owner starts — and never reset at start. Debits
+  are attributed per experiment. A morbidostat drug bottle is never shared.
+- **Holds.** Per-experiment maintenance is unchanged (routes now name the experiment).
+  The **machine hold** holds every experiment's pumps ("someone has the machine
+  open"), queues decided dilutions newest-per-vial, fires them in one schedule on
+  release, persists across restarts (`machine/hold.json`) and auto-resumes after the
+  same 30 min as maintenance. Held dilutions of an experiment that has since entered
+  its own maintenance join that maintenance's queue.
+- **Fan-out.** Emergency stop and shutdown stop every experiment; each records it.
+- **Resume.** Every RUNNING experiment resumes on its own engine. Two state files
+  claiming one vial means something already went wrong: **both** go to ERROR
+  (`resume_ownership_conflict`) with a critical alert — no guessed winner.
+- **Stopped experiments** are unloaded (their record is on disk) but remembered until a
+  new experiment claims one of their vials, so post-run manual pumping still books
+  against their bottle and carboy (§19.4 reconciliation).
+- **Per-run blank.** Stopping an experiment clears ONLY its vials' row-2 re-anchor
+  (`clear_od_blank(vials)`); see §19.2 for taking a blank while another runs.
+- **Records.** Alerts and events carry `experiment`; dedup keys are namespaced by it,
+  so identical alerts from two experiments are two drawer rows. `events.csv` routing
+  is in §20.2.
+- **Dashboard.** Run chips select the *lens* experiment the status bar and the media,
+  maintenance, morbidostat and blank panels show; vial cards lock and show chips by
+  **owner**. The wizard asks for the operator, greys out other experiments' vials and
+  offers the vessels in use for sharing.
 
 ### Turbidostat control mode (MVP)
 
@@ -1143,6 +1314,14 @@ Clicking a vial opens a detail panel:
 
 ### Experiment setup page
 
+> **As built (2026-09-24):** the wizard is Name → Media → Vials → Waste →
+> **Mode & groups** → Parameters → Review. Step 5 edits one group at a time
+> (tabs; "+ Split vials into groups" / "+ Add group"; click vials to move them
+> between groups). Step 6 shows the active group's temperature, stir and mode
+> parameters, with volume and overrun under "Run-wide". With one group, both
+> steps look and submit exactly as a single-mode experiment. The dashboard shows
+> a group chip on each vial card and lists groups in the status bar.
+
 Step-by-step wizard:
 
 ```
@@ -1343,7 +1522,7 @@ These decisions can be deferred but should be resolved before Phase 2:
 
 5. **Network access:** Currently the eVOLVER is on a dedicated Netgear router (192.168.1.x). For remote monitoring, the router could be connected to Yale's network, or a VPN tunnel could be set up. This is a Phase 4 concern.
 
-6. **Concurrent experiments:** Phase 2 allows multiple experiment groups, but the RS485 bus is shared. The serial manager must ensure commands for different experiments don't interfere. Since all 16 vials are always read in a single command, this is primarily a software isolation concern, not a hardware one. **Update:** the recommended path is vial groups within one experiment (§2 Phase 2, `ROADMAP.md` Session Y) rather than concurrent engine instances — same practical capability, far less concurrency risk in the code path that drives heaters.
+6. **Concurrent experiments:** Phase 2 allows multiple experiment groups, but the RS485 bus is shared. The serial manager must ensure commands for different experiments don't interfere. Since all 16 vials are always read in a single command, this is primarily a software isolation concern, not a hardware one. **Answered (2026-09-24):** both shipped. Vial groups (§9.1) serve one operator running several arms inside one experiment; parallel experiments (§9.2) give two operators independent lifecycles, as a single-threaded supervisor over one engine per experiment — not concurrent engine threads.
 
 ### Questions raised by the August 2026 lab meeting
 
@@ -1390,6 +1569,12 @@ reserve_ml (waste) = max(100.0, 0.05 * capacity_ml)
 Blocking is **sticky**: it clears only on an explicit `refill_media` call. It must never
 clear on its own, because the volume estimate has no way to recover — if the software
 believes a bottle is empty, only a human can establish otherwise.
+
+**Vessel-scoped since parallel experiments (§9.2).** Levels and latches live on the
+vessel (`server/vessels.py`), not the experiment. A shared carboy that fills blocks
+every experiment draining into it (each auto-enters consumables maintenance when all
+its vials are blocked); emptying it through any one of them clears the block for all,
+and each resumes explicitly as before.
 
 Suppressed pump attempts are logged to `events.csv` (§20) with the reason, so a run that
 quietly stopped diluting is diagnosable after the fact.
@@ -2053,6 +2238,13 @@ vials, media and sleeve seating.
 inoculation, under final run conditions — sterile medium at working volume, sleeves seated,
 stir at the run's PWM, temperature equilibrated and held ≥ 10 min, LED at the run's power.
 
+With vial groups (§9.1) "the run's PWM" and "setpoint" are **per vial**, from each vial's
+group. `POST /api/experiments/{name}/precondition` applies them (the wizard's "Apply run
+conditions"); `blank/start` expects every vial at its own group's stir, accepts a scalar
+`stir_pwm` claim only when every group stirs alike, reports any vial whose commanded stir
+differs as `stir_mismatch` (a warning), and records `stir_pwm_by_vial` in the envelope's
+`conditions` beside the scalar `stir_pwm` (null when groups differ).
+
 1. **Dark read** — LED power 0, five reads, per-vial median and SD.
 2. **Blank read** — LED at the run value, five reads, per-vial median and SD.
 3. **Re-anchor row 2 only:**
@@ -2083,6 +2275,13 @@ non-dark-subtracted blank is as wrong as the reverse.
 Per-run blanks are written to the **experiment directory**
 (`experiments/{name}/od_blank.json`), not the global calibration directory, because they
 are run-specific by definition.
+
+**With parallel experiments (§9.2)** a blank can be taken for a CREATED experiment while
+another runs: `blank/start` takes `{"experiment": name}` (default: the only CREATED one),
+the dark read darkens ONLY that experiment's LEDs (`collect_od_raw` takes a per-vial
+power vector) so the running experiment's next OD read is unaffected, and one blank
+session is open at a time machine-wide. Pump calibration and the raw actuator routes
+still need the whole machine: 409 while any experiment runs, naming who.
 
 ### 19.3 Pump flow calibration (gravimetric) — P0 — IMPLEMENTED
 
@@ -2219,6 +2418,12 @@ manual overrides (§21), drug escalations, sensor failures, and serial errors.
 
 This is the artefact a researcher attaches to a lab-notebook entry, the backing store for
 the event-log table in the UI, and part of the export bundle.
+
+**Routing with parallel experiments (§9.2)**, first match wins: an entry naming its
+`experiment` goes to that experiment's `events.csv` only; one about a vial goes to the
+vial's owner; anything else — bus, disk, watchdog, emergency stop, calibration
+installs, a manual pump on a free vial — goes to every active experiment's, because it
+is part of each run's story.
 
 ### 20.3 Error classification
 

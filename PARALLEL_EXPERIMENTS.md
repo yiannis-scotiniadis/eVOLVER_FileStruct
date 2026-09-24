@@ -1,7 +1,27 @@
 # PARALLEL_EXPERIMENTS.md — Two operators, one eVOLVER
 
-**Status:** design brainstorm, 2026-08-27. Supersedes the framing of `ROADMAP.md` item 18 and
-`SPEC.md` §14 Q6. No code written.
+**Status:** **BUILT 2026-09-24** (`server/supervisor.py`, `server/vessels.py`; `SPEC.md` §9.2;
+tests `server/test_parallel_runs.py`). This document was the design brainstorm of 2026-08-27;
+what shipped differs from it in these ways:
+
+- **Architecture.** Not "extract `Run` from the engine": the existing `ExperimentEngine`
+  already *was* one run, so the supervisor holds one engine per experiment on one shared
+  lock and one tick. Same single-threaded, multiplexed design as §3, without the big
+  refactor or compat shims.
+- **T1 is moot.** The fluidics audit (2026-09-23, FW-10/FW-11) found the `t` sub-mode
+  inert: `stop_all_pumps` stops nothing, so there is no masked stop to build (Stage 0).
+  Pumps fire concurrently through masks, and every dilution of a tick goes out in one
+  schedule for all experiments.
+- **Shared consumables are supported** (§4 "bottles first-class"), not merely refused (T8):
+  vessels are machine-scoped and an experiment can share another's bottle or carboy.
+- **Decisions taken with the operator:** the machine hold auto-resumes after 30 min like
+  maintenance (T4); stopping an experiment parks its heaters (not "leave warm", §8 Q4);
+  emergency stop and shutdown stop every experiment; the vial map is correct (§8 Q5);
+  calibration happens in agreed windows (§8 Q2).
+- **Not built:** the actuator reducer (A2) — the supervisor composes stir once per tick
+  and heaters are written only on events, so the N× bus cost it guarded against does not
+  arise — and the `state.json` debounce (§9): measured at 1.2 ms p95 for three runs,
+  still worth doing for SD wear, not for correctness.
 
 **Driving scenario (confirmed with Yiannis):** two people sharing one machine, staggered start
 and stop dates, fully separate media bottles and waste carboys per experiment.
