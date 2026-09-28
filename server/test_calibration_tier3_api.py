@@ -207,12 +207,20 @@ def test_tier3_start_refuses_a_machine_that_is_not_idle():
 
 
 def test_thermistor_wizard_over_http_installs_the_truth_and_goes_live():
+    """The HTTP flow and the live reload, on a NOISELESS mock: this app's
+    own sensor thread may tick mid-test and advance the simulation between
+    the reference reading and the capture. Noise and the equilibrium gates
+    are covered deterministically in test_calibration_tier3.py."""
+    import mock_serial_manager as M
+    saved_noise = M.TEMP_NOISE_SIGMA
+    M.TEMP_NOISE_SIGMA = 0.0
     with tempfile.TemporaryDirectory() as tmp:
         flask_app = _make_app(Path(tmp))
         try:
             state = _state(flask_app)
             mgr = state.manager
-            mgr.time_multiplier = 10.0            # quiet, still fast to settle
+            mgr.time_multiplier = 10.0
+            mgr.mock_temp_raw_noise_sd = 0.0
             mgr.set_true_temp_cal(PACK_SLOPE, PACK_INTERCEPT)
             client = flask_app.test_client()
             _post(client, "/api/calibration/temperature/start",
@@ -259,7 +267,7 @@ def test_thermistor_wizard_over_http_installs_the_truth_and_goes_live():
 
             # Live without a restart: manager, AppState, the sliders' curve.
             want = np.vstack([np.full(N_VIALS, PACK_SLOPE), np.full(N_VIALS, PACK_INTERCEPT)])
-            assert np.allclose(mgr.temp_cal, want, rtol=0.02, atol=0.3)
+            assert np.allclose(mgr.temp_cal, want, rtol=1e-3, atol=0.05)
             assert np.allclose(state.temp_cal, mgr.temp_cal)
             cal = client.get("/api/actuators/state").get_json()["temp_calibration"]
             assert np.allclose(cal["slope"], mgr.temp_cal[0])
@@ -272,6 +280,7 @@ def test_thermistor_wizard_over_http_installs_the_truth_and_goes_live():
             assert client.post("/api/calibration/raw/temperature",
                                json={"setpoints": [4095] * N_VIALS}).status_code == 200
         finally:
+            M.TEMP_NOISE_SIGMA = saved_noise
             _stop(flask_app)
 
 
