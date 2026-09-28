@@ -33,6 +33,7 @@ import os
 import threading
 import time
 import uuid
+import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -40,6 +41,7 @@ from typing import Any, Callable, Optional
 import numpy as np
 
 import run_config
+from serial_manager import DEFAULT_RAW_FLOOR, HEATER_OFF_SETPOINT, MAX_SAFE_TEMP_C
 
 N_VIALS = 16
 N_PUMPS = 32  # canonical pump index: 0..15 influx vial i, 16..31 efflux vial i-16
@@ -77,6 +79,16 @@ GROWTH_OD_FLOOR_SD_MULTIPLE = 10.0
 # uses to raise the human-readable warning; shared so the machine-readable
 # suspect-vial list and the printed warning can never disagree.
 OD_LOWER_ASYMPTOTE_SUSPECT = 40000.0
+
+# --- Tier 3 sessions (Session AA / CALIBRATION_PROTOCOL §8). A Tier 3
+# session reserves the whole machine for hours, so it carries its own heater
+# watchdog: with no experiment loaded, the engine's _handle_heater_safety_locked
+# never runs. Critical is one degree above the request cap -- tighter than the
+# engine's 50 °C, because nothing in a calibration should ever approach it.
+TIER3_KINDS = ("temperature", "od_series")
+CAL_HEATER_CRITICAL_C = MAX_SAFE_TEMP_C + 1.0
+CAL_HEATER_DEBOUNCE_READS = 3
+RAW_TRACKER_WINDOW_MINUTES = 30.0
 
 # --- Staleness thresholds (CALIBRATION_PROTOCOL §13).
 PUMP_STALE_DAYS = 30.0
@@ -1252,6 +1264,198 @@ class PumpCalSession:
 
 
 # ---------------------------------------------------------------------------
+# Tier 3 sessions (Session AA) — machine-reserving, resumable
+# ---------------------------------------------------------------------------
+
+class RawTempTracker:
+    """Rolling window of RAW thermistor ADC vectors, fed by the sensor loop
+    while a Tier 3 session exists. The thermistor wizard gates its captures
+    on these counts, not on °C: the °C scale is the thing being calibrated.
+
+    Stability is judged on PER-MINUTE MEDIANS, so one noisy read cannot
+    un-settle a vial and a slow drift cannot hide inside the noise."""
+
+    def __init__(
+        self,
+        clock: Callable[[], float] = time.time,
+        window_minutes: float = RAW_TRACKER_WINDOW_MINUTES,
+    ) -> None:
+        self._clock = clock
+        self._window_seconds = float(window_minutes) * 60.0
+        self._samples: list[tuple[float, np.ndarray]] = []
+        self._lock = threading.Lock()
+
+    def note(self, raw) -> None:
+        if raw is None:
+            return
+        now = self._clock()
+        arr = np.asarray(raw, dtype=float)
+        if arr.shape != (N_VIALS,):
+            return
+        with self._lock:
+            self._samples.append((now, arr))
+            cutoff = now - self._window_seconds
+            while self._samples and self._samples[0][0] < cutoff:
+                self._samples.pop(0)
+
+    def reset(self) -> None:
+        with self._lock:
+            self._samples.clear()
+
+    def latest(self) -> list[float]:
+        with self._lock:
+            if not self._samples:
+                return [float("nan")] * N_VIALS
+            return self._samples[-1][1].tolist()
+
+    def minute_medians(
+        self, minutes: float, *, relative_to: Optional[list[int]] = None,
+    ) -> tuple[np.ndarray, float]:
+        """``(medians, coverage_minutes)``: an ``(n_minutes, 16)`` array of
+        per-minute medians over the last ``minutes``, oldest first, and how
+        far back the samples actually reach.
+
+        With ``relative_to`` (a vial list), every sample is first expressed
+        as its offset from those vials' pack median at the same instant.
+        That cancels room drift the whole pack shares -- harmless to a
+        calibration point, since the reference is read at the same moment --
+        without hiding a single vial that is still moving."""
+        now = self._clock()
+        cutoff = now - float(minutes) * 60.0
+        with self._lock:
+            window = [(t, a) for t, a in self._samples if t >= cutoff]
+        if not window:
+            return np.empty((0, N_VIALS)), 0.0
+        coverage = (now - window[0][0]) / 60.0
+        buckets: dict[int, list[np.ndarray]] = {}
+        for t, arr in window:
+            if relative_to:
+                pack = np.nanmedian(arr[relative_to]) if np.any(
+                    np.isfinite(arr[relative_to])) else np.nan
+                arr = arr - pack
+            buckets.setdefault(int((t - cutoff) // 60.0), []).append(arr)
+        rows = []
+        for key in sorted(buckets):
+            stack = np.vstack(buckets[key])
+            # nanmedian of an all-NaN column warns; a dropped vial is normal.
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", category=RuntimeWarning)
+                rows.append(np.nanmedian(stack, axis=0))
+        return np.vstack(rows), coverage
+
+
+class Tier3Session:
+    """Common state of a Tier 3 wizard session (thermistor two-point, OD
+    dilution series).
+
+    A Tier 3 session reserves the whole machine for hours. Its ``state``:
+
+    - ``armed`` -- the session drives actuators: the sensor loop's tick
+      re-sends its stir and runs its heater watchdog. Only an ``apply`` on
+      an idle machine arms it.
+    - ``suspended`` -- reloaded after a restart, or stopped by shutdown. It
+      writes nothing; its captured points are kept.
+    - ``faulted`` -- emergency stop, watchdog, or its own heater watchdog.
+      Same as suspended, with the reason on record.
+
+    Persisted after every mutation (like :class:`PumpCalSession`) under
+    ``calibration/_sessions/<kind>.json``; ``abort`` deletes it and writes
+    nothing to ``calibration/``."""
+
+    kind = ""
+
+    def __init__(self, *, operator: str, vials: list[int], stir_pwm: int) -> None:
+        vials = sorted({int(v) for v in vials})
+        if not vials:
+            raise ValueError("'vials' must be a non-empty list")
+        for v in vials:
+            if not (0 <= v < N_VIALS):
+                raise ValueError(f"vial {v} out of range 0..{N_VIALS - 1}")
+        stir_pwm = int(stir_pwm)
+        if not (0 <= stir_pwm <= 15):
+            raise ValueError(f"stir_pwm must be in 0..15, got {stir_pwm}")
+        self.id = uuid.uuid4().hex[:12]
+        self.started_at = _iso_now()
+        self.operator = str(operator or "unknown")
+        self.vials = vials
+        self.stir_pwm = stir_pwm
+        self.state = "suspended"
+        self.state_reason = "not yet applied"
+        # vial -> reason; a faulted vial is excluded from the fit and is
+        # never re-heated by the session.
+        self.vial_faults: dict[int, str] = {}
+        # vial -> the raw xr setpoint the session last commanded.
+        self.commanded_raw: dict[int, int] = {}
+        self.phase: Optional[str] = None
+
+    # -- actuator targets -------------------------------------------------
+
+    def stir_vector(self) -> list[int]:
+        return [self.stir_pwm if v in self.vials else 0 for v in range(N_VIALS)]
+
+    def estimate_temps(self, installed_c: list, raw: list) -> list[float]:
+        """Best °C estimate per vial for the heater watchdog. The base
+        session trusts the installed calibration; the thermistor session
+        overrides this with each vial's own reference readings once it has
+        them (the installed curve is what it is there to replace)."""
+        return [float(x) if x is not None else float("nan") for x in installed_c]
+
+    # -- persistence ------------------------------------------------------
+
+    def _base_dict(self) -> dict:
+        return {
+            "kind": self.kind,
+            "id": self.id,
+            "started_at": self.started_at,
+            "operator": self.operator,
+            "vials": self.vials,
+            "stir_pwm": self.stir_pwm,
+            "state": self.state,
+            "state_reason": self.state_reason,
+            "vial_faults": {str(k): v for k, v in self.vial_faults.items()},
+            "commanded_raw": {str(k): int(v) for k, v in self.commanded_raw.items()},
+            "phase": self.phase,
+        }
+
+    def _restore_base(self, d: dict) -> None:
+        self.id = d.get("id", self.id)
+        self.started_at = d.get("started_at", self.started_at)
+        self.state = d.get("state", "suspended")
+        self.state_reason = d.get("state_reason", "")
+        self.vial_faults = {int(k): str(v) for k, v in (d.get("vial_faults") or {}).items()}
+        self.commanded_raw = {int(k): int(v) for k, v in (d.get("commanded_raw") or {}).items()}
+        self.phase = d.get("phase")
+
+    def to_dict(self) -> dict:
+        return self._base_dict()
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Tier3Session":
+        s = cls(operator=d.get("operator", "unknown"), vials=d["vials"],
+                stir_pwm=d.get("stir_pwm", 8))
+        s._restore_base(d)
+        return s
+
+    def summary(self) -> dict:
+        return {
+            "kind": self.kind,
+            "id": self.id,
+            "state": self.state,
+            "state_reason": self.state_reason,
+            "phase": self.phase,
+            "operator": self.operator,
+            "started_at": self.started_at,
+            "vials": self.vials,
+            "vial_faults": {str(k): v for k, v in self.vial_faults.items()},
+        }
+
+
+# kind -> session class, for reloading a persisted session at boot. The
+# concrete wizards register themselves below their definitions.
+TIER3_SESSION_CLASSES: dict[str, type] = {}
+
+
+# ---------------------------------------------------------------------------
 # Service façade
 # ---------------------------------------------------------------------------
 
@@ -1272,9 +1476,14 @@ class CalibrationService:
         self.experiments_root = Path(experiments_root)
         self.manager = manager
         self.tracker = TempStabilityTracker(clock=clock)
+        self.raw_tracker = RawTempTracker(clock=clock)
+        self._clock = clock
         self._lock = threading.RLock()
         self._blank: Optional[OdBlankSession] = None
         self._pump: Optional[PumpCalSession] = None
+        # At most one Tier 3 session (Session AA) machine-wide.
+        self._tier3: Optional[Tier3Session] = None
+        self._overtemp_streak = [0] * N_VIALS
 
     # -- wiring ----------------------------------------------------------
 
@@ -1287,6 +1496,7 @@ class CalibrationService:
     def bootstrap(self) -> list[str]:
         created = self.store.bootstrap_from_legacy()
         self._load_pump_session()
+        self._load_tier3_sessions()
         return created
 
     def _pump_session_path(self) -> Path:
@@ -1324,6 +1534,7 @@ class CalibrationService:
         loaded_experiment: Optional[str] = None,
         loaded_status: Optional[str] = None,
     ) -> dict:
+        tier3 = self.tier3_status()
         return {
             "subsystems": self.store.current_index(),
             "staleness": self.store.staleness(
@@ -1331,6 +1542,9 @@ class CalibrationService:
             ),
             "pump_session_active": self._pump is not None,
             "blank_session_active": self._blank is not None,
+            "tier3_session": tier3,
+            "temperature_session_active": bool(tier3 and tier3["kind"] == "temperature"),
+            "od_series_session_active": bool(tier3 and tier3["kind"] == "od_series"),
         }
 
     def subsystem(self, name: str) -> dict:
@@ -1340,6 +1554,201 @@ class CalibrationService:
         if env is None:
             raise FileNotFoundError(f"no calibration installed for {name!r}")
         return env
+
+    # -- Tier 3 session registry (Session AA) ----------------------------
+
+    def _tier3_path(self, kind: str) -> Path:
+        return self.store.sessions_dir / f"{kind}.json"
+
+    def _persist_tier3(self) -> None:
+        s = self._tier3
+        if s is None:
+            return
+        path = self._tier3_path(s.kind)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write_text(path, json.dumps(s.to_dict(), indent=4))
+
+    def _load_tier3_sessions(self) -> None:
+        """Reload an in-flight Tier 3 session at boot, SUSPENDED.
+
+        Never resume driving actuators across a restart: this runs before
+        resume_on_startup, the manager booted with heaters off and stir at
+        0, and what the machine is doing now is unknown. An operator
+        re-arms it with ``apply``, which re-checks that the machine is idle.
+        The captured points survive -- that is what resumability buys."""
+        for kind, cls in TIER3_SESSION_CLASSES.items():
+            path = self._tier3_path(kind)
+            if not path.is_file():
+                continue
+            try:
+                session = cls.from_dict(json.loads(path.read_text(encoding="utf-8")))
+            except Exception:
+                log.exception("failed to resume Tier 3 session from %s", path)
+                continue
+            if self._tier3 is not None:
+                log.error(
+                    "two Tier 3 session files; keeping '%s', ignoring %s",
+                    self._tier3.kind, path,
+                )
+                continue
+            if session.state == "armed":
+                session.state = "suspended"
+                session.state_reason = "server restarted — re-apply to continue"
+            self._tier3 = session
+            self._persist_tier3()
+            log.info("resumed Tier 3 %s calibration session (suspended)", kind)
+
+    def tier3_status(self) -> Optional[dict]:
+        """Summary of the open Tier 3 session, or None. The app uses it to
+        refuse anything that would drive the machine behind its back."""
+        with self._lock:
+            return None if self._tier3 is None else self._tier3.summary()
+
+    def _begin_tier3(self, session: Tier3Session) -> None:
+        if self._tier3 is not None:
+            raise CalibrationConflict(
+                f"a {self._tier3.kind} calibration session is already open "
+                f"(started {self._tier3.started_at}) — resume or abort it first"
+            )
+        if self._pump is not None:
+            raise CalibrationConflict(
+                "a pump calibration session is open (calibration/_sessions/"
+                f"pump.json, started {self._pump.started_at}) — finish or "
+                "abort it first; a Tier 3 session reserves the whole machine"
+            )
+        if self._blank is not None:
+            raise CalibrationConflict(
+                f"an OD blank for '{self._blank.experiment}' is in progress — "
+                "finish or abort it first"
+            )
+        self._tier3 = session
+        self.raw_tracker.reset()
+        self._overtemp_streak = [0] * N_VIALS
+        self._persist_tier3()
+
+    def _refuse_during_tier3(self, what: str) -> None:
+        if self._tier3 is not None:
+            raise CalibrationConflict(
+                f"{what} cannot start while a {self._tier3.kind} calibration "
+                f"session is open ({self._tier3.state}) — it reserves the "
+                "whole machine; finish or abort it first"
+            )
+
+    def _require_tier3(self, kind: str) -> Tier3Session:
+        s = self._tier3
+        if s is None or s.kind != kind:
+            raise CalibrationConflict(f"no {kind} calibration session is open")
+        return s
+
+    def _arm_tier3(self, s: Tier3Session, phase: str) -> None:
+        s.state = "armed"
+        s.state_reason = ""
+        s.phase = phase
+        self._overtemp_streak = [0] * N_VIALS
+        self._persist_tier3()
+
+    def _require_armed(self, s: Tier3Session) -> None:
+        if s.state != "armed":
+            raise CalibrationConflict(
+                f"the {s.kind} session is {s.state}"
+                + (f" ({s.state_reason})" if s.state_reason else "")
+                + " — re-apply it before capturing"
+            )
+
+    def _end_tier3(self) -> None:
+        """Close the session: park every heater (the session reserved the
+        whole machine, so none is anyone else's), delete the session file."""
+        s = self._tier3
+        if s is None:
+            return
+        try:
+            self.manager.set_temperature_raw([HEATER_OFF_SETPOINT] * N_VIALS)
+        except Exception:
+            log.exception("parking heaters at the end of a Tier 3 session failed")
+        try:
+            self._tier3_path(s.kind).unlink(missing_ok=True)
+        except OSError:
+            log.exception("failed to remove Tier 3 session file")
+        self._tier3 = None
+        self.raw_tracker.reset()
+
+    def fault(self, reason: str) -> None:
+        """Emergency stop / watchdog: stop driving actuators at once. The
+        stop itself has already zeroed stir and parked the heaters; this
+        keeps the tick from switching the stirrers back on 10 s later."""
+        with self._lock:
+            s = self._tier3
+            if s is None:
+                return
+            s.state = "faulted"
+            s.state_reason = str(reason)
+            self._persist_tier3()
+
+    def suspend(self, reason: str) -> None:
+        """Clean shutdown: park the session without calling it a fault."""
+        with self._lock:
+            s = self._tier3
+            if s is None or s.state != "armed":
+                return
+            s.state = "suspended"
+            s.state_reason = str(reason)
+            self._persist_tier3()
+
+    def tick(self, temps_c: list, temps_raw: Optional[list]) -> list[dict]:
+        """One sensor-loop tick for the open Tier 3 session, on the FAST lane.
+
+        Records the raw thermistor counts; and, while armed, re-sends the
+        session's stir (drift protection, as the supervisor does for an
+        experiment) and runs the calibration heater watchdog over ALL
+        sixteen vials -- a stuck heater on an excluded vial still matters.
+        Returns alert payloads for the app to emit through its funnel;
+        nothing here talks to the browser."""
+        with self._lock:
+            s = self._tier3
+            if s is None:
+                return []
+            self.raw_tracker.note(temps_raw)
+            if s.state != "armed":
+                return []
+            self.manager.set_stir(s.stir_vector())
+            estimates = s.estimate_temps(temps_c, temps_raw or [float("nan")] * N_VIALS)
+            parked: list[int] = []
+            for v in range(N_VIALS):
+                t = estimates[v]
+                if t is None or not math.isfinite(t):
+                    continue  # a dropped read neither extends nor resets a streak
+                if t > CAL_HEATER_CRITICAL_C:
+                    self._overtemp_streak[v] += 1
+                    if (self._overtemp_streak[v] >= CAL_HEATER_DEBOUNCE_READS
+                            and s.vial_faults.get(v) != "overtemp"):
+                        parked.append(v)
+                else:
+                    self._overtemp_streak[v] = 0
+            if not parked:
+                return []
+            setpoints = [int(x) for x in np.asarray(self.manager.temp_setpoint_raw)]
+            for v in parked:
+                setpoints[v] = HEATER_OFF_SETPOINT
+                s.commanded_raw[v] = HEATER_OFF_SETPOINT
+                s.vial_faults[v] = "overtemp"
+            self.manager.set_temperature_raw(setpoints)
+            self._persist_tier3()
+            return [
+                {
+                    "level": "critical",
+                    "message": (
+                        f"Calibration heater watchdog: vial {v} read "
+                        f"{estimates[v]:.1f} °C (> {CAL_HEATER_CRITICAL_C:.0f} °C) "
+                        f"on {CAL_HEATER_DEBOUNCE_READS} consecutive reads — "
+                        "heater parked OFF and the vial excluded from this "
+                        f"{s.kind} calibration"
+                    ),
+                    "category": "heater",
+                    "vial": v,
+                    "dedup_key": ("cal_heater_critical", v),
+                }
+                for v in parked
+            ]
 
     # -- per-run OD blank (O2) -------------------------------------------
 
@@ -1366,6 +1775,7 @@ class CalibrationService:
         reported beside the expectation (``stir_mismatch``) as a warning, not
         a refusal -- the thermal-settling check is the hard gate."""
         with self._lock:
+            self._refuse_during_tier3("an OD blank")
             if engine_status != "created":
                 raise CalibrationConflict(
                     "the OD blank is taken against a CREATED experiment, "
@@ -1827,6 +2237,7 @@ class CalibrationService:
 
     def pump_start(self, body: dict) -> dict:
         with self._lock:
+            self._refuse_during_tier3("a pump calibration")
             if self._pump is not None:
                 if body.get("resume"):
                     return {"status": "resumed", **self._pump.progress()}

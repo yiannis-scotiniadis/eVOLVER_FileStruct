@@ -53,6 +53,7 @@ from serial_manager import (
     OD_LED_MAX,
     ODReading,
     SerialManager,
+    apply_floor_override,
     led_power_vector,
 )
 
@@ -185,6 +186,21 @@ class MockSerialManager:
         self.mock_signal_noise_sd = 150.0
         self.mock_uncal_signal_counts = 58000.0
 
+        # --- Ground truth for the Tier 3 wizards (Session AA) -------------
+        # The true thermistor response, i.e. what a perfect two-point
+        # calibration would recover. Pinned at the FIRST load_calibration and
+        # never moved by a later one: the heater physics runs on it, while
+        # the INSTALLED temp_cal only converts raw counts to reported °C and
+        # °C targets to setpoints. If the truth followed each install, every
+        # post-install test would pass by construction.
+        self._true_temp_cal: Optional[np.ndarray] = None
+        self.mock_temp_raw_noise_sd = 1.0  # thermistor ADC counts per read
+        self.last_temperature_raw = np.full(N_VIALS, np.nan)
+        # OD truth overrides (set_true_od / set_true_od_curve). Opt-in: with
+        # neither set, OD behaves exactly as before.
+        self._frozen_od: dict[int, float] = {}
+        self._true_od_rows: Optional[np.ndarray] = None
+
         self.sim_time = 0.0
 
     # ------------------------------------------------------------------
@@ -212,11 +228,56 @@ class MockSerialManager:
             self.od_cal = od_cal
             self._od_cal_base = od_cal.copy()
             self._od_cal_dark_subtracted = dark_subtracted
+            if self._true_temp_cal is None:
+                self._true_temp_cal = temp_cal.copy()
 
     @property
     def od_cal_dark_subtracted(self) -> bool:
         """Parity with SerialManager.od_cal_dark_subtracted."""
         return self._od_cal_dark_subtracted
+
+    # ------------------------------------------------------------------
+    # Ground-truth controls (tests of the Tier 3 wizards)
+    # ------------------------------------------------------------------
+
+    def set_true_temp_cal(self, slope, intercept) -> None:
+        """Make the simulated thermistors respond as ``raw * slope +
+        intercept`` (per vial), independently of the installed calibration.
+        A two-point calibration against a perfect reference thermometer
+        should recover exactly these numbers."""
+        cal = np.vstack([
+            np.broadcast_to(np.asarray(slope, dtype=float), (N_VIALS,)),
+            np.broadcast_to(np.asarray(intercept, dtype=float), (N_VIALS,)),
+        ])
+        with self._lock:
+            self._true_temp_cal = cal
+
+    def set_true_od(self, vials, od: Optional[float]) -> None:
+        """Hold the listed vials at a fixed true OD600 -- no growth, no
+        noise, no carrying-capacity clip -- as a loaded turbidity standard
+        would sit. ``od=None`` releases them back to the growth model."""
+        with self._lock:
+            for v in vials:
+                if od is None:
+                    self._frozen_od.pop(int(v), None)
+                else:
+                    self._frozen_od[int(v)] = float(od)
+                    self.od_abs[int(v)] = float(od)
+
+    def set_true_od_curve(self, rows, dark_counts=None) -> None:
+        """Synthesize ``collect_od_raw``'s lit signal as ``dark +
+        S_true(OD)`` from a 4x16 DARK-SUBTRACTED logistic ``rows`` -- the
+        curve an OD dilution series should recover. ``dark_counts`` (scalar
+        or 16-list) sets the per-vial dark floor too."""
+        rows = np.asarray(rows, dtype=float)
+        if rows.shape != (4, N_VIALS):
+            raise ValueError(f"rows shape {rows.shape}, expected (4, {N_VIALS})")
+        with self._lock:
+            self._true_od_rows = rows
+            if dark_counts is not None:
+                self.mock_dark_counts = np.broadcast_to(
+                    np.asarray(dark_counts, dtype=float), (N_VIALS,)
+                ).copy()
 
     def apply_od_blank(self, c_run_by_vial: dict) -> None:
         """Parity with SerialManager.apply_od_blank. The mock's calibrated
@@ -294,7 +355,11 @@ class MockSerialManager:
             self._pump_cursor += 1
 
         # 2. Temperature: first-order lag toward the setpoint-driven steady-state.
-        target_C = raw_setpoint_to_target_C(self.temp_setpoint_raw, self.temp_cal)
+        # The firmware closes its loop on the thermistor ADC, so where a
+        # setpoint lands physically is set by the TRUE thermistor response,
+        # not by whatever calibration the server has installed.
+        true_cal = self._true_temp_cal if self._true_temp_cal is not None else self.temp_cal
+        target_C = raw_setpoint_to_target_C(self.temp_setpoint_raw, true_cal)
         alpha = 1.0 - math.exp(-sim_dt / THERMAL_TAU_SECONDS)
         noise_T = self._rng.normal(
             0.0, TEMP_NOISE_SIGMA * math.sqrt(sim_dt / 10.0), N_VIALS
@@ -311,6 +376,34 @@ class MockSerialManager:
         )
         self.od_abs = self.od_abs + self._rng.normal(0.0, OD_NOISE_SIGMA, N_VIALS)
         self.od_abs = np.clip(self.od_abs, 1e-4, CARRYING_CAPACITY_OD * 1.05)
+        # A loaded turbidity standard does not grow (set_true_od).
+        for vial, od in self._frozen_od.items():
+            self.od_abs[vial] = od
+
+    # ------------------------------------------------------------------
+    # Thermistor ADC model (must hold self._lock)
+    # ------------------------------------------------------------------
+
+    def _true_temp_raw_locked(self) -> np.ndarray:
+        """The raw counts the thermistors would report at the simulated
+        temperature, through the TRUE response (fallback when uncalibrated)."""
+        true_cal = self._true_temp_cal if self._true_temp_cal is not None else self.temp_cal
+        if true_cal is None:
+            slope, intercept = _FALLBACK_SLOPE, _FALLBACK_INTERCEPT
+        else:
+            slope, intercept = true_cal[0], true_cal[1]
+        return (self.temp_C - intercept) / slope
+
+    def _reported_temps_locked(self, raw: np.ndarray) -> np.ndarray:
+        """°C as the server would compute it from ``raw`` with the INSTALLED
+        calibration. While that is the true response (always, until a Tier 3
+        test sets a different truth or installs a new curve) this is the
+        simulated temperature itself, exactly as before Session AA."""
+        if self.temp_cal is None:
+            return self.temp_C.copy()
+        if self._true_temp_cal is None or np.array_equal(self.temp_cal, self._true_temp_cal):
+            return self.temp_C.copy()
+        return raw * self.temp_cal[0] + self.temp_cal[1]
 
     # ------------------------------------------------------------------
     # Public reads — direct physical units, no ADC indirection.
@@ -319,7 +412,35 @@ class MockSerialManager:
     def read_temperature(self) -> list[float]:
         with self._lock:
             self._advance()
-            return self.temp_C.tolist()
+            raw = self._true_temp_raw_locked()
+            self.last_temperature_raw = raw
+            return self._reported_temps_locked(raw).tolist()
+
+    def read_temperature_with_raw(self) -> tuple[list[float], list[float]]:
+        """Parity with SerialManager.read_temperature_with_raw."""
+        with self._lock:
+            self._advance()
+            raw = self._true_temp_raw_locked()
+            self.last_temperature_raw = raw
+            return self._reported_temps_locked(raw).tolist(), raw.tolist()
+
+    def collect_temp_raw(self, n_samples: int = 5) -> dict:
+        """Parity with SerialManager.collect_temp_raw. Advances the sim ONCE
+        (n advances at the default 100x would be minutes of simulated time
+        per capture) and synthesizes ``n`` reads with count noise."""
+        n = max(1, int(n_samples))
+        with self._lock:
+            self._advance()
+            raw = self._true_temp_raw_locked()
+            self.last_temperature_raw = raw
+            samples = raw[None, :] + self._rng.normal(
+                0.0, self.mock_temp_raw_noise_sd, (n, N_VIALS)
+            )
+        return {
+            "median": np.median(samples, axis=0).tolist(),
+            "sd": np.std(samples, axis=0).tolist(),
+            "n_valid": [n] * N_VIALS,
+        }
 
     def read_od(self, led_power: int = 2125) -> list[float]:
         with self._lock:
@@ -337,12 +458,21 @@ class MockSerialManager:
         with self._lock:
             self._advance()
             dark = leds == 0
-            if self.od_cal is not None:
+            dark_counts = np.broadcast_to(
+                np.asarray(self.mock_dark_counts, dtype=float), (N_VIALS,)
+            )
+            if self._true_od_rows is not None:
+                # Session AA ground truth: a lit read is the dark floor plus
+                # the true dark-subtracted curve at the true OD.
+                a, b, c, d = self._true_od_rows
+                od = np.asarray(self.od_abs, dtype=float)
+                lit = dark_counts + a + (b - a) / (1.0 + np.power(10.0, d * (c - od)))
+            elif self.od_cal is not None:
                 lit = self._od_abs_to_raw(np.asarray(self.od_abs, dtype=float))
             else:
                 lit = np.full(N_VIALS, float(self.mock_uncal_signal_counts))
             # Per vial: a dark LED reads the dark floor, a lit one the signal.
-            base = np.where(dark, float(self.mock_dark_counts), lit)
+            base = np.where(dark, dark_counts, lit)
             noise_sd = np.where(dark, self.mock_dark_noise_sd, self.mock_signal_noise_sd)
             self.last_collect_led_powers = leds.tolist()
             samples = base[None, :] + self._rng.normal(0.0, 1.0, (n, N_VIALS)) * noise_sd[None, :]
@@ -450,7 +580,9 @@ class MockSerialManager:
             self.temp_setpoint_raw = raw
         return self.read_temperature()
 
-    def set_temperature_raw(self, setpoints: list[int]) -> list[float]:
+    def set_temperature_raw(
+        self, setpoints: list[int], floor_override: Optional[dict] = None,
+    ) -> list[float]:
         """Escape hatch — see SerialManager.set_temperature_raw."""
         raw = np.asarray(setpoints, dtype=int)
         if raw.shape != (N_VIALS,):
@@ -458,7 +590,7 @@ class MockSerialManager:
                 f"set_temperature_raw expects {N_VIALS} values, "
                 f"got shape {raw.shape}"
             )
-        floor = self._raw_floor_per_vial()
+        floor = apply_floor_override(self._raw_floor_per_vial(), floor_override)
         raw = np.maximum(raw, floor)
         raw = np.clip(raw, None, HEATER_OFF_SETPOINT)
         with self._lock:

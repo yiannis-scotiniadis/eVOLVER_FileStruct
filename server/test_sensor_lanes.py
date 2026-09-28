@@ -279,7 +279,8 @@ def test_sensors_latest_is_served_from_cache_without_serial_io() -> None:
         # than no assertion -- this is the claim the route's docstring makes,
         # so it has to actually be checked.
         reads = {"n": 0}
-        for meth in ("read_temperature", "read_od", "read_od_enhanced"):
+        for meth in ("read_temperature", "read_temperature_with_raw",
+                     "read_od", "read_od_enhanced"):
             orig = getattr(state.manager, meth)
 
             def wrapped(*a, _o=orig, **k):

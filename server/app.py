@@ -318,10 +318,21 @@ class AppState:
 
 
 def _read_temperature_pair(state: AppState) -> dict:
+    """``calibrated`` °C, and ``raw`` thermistor counts. When the manager can
+    return both from one transaction (``read_temperature_with_raw``), ``raw``
+    is the true ADC reading -- numerically what inverting the calibration
+    gave before, but it can no longer disagree with °C mid-reload. ``adc``
+    is set only in that case (None otherwise): the Tier 3 thermistor wizard
+    must never fit against a reconstruction."""
+    with_raw = getattr(state.manager, "read_temperature_with_raw", None)
+    if with_raw is not None:
+        values, adc = with_raw()
+        return {"calibrated": list(values), "raw": list(adc), "adc": list(adc)}
     values = state.manager.read_temperature()
     if state.temp_cal is not None:
-        return {"calibrated": values, "raw": _temp_C_to_raw(values, state.temp_cal)}
-    return {"calibrated": values, "raw": list(values)}
+        return {"calibrated": values, "raw": _temp_C_to_raw(values, state.temp_cal),
+                "adc": None}
+    return {"calibrated": values, "raw": list(values), "adc": None}
 
 
 def _read_od_pair(state: AppState) -> dict:
@@ -790,6 +801,12 @@ def create_app(use_mock: bool):
         socketio.emit("experiment_event", payload)
 
     def _on_watchdog_trigger(reason: str) -> None:
+        # The watchdog has already zeroed the actuators; a Tier 3 session
+        # must not drive them again when the loop comes back.
+        try:
+            cal_service.fault(f"watchdog: {reason}")
+        except Exception:
+            log.exception("faulting the Tier 3 calibration session failed")
         _emit_alert(
             "critical", reason,
             category=evlog.CATEGORY_SYSTEM, dedup_key="watchdog",
@@ -1025,6 +1042,62 @@ def create_app(use_mock: bool):
         op = state.engine.operator_of(name) if state.engine is not None else ""
         return f"'{name}'" + (f" (operator {op})" if op else "")
 
+    def _machine_not_idle():
+        """409 unless the machine is IDLE for a Tier 3 calibration (Session
+        AA): no experiment loaded in ANY state -- a CREATED one still owns
+        its vials and may be preconditioning their heaters, an ERROR one
+        still owns them too -- and no pump calibration session. Installing
+        a Tier 3 curve also reloads the calibration live, which is only
+        safe with no engine holding a cached copy. None when idle."""
+        loaded = state.engine.loaded_names() if state.engine is not None else []
+        if loaded:
+            labels = []
+            for n in loaded:
+                run = state.engine.get_run(n)
+                status = run.status_string if run is not None else "?"
+                labels.append(f"{_owner_label(n)} [{status}]")
+            return jsonify(
+                error=(
+                    "a Tier 3 calibration needs an idle machine — loaded: "
+                    + ", ".join(labels)
+                    + ". Stop them first: a CREATED experiment still owns its "
+                    "vials and may be holding their heaters."
+                ),
+                code="machine_not_idle",
+                experiments=loaded,
+            ), 409
+        pump = cal_service.pump_session()
+        if pump.get("active"):
+            return jsonify(
+                error=(
+                    "a Tier 3 calibration needs an idle machine — a pump "
+                    "calibration session is open (calibration/_sessions/"
+                    f"pump.json, started {pump.get('started_at')}). Finish or "
+                    "abort it first."
+                ),
+                code="machine_not_idle",
+            ), 409
+        return None
+
+    def _tier3_in_progress():
+        """409 while a Tier 3 calibration session holds the machine, in any
+        state: a suspended or faulted session still owns its captured points
+        and its vials' conditions. None otherwise. Never applied to the
+        emergency stop."""
+        session = cal_service.tier3_status()
+        if session is None:
+            return None
+        label = "thermistor" if session["kind"] == "temperature" else "OD dilution-series"
+        return jsonify(
+            error=(
+                f"a Tier 3 {label} calibration session is open "
+                f"({session['state']}) and reserves the whole machine — "
+                "finish or abort it on the Calibration tab first"
+            ),
+            code="calibration_in_progress",
+            session=session,
+        ), 409
+
     @flask_app.route("/api/actuators/temperature", methods=["POST"])
     def api_set_temperature():
         """Set per-vial target temperatures in Celsius.
@@ -1046,6 +1119,9 @@ def create_app(use_mock: bool):
         )
         if err is not None:
             return jsonify(error=err), 400
+        blocked = _tier3_in_progress()
+        if blocked is not None:
+            return blocked
         # Block manual override of any experiment-controlled vial. We
         # compare on the raw setpoint stored in the manager (translated
         # from the request's °C via the calibration) so the comparison
@@ -1111,6 +1187,9 @@ def create_app(use_mock: bool):
         err = _validate_int_array(values, N_VIALS, 0, STIR_MAX, "values")
         if err is not None:
             return jsonify(error=err), 400
+        blocked = _tier3_in_progress()
+        if blocked is not None:
+            return blocked
         driven = state.engine.driven_vials() if state.engine is not None else {}
         if driven:
             locked = sorted(driven)
@@ -1196,6 +1275,11 @@ def create_app(use_mock: bool):
             return jsonify(error="'direction' must be 'influx' or 'efflux'"), 400
         if (seconds_in is None) == (volume_ml_in is None):
             return jsonify(error="specify exactly one of 'seconds' or 'volume_ml'"), 400
+        # An OD dilution series holds turbidity standards in the vials; a
+        # manual pump would dilute them mid-series.
+        blocked = _tier3_in_progress()
+        if blocked is not None:
+            return blocked
 
         lock = _experiment_locks_vial(int(vial))
         if lock is not None:
@@ -1307,6 +1391,12 @@ def create_app(use_mock: bool):
         engine stops firing pumps on its own."""
         log.warning("emergency_stop requested via API")
         timestamp = _now_iso()
+        # Fault an open Tier 3 session FIRST: its tick re-sends stir every
+        # tick and would switch the stirrers back on within 10 s.
+        try:
+            cal_service.fault("emergency stop")
+        except Exception:
+            log.exception("faulting the Tier 3 calibration session failed")
         try:
             state.manager.emergency_shutdown()
         except Exception as exc:
@@ -1343,6 +1433,11 @@ def create_app(use_mock: bool):
     @flask_app.route("/api/experiments/create", methods=["POST"])
     def api_experiments_create():
         body = request.get_json(silent=True) or {}
+        # A Tier 3 session reserves the machine; an experiment created now
+        # would record calibration versions the session is about to replace.
+        blocked = _tier3_in_progress()
+        if blocked is not None:
+            return blocked
         # SPEC §19.1 provenance: record the calibration versions this run
         # will use, plus the measured 32-pump flow rates when a complete pump
         # calibration exists. Caller-supplied values win (deep-merged last).
@@ -1404,6 +1499,9 @@ def create_app(use_mock: bool):
         """Hold a CREATED experiment's vials at their groups' heater and stir
         targets, so the per-run OD blank can be taken under run conditions
         (SPEC §19.2). Control and logging do not start until /start."""
+        blocked = _tier3_in_progress()
+        if blocked is not None:
+            return blocked
         try:
             result = state.engine.precondition_experiment(name)
         except InvalidExperimentStateError as exc:
@@ -1417,6 +1515,9 @@ def create_app(use_mock: bool):
     @flask_app.route("/api/experiments/<name>/start", methods=["POST"])
     def api_experiments_start(name):
         body = request.get_json(silent=True) or {}
+        blocked = _tier3_in_progress()
+        if blocked is not None:
+            return blocked
         # Per-run OD blank hard block (CALIBRATION_PROTOCOL §13: "hard block,
         # not a warning"). Without a blank the machine reports OD 0.12-0.44
         # for sterile medium, vial-dependent. Overridable only explicitly,
@@ -1920,7 +2021,12 @@ def create_app(use_mock: bool):
     # route rejects with 409 while an experiment is RUNNING, and these are the
     # ONLY routes permitted to reach the raw actuator paths (§19.6).
 
-    def _cal_route(mutating: bool = True, exclusive: bool = True):
+    def _cal_route(
+        mutating: bool = True,
+        exclusive: bool = True,
+        idle: bool = False,
+        blocked_by_tier3: bool = False,
+    ):
         """Decorator: RUNNING-experiment guard + exception -> HTTP mapping
         (ValueError 400, CalibrationConflict 409, QCRefusal 422 with the qc
         block, FileNotFoundError 404).
@@ -1929,7 +2035,12 @@ def create_app(use_mock: bool):
         whole machine: 409 while ANY experiment runs, naming who. The per-run
         OD blank is not exclusive -- it touches only its own CREATED
         experiment's vials, so one operator can take a blank while another's
-        experiment runs (PARALLEL_EXPERIMENTS.md T3)."""
+        experiment runs (PARALLEL_EXPERIMENTS.md T3).
+
+        ``idle`` (Tier 3 start/apply/finish) is stricter still: nothing
+        loaded at all, and no pump session -- see ``_machine_not_idle``.
+        ``blocked_by_tier3`` refuses while a Tier 3 session holds the
+        machine (``_tier3_in_progress``)."""
         def decorate(fn):
             @functools.wraps(fn)
             def wrapper(*args, **kwargs):
@@ -1944,6 +2055,14 @@ def create_app(use_mock: bool):
                         code="experiment_running",
                         experiments=running,
                     ), 409
+                if idle:
+                    blocked = _machine_not_idle()
+                    if blocked is not None:
+                        return blocked
+                if blocked_by_tier3:
+                    blocked = _tier3_in_progress()
+                    if blocked is not None:
+                        return blocked
                 try:
                     return fn(*args, **kwargs)
                 except QCRefusal as exc:
@@ -1994,7 +2113,7 @@ def create_app(use_mock: bool):
     # --- per-run OD blank (§19.2 / CALIBRATION_PROTOCOL §5.4) ----------------
 
     @flask_app.route("/api/calibration/od/blank/start", methods=["POST"])
-    @_cal_route(exclusive=False)
+    @_cal_route(exclusive=False, blocked_by_tier3=True)
     def api_blank_start():
         body = request.get_json(silent=True) or {}
         # Which experiment: named in the body, else the only CREATED one.
@@ -2107,13 +2226,13 @@ def create_app(use_mock: bool):
     # --- pump gravimetric (§19.3 / CALIBRATION_PROTOCOL §7) ------------------
 
     @flask_app.route("/api/calibration/pump/start", methods=["POST"])
-    @_cal_route()
+    @_cal_route(blocked_by_tier3=True)
     def api_pump_cal_start():
         body = request.get_json(silent=True) or {}
         return jsonify(cal_service.pump_start(body))
 
     @flask_app.route("/api/calibration/pump/fire", methods=["POST"])
-    @_cal_route()
+    @_cal_route(blocked_by_tier3=True)
     def api_pump_cal_fire():
         body = request.get_json(silent=True) or {}
         pump_id = body.get("pump_id")
@@ -2164,7 +2283,7 @@ def create_app(use_mock: bool):
     # --- raw escape hatches, calibration-only (§19.6) ------------------------
 
     @flask_app.route("/api/calibration/raw/temperature", methods=["POST"])
-    @_cal_route()
+    @_cal_route(blocked_by_tier3=True)
     def api_cal_raw_temperature():
         """Raw `xr` setpoints for the calibration wizard / low-level debug.
 
@@ -2197,7 +2316,7 @@ def create_app(use_mock: bool):
         )
 
     @flask_app.route("/api/calibration/raw/od_led", methods=["POST"])
-    @_cal_route()
+    @_cal_route(blocked_by_tier3=True)
     def api_cal_raw_od_led():
         """Raw OD read at an arbitrary LED power (0 = dark read). Returns
         per-vial median/sd/n_valid of the raw counts — the same primitive
@@ -2683,6 +2802,27 @@ def create_app(use_mock: bool):
                 # "held >=10 min" guard is enforced from what this loop saw).
                 cal_service.note_temperatures(t["calibrated"])
 
+                # Tier 3 calibration session (Session AA): raw thermistor
+                # history, stir re-send and the calibration heater watchdog.
+                # FAST lane, before the OD read, with its own guard: nothing
+                # here may cost the tick its broadcast or its watchdog pet.
+                try:
+                    for alert in cal_service.tick(t["calibrated"], t.get("adc")):
+                        _emit_alert(
+                            alert["level"], alert["message"],
+                            category=alert.get("category", evlog.CATEGORY_CALIBRATION),
+                            vial=alert.get("vial"),
+                            dedup_key=alert.get("dedup_key"),
+                        )
+                except Exception as exc:
+                    log.exception("calibration session tick failed")
+                    _emit_alert(
+                        "critical",
+                        f"Calibration session tick failed: {exc}",
+                        category=evlog.CATEGORY_CALIBRATION,
+                        dedup_key="cal_tick_failed",
+                    )
+
                 # --- OD lane: every OD_EVERY_N_TICKS ticks -------------
                 o = None
                 if od_tick:
@@ -2857,6 +2997,11 @@ def create_app(use_mock: bool):
                 state.engine.stop_all(reason="shutdown")
             except Exception:
                 log.exception("shutdown: stopping experiments failed")
+        try:
+            # Kept, not faulted: a restart reloads it suspended, points intact.
+            cal_service.suspend("server shutdown — re-apply to continue")
+        except Exception:
+            log.exception("shutdown: suspending the Tier 3 session failed")
         try:
             manager.emergency_shutdown()
         except Exception:

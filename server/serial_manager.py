@@ -95,6 +95,40 @@ def led_power_vector(led_power) -> "np.ndarray":
     return np.clip(np.rint(arr), 0, OD_LED_MAX).astype(int)
 
 
+def apply_floor_override(floor: "np.ndarray", floor_override: Optional[dict]) -> "np.ndarray":
+    """The per-vial raw-setpoint floor with ``{vial: floor}`` overrides
+    applied, each clamped to at least DEFAULT_RAW_FLOOR -- no override can
+    request hotter than the uncalibrated safety floor."""
+    floor = np.asarray(floor, dtype=int).copy()
+    for vial, value in (floor_override or {}).items():
+        v = int(vial)
+        if not (0 <= v < N_VIALS):
+            raise ValueError(f"floor_override vial must be in 0..{N_VIALS - 1}, got {v}")
+        floor[v] = max(DEFAULT_RAW_FLOOR, int(value))
+    return floor
+
+
+def _sample_stats(samples: "np.ndarray") -> dict:
+    """Per-vial median / population SD / valid count of an ``(n, N_VIALS)``
+    sample array, ignoring NaN (dropped) rows. The shape every calibration
+    read primitive returns; a vial with no valid sample reports NaN."""
+    median: list[float] = []
+    sd: list[float] = []
+    n_valid: list[int] = []
+    for v in range(N_VIALS):
+        col = samples[:, v]
+        col = col[~np.isnan(col)]
+        n_valid.append(int(col.size))
+        if col.size == 0:
+            median.append(float("nan"))
+            sd.append(float("nan"))
+        else:
+            median.append(float(np.median(col)))
+            # ddof=0 population SD; with n=1 that's 0.0, not NaN.
+            sd.append(float(np.std(col)))
+    return {"median": median, "sd": sd, "n_valid": n_valid}
+
+
 @dataclass(frozen=True)
 class ODReading:
     """Structured result of one enhanced OD acquisition cycle.
@@ -150,6 +184,14 @@ class SerialManager:
         # leak zeros onto the wire.
         self.temp_setpoint_raw = np.full(N_VIALS, HEATER_OFF_SETPOINT, dtype=int)
         self.stir_speed = np.zeros(N_VIALS, dtype=int)
+        # The true thermistor ADC counts of the most recent temperature read
+        # (NaN until the first, or for a dropped read). The public reads
+        # return °C; the Tier 3 thermistor wizard needs the counts themselves.
+        self.last_temperature_raw = np.full(N_VIALS, np.nan)
+        # Per-vial last good dark reading, so a dropped dark read in a
+        # dark-subtracted acquisition falls back to it instead of to 0 (which
+        # would bias that vial's signal by the whole dark offset).
+        self._last_good_dark = np.full(N_VIALS, np.nan)
 
         self.temp_cal: Optional[np.ndarray] = None
         self.od_cal: Optional[np.ndarray] = None
@@ -324,13 +366,22 @@ class SerialManager:
     def _format_csv(values: np.ndarray) -> str:
         return ",".join(str(int(v)) for v in values) + ","
 
-    def _read_temperature_locked(self) -> list[float]:
+    def _read_temperature_raw_locked(self) -> np.ndarray:
+        """One xr/temp transaction: re-send the current setpoints, return the
+        16 raw thermistor ADC counts (NaN on a dropped read). Records them as
+        ``last_temperature_raw``."""
         body = self._format_csv(self.temp_setpoint_raw)
         self._write(PREFIX_TEMPERATURE, body)
         values = self._read_response(RESPONSE_TEMP)
         if values is None:
-            return [float("nan")] * N_VIALS
-        raw = np.asarray(values)
+            raw = np.full(N_VIALS, np.nan)
+        else:
+            raw = np.asarray(values, dtype=float)
+        self.last_temperature_raw = raw
+        return raw
+
+    def _read_temperature_locked(self) -> list[float]:
+        raw = self._read_temperature_raw_locked()
         if self.temp_cal is None:
             return raw.tolist()
         return self._temp_raw_to_C(raw).tolist()
@@ -412,21 +463,7 @@ class SerialManager:
         with self._lock:
             body = self._format_csv(leds)
             samples = self._collect_od_reads(body, n)
-        median: list[float] = []
-        sd: list[float] = []
-        n_valid: list[int] = []
-        for v in range(N_VIALS):
-            col = samples[:, v]
-            col = col[~np.isnan(col)]
-            n_valid.append(int(col.size))
-            if col.size == 0:
-                median.append(float("nan"))
-                sd.append(float("nan"))
-            else:
-                median.append(float(np.median(col)))
-                # ddof=0 population SD; with n=1 that's 0.0, not NaN.
-                sd.append(float(np.std(col)))
-        return {"median": median, "sd": sd, "n_valid": n_valid}
+        return _sample_stats(samples)
 
     def read_od_enhanced(
         self,
@@ -479,8 +516,15 @@ class SerialManager:
             dark_body = self._format_csv(np.zeros(N_VIALS, dtype=int))
             dark_samples = self._collect_od_reads(dark_body, n_dark)
             dark_agg, _ = self._aggregate_samples(dark_samples, agg)
-            # A dropped dark read subtracts 0 rather than poisoning the vial.
-            dark_for_calc = np.nan_to_num(dark_agg, nan=0.0)
+            # A dropped dark read falls back to that vial's last good dark:
+            # against a dark-subtracted curve, subtracting 0 would bias the
+            # vial by the whole dark offset (~1200 counts). With no history
+            # yet it still subtracts 0 rather than poisoning the vial.
+            good = ~np.isnan(dark_agg)
+            self._last_good_dark = np.where(good, dark_agg, self._last_good_dark)
+            dark_for_calc = np.where(
+                good, dark_agg, np.nan_to_num(self._last_good_dark, nan=0.0),
+            )
         else:
             dark_agg = np.full(N_VIALS, np.nan)
             dark_for_calc = np.zeros(N_VIALS)
@@ -537,6 +581,32 @@ class SerialManager:
     def read_temperature(self) -> list[float]:
         with self._lock:
             return self._read_temperature_locked()
+
+    def read_temperature_with_raw(self) -> tuple[list[float], list[float]]:
+        """``(°C, raw ADC counts)`` from ONE transaction under one lock hold,
+        so a calibration reload can never land between the two halves. °C
+        is the raw counts again when no calibration is loaded."""
+        with self._lock:
+            raw = self._read_temperature_raw_locked()
+            if self.temp_cal is None:
+                return raw.tolist(), raw.tolist()
+            return self._temp_raw_to_C(raw).tolist(), raw.tolist()
+
+    def collect_temp_raw(self, n_samples: int = 5) -> dict:
+        """Tier 3 thermistor-wizard read primitive (CALIBRATION_PROTOCOL
+        §8.1), the temperature twin of :meth:`collect_od_raw`: ``n_samples``
+        xr/temp transactions at the CURRENT setpoints (so capturing never
+        changes what the heaters are doing), reduced to per-vial NaN-aware
+        statistics of the raw thermistor ADC counts. No calibration is
+        applied -- the fit is what produces one.
+
+        Returns ``{"median": [...16], "sd": [...16], "n_valid": [...16]}``."""
+        n = max(1, int(n_samples))
+        with self._lock:
+            samples = np.vstack([
+                self._read_temperature_raw_locked() for _ in range(n)
+            ])
+        return _sample_stats(samples)
 
     def read_od(self, led_power: int = 2125) -> list[float]:
         with self._lock:
@@ -599,7 +669,9 @@ class SerialManager:
             self.temp_setpoint_raw = raw
             return self._read_temperature_locked()
 
-    def set_temperature_raw(self, setpoints: list[int]) -> list[float]:
+    def set_temperature_raw(
+        self, setpoints: list[int], floor_override: Optional[dict] = None,
+    ) -> list[float]:
         """Escape hatch for calibration wizard and low-level debugging.
 
         Sends 16 raw setpoint integers verbatim as the `xr` command payload.
@@ -609,14 +681,21 @@ class SerialManager:
         Enforces a per-vial floor derived from MAX_SAFE_TEMP_C (or a
         conservative default of DEFAULT_RAW_FLOOR if no calibration is
         loaded). Setpoints below the floor are clipped up — you cannot
-        send something hotter than the safety cap via this method."""
+        send something hotter than the safety cap via this method.
+
+        ``floor_override`` (``{vial: raw_floor}``) replaces the floor for
+        the listed vials only, and is itself clamped to at least
+        DEFAULT_RAW_FLOOR. It exists for one caller: the Tier 3 thermistor
+        wizard retargeting a vial whose INSTALLED calibration is the thing
+        under test, with a floor derived from that vial's own reference-
+        thermometer readings instead (see calibration_service)."""
         raw = np.asarray(setpoints, dtype=int)
         if raw.shape != (N_VIALS,):
             raise ValueError(
                 f"set_temperature_raw expects {N_VIALS} values, "
                 f"got shape {raw.shape}"
             )
-        floor = self._raw_floor_per_vial()
+        floor = apply_floor_override(self._raw_floor_per_vial(), floor_override)
         raw = np.maximum(raw, floor)
         raw = np.clip(raw, None, HEATER_OFF_SETPOINT)
         with self._lock:
