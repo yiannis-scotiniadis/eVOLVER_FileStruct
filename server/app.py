@@ -288,8 +288,10 @@ class AppState:
         self.watchdog: Watchdog | None = None  # set after socketio is created
         self.engine: ExperimentEngine | None = None  # set after socketio is created
         self.cal_service: CalibrationService | None = None  # set in create_app
-        # create_app's _reload_calibration(subsystem, version).
+        # create_app's _reload_calibration(subsystem, version) and
+        # _calibration_tick(temperature_pair).
         self.reload_calibration = None
+        self.calibration_tick = None
         self.sensor_thread_stop = threading.Event()
         self.shutdown_done = threading.Event()
         # Low-disk monitor state (sensor loop): throttle counter + edge latches.
@@ -2760,6 +2762,34 @@ def create_app(use_mock: bool):
         if state.last_sensor_update is not None:
             emit("sensor_update", state.last_sensor_update)
 
+    def _calibration_tick(t: dict) -> None:
+        """One tick for an open Tier 3 calibration session: raw thermistor
+        history, stir re-send and the calibration heater watchdog, whose
+        alerts go through the funnel.
+
+        NEVER raises: it runs inside the sensor loop's tick, and an exception
+        escaping it would skip that tick's broadcast and its watchdog pet --
+        the watchdog would then zero every actuator over a calibration bug."""
+        try:
+            for alert in cal_service.tick(t["calibrated"], t.get("adc")):
+                _emit_alert(
+                    alert["level"], alert["message"],
+                    category=alert.get("category", evlog.CATEGORY_CALIBRATION),
+                    vial=alert.get("vial"),
+                    dedup_key=alert.get("dedup_key"),
+                )
+        except Exception as exc:
+            log.exception("calibration session tick failed")
+            _emit_alert(
+                "critical",
+                f"Calibration session tick failed: {exc}",
+                category=evlog.CATEGORY_CALIBRATION,
+                dedup_key="cal_tick_failed",
+            )
+
+    # Exposed for the API tests (the loop itself is not steppable).
+    state.calibration_tick = _calibration_tick
+
     def sensor_loop():
         """One thread, two lanes: a fast safety lane and an OD lane that can
         be decimated below it.
@@ -2802,26 +2832,9 @@ def create_app(use_mock: bool):
                 # "held >=10 min" guard is enforced from what this loop saw).
                 cal_service.note_temperatures(t["calibrated"])
 
-                # Tier 3 calibration session (Session AA): raw thermistor
-                # history, stir re-send and the calibration heater watchdog.
-                # FAST lane, before the OD read, with its own guard: nothing
-                # here may cost the tick its broadcast or its watchdog pet.
-                try:
-                    for alert in cal_service.tick(t["calibrated"], t.get("adc")):
-                        _emit_alert(
-                            alert["level"], alert["message"],
-                            category=alert.get("category", evlog.CATEGORY_CALIBRATION),
-                            vial=alert.get("vial"),
-                            dedup_key=alert.get("dedup_key"),
-                        )
-                except Exception as exc:
-                    log.exception("calibration session tick failed")
-                    _emit_alert(
-                        "critical",
-                        f"Calibration session tick failed: {exc}",
-                        category=evlog.CATEGORY_CALIBRATION,
-                        dedup_key="cal_tick_failed",
-                    )
+                # Tier 3 calibration session (Session AA), FAST lane, before
+                # the OD read. Never raises (see _calibration_tick).
+                _calibration_tick(t)
 
                 # --- OD lane: every OD_EVERY_N_TICKS ticks -------------
                 o = None

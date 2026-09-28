@@ -73,9 +73,6 @@ def test_temperature_install_reloads_every_live_cache():
 # Phase 1: a Tier 3 session reserves the machine
 # ---------------------------------------------------------------------------
 
-import time  # noqa: E402
-
-import app as A  # noqa: E402
 from test_calibration_tier3 import _ProbeSession  # noqa: E402
 
 
@@ -138,11 +135,10 @@ def test_emergency_stop_faults_the_session_so_stir_stays_off():
             _stop(flask_app)
 
 
-def test_a_failing_calibration_tick_never_costs_the_watchdog_pet():
+def test_a_failing_calibration_tick_is_contained_and_alerted():
+    """The sensor loop calls _calibration_tick inside its tick; it must never
+    raise, or that tick loses its broadcast and its watchdog pet."""
     with tempfile.TemporaryDirectory() as tmp:
-        saved = A.SENSOR_LOOP_INTERVAL_SECONDS
-        # Read by the loop on every iteration, including its first wait.
-        A.SENSOR_LOOP_INTERVAL_SECONDS = 0.05
         flask_app = _make_app(Path(tmp))
         try:
             state = _state(flask_app)
@@ -150,19 +146,26 @@ def test_a_failing_calibration_tick_never_costs_the_watchdog_pet():
             def boom(*_a, **_k):
                 raise RuntimeError("tick exploded")
             state.cal_service.tick = boom
-            pets = {"n": 0}
-            orig_pet = state.watchdog.pet
-
-            def counting_pet():
-                pets["n"] += 1
-                orig_pet()
-            state.watchdog.pet = counting_pet
-            deadline = time.monotonic() + 5.0
-            while pets["n"] < 2 and time.monotonic() < deadline:
-                time.sleep(0.05)
-            assert pets["n"] >= 2, "sensor loop stopped petting the watchdog"
+            state.calibration_tick({"calibrated": [22.0] * N_VIALS, "adc": None})
             messages = [e.get("message", "") for e in state.event_log.recent()]
             assert any("Calibration session tick failed" in m for m in messages)
         finally:
-            A.SENSOR_LOOP_INTERVAL_SECONDS = saved
+            _stop(flask_app)
+
+
+def test_calibration_heater_alerts_go_through_the_funnel():
+    with tempfile.TemporaryDirectory() as tmp:
+        flask_app = _make_app(Path(tmp))
+        try:
+            state = _state(flask_app)
+            _open_probe(state)
+            hot = {"calibrated": [30.0] * N_VIALS, "adc": [500.0] * N_VIALS}
+            hot["calibrated"][4] = 48.0
+            for _ in range(3):
+                state.calibration_tick(hot)
+            entries = [e for e in state.event_log.recent()
+                       if "heater watchdog" in e.get("message", "")]
+            assert len(entries) == 1 and entries[0].get("vial") == 4
+            assert int(state.manager.temp_setpoint_raw[4]) == 4095
+        finally:
             _stop(flask_app)
