@@ -351,13 +351,16 @@ def _read_od_pair(state: AppState) -> dict:
         r = state.manager.read_od_enhanced(
             OD_LED_POWER, **engine.od_acquisition_params()
         )
-        return {
-            "calibrated": list(r.calibrated),
-            "raw": list(r.raw),
-            "dark": list(r.dark),
-            "n_valid": list(r.n_valid),
-            "flags": list(r.flags),
-        }
+        return _od_reading_dict(r)
+    if getattr(state.manager, "od_cal_dark_subtracted", False):
+        # Against a dark-subtracted curve (Session AA) even an idle read must
+        # subtract the dark -- the naive read cannot, and would be biased by
+        # the whole dark offset. One lit and one dark read keeps standby
+        # bus time small.
+        r = state.manager.read_od_enhanced(
+            OD_LED_POWER, n_samples=1, dark_subtract=True, n_dark=1,
+        )
+        return _od_reading_dict(r)
     # Naive idle path (unchanged conversion) with neutral diagnostics. NaN
     # (timed-out) values are flagged "dropped"; everything else "ok".
     values = state.manager.read_od(OD_LED_POWER)
@@ -369,6 +372,16 @@ def _read_od_pair(state: AppState) -> dict:
         "dark": [float("nan")] * N_VIALS,
         "n_valid": [1] * N_VIALS,
         "flags": flags,
+    }
+
+
+def _od_reading_dict(r) -> dict:
+    return {
+        "calibrated": list(r.calibrated),
+        "raw": list(r.raw),
+        "dark": list(r.dark),
+        "n_valid": list(r.n_valid),
+        "flags": list(r.flags),
     }
 
 
@@ -909,11 +922,28 @@ def create_app(use_mock: bool):
     # Exposed for the API tests, which drive installs white-box.
     state.reload_calibration = _reload_calibration
 
+    def _blank_is_stale(blank: dict | None) -> bool:
+        """A per-run blank re-anchors ONE curve: its c_run is meaningless on
+        any other (and against a dark-subtracted curve it was computed from
+        the wrong signal). Stale once a new OD version has been installed."""
+        if blank is None:
+            return False
+        parent = (blank.get("conditions") or {}).get("parent_od_cal")
+        return parent != cal_service.store.current_versions().get("od")
+
     def _apply_experiment_blank(name: str) -> None:
         """Re-apply a committed per-run blank to the live manager (used on
-        commit and on crash-resume, so a restart keeps the re-anchored OD)."""
+        commit and on crash-resume, so a restart keeps the re-anchored OD).
+        A blank taken against a different OD calibration is NOT applied."""
         blank = cal_service.load_experiment_blank(name)
         if blank is None:
+            return
+        if _blank_is_stale(blank):
+            log.warning(
+                "not applying the OD blank for '%s': it was taken against OD "
+                "calibration %s, not the installed one", name,
+                (blank.get("conditions") or {}).get("parent_od_cal"),
+            )
             return
         c_run = blank.get("fit", {}).get("c_run") or {}
         try:
@@ -1525,6 +1555,21 @@ def create_app(use_mock: bool):
         # for sterile medium, vial-dependent. Overridable only explicitly,
         # and the override is recorded through the alert funnel.
         blank_missing = not (EXPERIMENTS_DIR / name / "od_blank.json").is_file()
+        if not blank_missing and _blank_is_stale(cal_service.load_experiment_blank(name)):
+            # Taken against an OD calibration that has since been replaced
+            # (Session AA): it would re-anchor the wrong curve. Retake it --
+            # or start without one (recorded), exactly as for a missing blank.
+            if not body.get("allow_missing_od_blank"):
+                return jsonify(
+                    error=(
+                        f"the OD blank for '{name}' was taken against an OD "
+                        "calibration that has since been replaced — retake it "
+                        "(Calibration tab), or pass allow_missing_od_blank=true "
+                        "to start without one (recorded)"
+                    ),
+                    code="stale_od_blank",
+                ), 409
+            blank_missing = True
         if blank_missing and not body.get("allow_missing_od_blank"):
             return jsonify(
                 error=(
@@ -2344,6 +2389,69 @@ def create_app(use_mock: bool):
     def api_temp_cal_abort():
         return jsonify(cal_service.temp_abort())
 
+    # --- Tier 3: OD dilution series (§19.5 / PROTOCOL §8.2) -----------------
+
+    @flask_app.route("/api/calibration/od/series/start", methods=["POST"])
+    @_cal_route(idle=True)
+    def api_od_series_start():
+        body = request.get_json(silent=True) or {}
+        return jsonify(cal_service.series_start(body))
+
+    @flask_app.route("/api/calibration/od/series/apply", methods=["POST"])
+    @_cal_route(idle=True)
+    def api_od_series_apply():
+        return jsonify(cal_service.series_apply())
+
+    @flask_app.route("/api/calibration/od/series/session", methods=["GET"])
+    @_cal_route(mutating=False)
+    def api_od_series_session():
+        preview = request.args.get("preview", "") in ("1", "true", "yes")
+        return jsonify(cal_service.series_session(preview=preview))
+
+    @flask_app.route("/api/calibration/od/series/point", methods=["POST"])
+    @_cal_route()
+    def api_od_series_point():
+        body = request.get_json(silent=True) or {}
+        return jsonify(cal_service.series_point(
+            entries=body.get("entries"),
+            spec_reading=body.get("spec_reading"),
+            dilution_factor=body.get("dilution_factor", 1),
+            vials=body.get("vials"),
+            settle_check=body.get("settle_check", True) is not False,
+        ))
+
+    @flask_app.route("/api/calibration/od/series/discard", methods=["POST"])
+    @_cal_route()
+    def api_od_series_discard():
+        body = request.get_json(silent=True) or {}
+        point_id = body.get("point_id")
+        if not isinstance(point_id, int) or isinstance(point_id, bool):
+            return jsonify(error="'point_id' must be an integer"), 400
+        return jsonify(cal_service.series_discard(point_id))
+
+    @flask_app.route("/api/calibration/od/series/fit", methods=["POST"])
+    @_cal_route()
+    def api_od_series_fit():
+        body = request.get_json(silent=True) or {}
+        return jsonify(cal_service.series_fit(body.get("exclude_vials")))
+
+    @flask_app.route("/api/calibration/od/series/finish", methods=["POST"])
+    @_cal_route(idle=True)
+    def api_od_series_finish():
+        body = request.get_json(silent=True) or {}
+        result = cal_service.series_finish(
+            exclude_vials=body.get("exclude_vials"),
+            override_reason=body.get("override_reason"),
+            operator=body.get("operator"),
+        )
+        _reload_calibration("od", result["version"])
+        return jsonify(result)
+
+    @flask_app.route("/api/calibration/od/series/abort", methods=["POST"])
+    @_cal_route()
+    def api_od_series_abort():
+        return jsonify(cal_service.series_abort())
+
     # --- raw escape hatches, calibration-only (§19.6) ------------------------
 
     @flask_app.route("/api/calibration/raw/temperature", methods=["POST"])
@@ -3035,12 +3143,59 @@ def create_app(use_mock: bool):
     )
     sensor_thread.start()
 
+    def _check_resumed_calibration(name: str) -> None:
+        """A run resumed onto calibration versions other than the ones its
+        config.json recorded -- possible only if a Tier 3 install landed
+        while its resume had failed, but then silent without this.
+
+        OD: its numbers are no longer comparable across the restart, and
+        its blank is not applied (_apply_experiment_blank) -- critical, the
+        operator decides. Temperature: the persisted raw setpoints were
+        converted through the old curve; recompute them from the °C
+        targets so the vials go to the temperature the run asked for."""
+        try:
+            config = json.loads(
+                (EXPERIMENTS_DIR / name / "config.json").read_text(encoding="utf-8")
+            )
+        except Exception:
+            return
+        recorded = config.get("calibration") or {}
+        current = cal_service.store.current_versions()
+        if recorded.get("od") and recorded.get("od") != current.get("od"):
+            _emit_alert(
+                "critical",
+                f"Experiment '{name}' resumed on OD calibration "
+                f"{current.get('od')}, not the {recorded.get('od')} it started "
+                "with — its OD is not comparable across the restart and its "
+                "per-run blank was not applied. Stop and restart the run.",
+                category=evlog.CATEGORY_CALIBRATION,
+                dedup_key=("resume_od_calibration_changed", name),
+            )
+        if (recorded.get("temperature")
+                and recorded.get("temperature") != current.get("temperature")):
+            run = state.engine.get_run(name)
+            changed = []
+            try:
+                changed = run.reapply_temperature_targets() if run is not None else []
+            except Exception:
+                log.exception("recomputing heater setpoints for '%s' failed", name)
+            _emit_alert(
+                "warning",
+                f"Experiment '{name}' resumed on temperature calibration "
+                f"{current.get('temperature')}, not {recorded.get('temperature')} "
+                "— heater setpoints recomputed from its °C targets through the "
+                f"installed curve (changed on vials {changed})",
+                category=evlog.CATEGORY_CALIBRATION,
+                dedup_key=("resume_temperature_calibration_changed", name),
+            )
+
     # Recover any in-flight experiment from a previous server lifetime.
     # Runs after the sensor thread has started so the engine's run_cycle
     # ticks will pick up immediately.
     try:
         for resumed in state.engine.resume_on_startup():
             log.info("resumed experiment '%s' from previous server run", resumed)
+            _check_resumed_calibration(resumed)
             # The blank re-anchor lives in memory; a restart must re-apply it
             # or the resumed run's OD silently reverts to the offset curve.
             _apply_experiment_blank(resumed)

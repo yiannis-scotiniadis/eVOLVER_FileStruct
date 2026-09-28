@@ -62,6 +62,7 @@ from experiment_engine import (
     ExperimentStatus,
     InvalidExperimentStateError,
     _parse_od_acquisition,
+    materialize_od_acquisition,
 )
 from vessels import VesselRegistry
 
@@ -402,7 +403,14 @@ class ExperimentSupervisor:
                     f"vials {taken} belong to experiment {who}; a vial can be "
                     "in one experiment at a time"
                 )
-            self._check_od_acquisition_locked(parameters or {})
+            # Resolve the dark_subtract default against the installed curve
+            # BEFORE comparing with the running experiments, whose configs
+            # carry the resolved value.
+            parameters = materialize_od_acquisition(
+                parameters or {},
+                bool(getattr(self._manager, "od_cal_dark_subtracted", False)),
+            )
+            self._check_od_acquisition_locked(parameters)
             self._check_vessel_sharing_locked(name, mode, vials, parameters, media, groups)
 
             engine = self._new_engine()

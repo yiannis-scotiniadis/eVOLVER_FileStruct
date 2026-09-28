@@ -825,3 +825,302 @@ def test_thermistor_start_warns_when_the_span_is_unreachable():
         out = svc.temp_start({"operator": "t", "bench_temp_c": 27.0})
         assert any("cannot reach" in w for w in out["warnings"])
         assert any("vial_map" in w for w in out["warnings"])
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: OD dilution series + the dark-subtraction switch (§8.2)
+# ---------------------------------------------------------------------------
+
+import od_curve_fit as F  # noqa: E402
+from calibration_service import OD_SERIES_SOURCE  # noqa: E402
+
+LEGACY_OD = np.genfromtxt(REPO_CAL / "OD_cal.txt", delimiter=",")
+SERIES_LEVELS = [0.0, 0.05, 0.1, 0.2, 0.4, 0.8, 1.2, 1.6, 2.0]
+DARK = 1200.0
+
+
+def _true_ds_rows() -> np.ndarray:
+    """The 2016 curves on dark-subtracted signal, blank-anchored at 58 000."""
+    rows = LEGACY_OD.copy()
+    rows[0] -= DARK
+    rows[1] -= DARK
+    a, b, _c, d = rows
+    rows[2] = np.log10((b - a) / (58000.0 - DARK - a) - 1.0) / d
+    return rows
+
+
+class OdRig:
+    """collect_od_raw stand-in: LED 0 reads the per-vial dark floor; a lit
+    LED reads dark + S_true(OD) from a true dark-subtracted curve."""
+
+    def __init__(self, rows=None, dark=DARK):
+        self.rows = _true_ds_rows() if rows is None else np.asarray(rows, float)
+        self.dark = np.full(N_VIALS, float(dark))
+        self.od = np.zeros(N_VIALS)
+        self.sd = np.full(N_VIALS, 20.0)
+        self.temp_setpoint_raw = np.full(N_VIALS, HEATER_OFF_SETPOINT, dtype=int)
+        self.stir_speed = np.zeros(N_VIALS, dtype=int)
+        self.temp_cal = LEGACY_TEMP.copy()
+        self.lit_offset = np.zeros(N_VIALS)     # to force a bad point
+
+    def set_od(self, vials, od):
+        for v in vials:
+            self.od[v] = od
+
+    def collect_od_raw(self, led_power, n_samples=5):
+        leds = led_power if isinstance(led_power, (list, tuple)) else [led_power] * N_VIALS
+        a, b, c, d = self.rows
+        lit = self.dark + F.signal_from_od(self.od, a, b, c, d) + self.lit_offset
+        med = [self.dark[v] if leds[v] == 0 else lit[v] for v in range(N_VIALS)]
+        return {"median": [float(x) for x in med], "sd": self.sd.tolist(),
+                "n_valid": [n_samples] * N_VIALS}
+
+    def set_temperature_raw(self, setpoints, floor_override=None):
+        self.temp_setpoint_raw = np.asarray(setpoints, dtype=int)
+        return [22.0] * N_VIALS
+
+    def set_stir(self, values):
+        self.stir_speed = np.asarray(values, dtype=int)
+
+
+def _series_service(tmp: Path, rig: OdRig) -> CalibrationService:
+    _legacy_store(tmp)
+    (tmp / "experiments").mkdir(exist_ok=True)
+    return CalibrationService(tmp / "calibration", tmp / "experiments", rig, clock=_Clock())
+
+
+def _run_series(svc, rig, vials=None, levels=SERIES_LEVELS):
+    vials = list(range(N_VIALS)) if vials is None else vials
+    svc.series_start({"operator": "t", "vials": vials, "standard": "heat-killed E. coli",
+                      "spectrophotometer": "Genesys 30"})
+    svc.series_apply()
+    for od in levels:
+        rig.set_od(vials, od)
+        # Dense standards are read diluted on the benchtop instrument.
+        factor = 4.0 if od > 1.0 else 1.0
+        svc.series_point(spec_reading=od / factor, dilution_factor=factor, vials=vials)
+
+
+def _od(rows, v, s):
+    a, b, c, d = rows[:, v]
+    return float(F.od_from_signal(s, a, b, c, d))
+
+
+def test_series_recovers_the_true_curve_and_installs_it_dark_subtracted():
+    with tempfile.TemporaryDirectory() as tmp:
+        rig = OdRig()
+        svc = _series_service(Path(tmp), rig)
+        _run_series(svc, rig)
+        out = svc.series_finish()
+        assert out["qc"]["passed"], out["qc"]
+        env = svc.store.get_current("od")
+        rows = np.asarray(env["data"]["rows"])
+        assert np.allclose(rows, rig.rows, rtol=1e-6), np.abs(rows / rig.rows - 1).max()
+        assert env["data"]["dark_subtracted"] is True
+        assert env["fit"]["per_vial_source"] == [OD_SERIES_SOURCE] * N_VIALS
+        assert env["conditions"]["standard"] == "heat-killed E. coli"
+        # The sidecar that lets the dark read graduate to a correction.
+        meta = json.loads((svc.store.root / "OD_cal.meta.json").read_text())
+        assert meta["dark_subtracted"] is True
+        # c sits below OD 0 on these shapes: warned, never refused.
+        assert any("inflection" in w for w in out["qc"]["warnings"])
+        assert out["review"]["1"]["previous_od_at_blank"] is not None
+        stale = svc.store.staleness()["od"]
+        assert not any("never verified" in r for r in stale["reasons"]), stale
+        assert svc.tier3_status() is None
+
+
+def test_five_priority_vials_install_dark_subtracted_and_convert_the_rest_exactly():
+    """SPEC §19.5's short-bench-time recommendation. The other eleven keep
+    their 2016 curve, shifted to dark-subtracted signal: same OD from S - D
+    as the old curve gave from S."""
+    with tempfile.TemporaryDirectory() as tmp:
+        rig = OdRig()
+        svc = _series_service(Path(tmp), rig)
+        _run_series(svc, rig, vials=[0, 1, 6, 14, 15])
+        out = svc.series_finish()
+        assert out["measured_vials"] == [0, 1, 6, 14, 15]
+        assert out["converted_vials"] == [2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13]
+        rows = np.asarray(svc.store.get_current("od")["data"]["rows"])
+        for v in out["converted_vials"]:
+            for s in (40_000.0, 50_000.0, 57_000.0):
+                if LEGACY_OD[0, v] < s < LEGACY_OD[1, v]:
+                    assert abs(_od(rows, v, s - DARK) - _od(LEGACY_OD, v, s)) < 1e-9
+        src = svc.store.get_current("od")["fit"]["per_vial_source"]
+        assert src[0] == OD_SERIES_SOURCE and src[2] == "legacy-import-2016"
+        assert svc.store.get_current("od")["data"]["dark_subtracted"] is True
+
+
+def test_series_refuses_too_few_levels_non_monotone_and_bad_residuals():
+    with tempfile.TemporaryDirectory() as tmp:
+        rig = OdRig()
+        svc = _series_service(Path(tmp), rig)
+        svc.series_start({"operator": "t", "vials": [3, 4, 5]})
+        svc.series_apply()
+        for od in SERIES_LEVELS:
+            rig.set_od([3, 4, 5], od)
+            entries = [{"vial": 3, "spec_reading": od}]
+            if od <= 1.2:                                     # vial 4: 7 levels
+                entries.append({"vial": 4, "spec_reading": od})
+            # vial 5: the 0.4 and 0.8 standards' readings swapped on paper
+            recorded = {0.4: 0.8, 0.8: 0.4}.get(od, od)
+            entries.append({"vial": 5, "spec_reading": recorded})
+            svc.series_point(entries=entries)
+        try:
+            svc.series_finish()
+        except QCRefusal as exc:
+            failures = " | ".join(exc.qc["failures"])
+            assert "vial 4: 7 OD levels < 8" in failures, failures
+            assert "vial 5" in failures and ("does not fall" in failures
+                                             or "residual" in failures), failures
+            assert "vial 3" not in failures, failures
+        else:
+            raise AssertionError("series with bad vials installed without override")
+        out = svc.series_finish(exclude_vials=[4, 5])
+        assert out["measured_vials"] == [3]
+
+
+def test_lower_asymptote_inside_the_noise_is_refused():
+    """Vial 1's 2016 failure mode: the curve's lower asymptote sits right
+    under the densest point, so it diverges inside its own range."""
+    with tempfile.TemporaryDirectory() as tmp:
+        rig = OdRig()
+        rig.sd[1] = 800.0                     # the dense end is this noisy
+        svc = _series_service(Path(tmp), rig)
+        _run_series(svc, rig, vials=[1])
+        fit = svc.series_fit()
+        assert fit["qc"]["criteria"]["1"]["lower_asymptote_margin"] is False
+        assert any("diverges inside its own range" in f for f in fit["qc"]["failures"])
+
+
+def test_series_discard_and_signal_below_dark():
+    with tempfile.TemporaryDirectory() as tmp:
+        rig = OdRig()
+        svc = _series_service(Path(tmp), rig)
+        _run_series(svc, rig, vials=[9])
+        # A bad extra point, then discarded: the fit is unaffected.
+        rig.set_od([9], 0.3)
+        out = svc.series_point(entries=[{"vial": 9, "spec_reading": 0.9}])
+        bad = out["captured"][0]["id"]
+        assert svc.series_fit()["qc"]["passed"] is False
+        svc.series_discard(bad)
+        assert svc.series_fit()["qc"]["passed"] is True
+        # LED-on not above the dark: rejected, not recorded.
+        rig.lit_offset[9] = -1e6
+        try:
+            svc.series_point(entries=[{"vial": 9, "spec_reading": 0.3}])
+        except ValueError as exc:
+            assert "not above the dark" in str(exc)
+        else:
+            raise AssertionError("recorded a point whose signal was below the dark")
+
+
+def test_series_survives_a_restart_suspended_with_its_points():
+    with tempfile.TemporaryDirectory() as tmp:
+        rig = OdRig()
+        svc = _series_service(Path(tmp), rig)
+        _run_series(svc, rig, vials=[2], levels=SERIES_LEVELS[:5])
+        svc2 = CalibrationService(Path(tmp) / "calibration", Path(tmp) / "experiments",
+                                  rig, clock=_Clock())
+        svc2.bootstrap()
+        st = svc2.series_session()
+        assert st["state"] == "suspended" and st["per_vial"]["2"]["n_levels"] == 5
+        svc2.series_apply()
+        for od in SERIES_LEVELS[5:]:
+            rig.set_od([2], od)
+            svc2.series_point(spec_reading=od, vials=[2])
+        assert svc2.series_fit()["qc"]["criteria"]["2"]["n_levels"] is True
+        prev = svc2.series_session(preview=True)["per_vial"]["2"]["preview"]
+        assert prev["r2"] > 0.999
+
+
+def test_blank_against_a_dark_subtracted_curve_subtracts_the_dark():
+    with tempfile.TemporaryDirectory() as tmp:
+        rig = OdRig()
+        svc = _series_service(Path(tmp), rig)
+        _run_series(svc, rig)
+        svc.series_finish()
+        ds_rows = np.asarray(svc.store.get_current("od")["data"]["rows"])
+        # A blank run on the new curve.
+        import test_calibration_service as T
+        clock = T.FakeClock()
+        svc.tracker = TempStabilityTracker(clock=clock)
+        mgr = T.FakeManager(dark=1500.0, blank=57_000.0)
+        svc.manager = mgr
+        sid = T._blank_session(svc, clock)["session"]
+        svc.blank_dark(sid)
+        svc.blank_measure(sid)
+        result = svc.blank_commit(sid)
+        blank = svc.load_experiment_blank("exp1")
+        assert blank["conditions"]["dark_subtracted"] is True
+        assert blank["data"]["blank_signal"][0] == 57_000.0 - 1500.0
+        # The re-anchored curve reads 0 at the DARK-SUBTRACTED blank.
+        reanchored = ds_rows.copy()
+        reanchored[2, 0] = result["c_run"]["0"]
+        assert abs(_od(reanchored, 0, 57_000.0 - 1500.0)) < 1e-9
+        # The previous blank (none here) or one on another curve: the c_run
+        # drift reference resets instead of false-failing.
+        assert result["qc"]["passed"]
+
+
+def test_c_run_drift_reference_resets_across_od_versions():
+    import test_calibration_service as T
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        clock = T.FakeClock()
+        svc = T._service(tmp, clock=clock)
+        T._install_synthetic_od(svc, version="2026-01-01T000000Z")
+        sid = T._blank_session(svc, clock, name="first")["session"]
+        svc.blank_dark(sid)
+        svc.blank_measure(sid)
+        svc.blank_commit(sid)
+        # A new curve whose c is far from the old one.
+        od = T._synthetic_od_cal()
+        od[2] -= 1.0
+        svc.store.save_version("od", make_envelope(
+            "od", operator="t", source="dilution-series", conditions={"n": 1},
+            data={"rows": od.tolist(), "dark_subtracted": False},
+            version="2026-02-01T000000Z",
+        ))
+        sid = T._blank_session(svc, clock, name="second")["session"]
+        svc.blank_dark(sid)
+        svc.blank_measure(sid)
+        result = svc.blank_commit(sid)       # no c_run failure across curves
+        assert result["qc"]["passed"], result["qc"]
+        assert any("reference resets" in w for w in result["qc"]["warnings"])
+
+
+def test_growth_context_reads_a_real_committed_blank():
+    """Before Session AA growth_context iterated .items() on the LIST
+    blank_commit writes, raised, and no run ever got per-vial OD floors."""
+    import test_calibration_service as T
+    with tempfile.TemporaryDirectory() as tmp:
+        clock = T.FakeClock()
+        svc = T._service(Path(tmp), clock=clock)
+        T._install_synthetic_od(svc)
+        sid = T._blank_session(svc, clock)["session"]
+        svc.blank_dark(sid)
+        svc.blank_measure(sid)
+        svc.blank_commit(sid)
+        ctx = svc.growth_context("exp1")
+        assert ctx["blank_present"] is True
+        assert set(ctx["od_floor"]) == set(range(N_VIALS))
+
+
+def test_idle_od_read_subtracts_the_dark_against_a_dark_subtracted_curve():
+    """Through SerialManager + FakeSerial: the mock returns OD directly and
+    could not catch a naive read against a dark-subtracted curve."""
+    import types
+    import app as A
+    with tempfile.TemporaryDirectory() as tmp:
+        sm, fake = fresh_dark_marked(Path(tmp))
+
+        def turb(v):
+            return ("turb" + ",".join(str(x) for x in [v] * N_VIALS) + ",end\n").encode()
+        fake.read_queue = [turb(1200), turb(50000)]
+        state = types.SimpleNamespace(manager=sm, engine=None, od_cal=sm.od_cal)
+        out = A._read_od_pair(state)
+        assert out["raw"][0] == 50000 - 1200
+        assert fake.write_log[0].startswith(b"we0,")          # the dark read
+        want = sm._od_raw_to_OD(np.full(N_VIALS, 50000.0 - 1200.0))[0]
+        assert abs(out["calibrated"][0] - want) < 1e-9

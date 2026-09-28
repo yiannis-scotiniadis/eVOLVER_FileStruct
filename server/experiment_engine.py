@@ -572,6 +572,27 @@ def _parse_od_acquisition(parameters: dict) -> dict:
     }
 
 
+def materialize_od_acquisition(parameters: dict, curve_dark_subtracted: bool) -> dict:
+    """``parameters`` with ``od_acquisition.dark_subtract`` made explicit
+    when the installed OD curve is dark-subtracted (Session AA).
+
+    Against such a curve the default must be True -- the curve was fit on
+    LED-on minus LED-off signal -- and it is WRITTEN into the experiment's
+    config, never left implicit: an implicit default would re-resolve
+    against whatever curve is installed when the run is resumed. Against a
+    non-dark-subtracted curve nothing changes (the module default, False, is
+    fixed), so pre-Session-AA configs stay byte-identical. An explicit value
+    is never overwritten; the create-time guard judges it."""
+    params = dict(parameters or {})
+    if not curve_dark_subtracted:
+        return params
+    block = params.get("od_acquisition")
+    block = dict(block) if isinstance(block, dict) else {}
+    block.setdefault("dark_subtract", True)
+    params["od_acquisition"] = block
+    return params
+
+
 def _validate_and_normalize_media(media: dict) -> dict:
     """Validate the media block from POST /experiments/create.
 
@@ -1041,20 +1062,32 @@ class ExperimentEngine:
 
         # Validate the optional od_acquisition block up front so a malformed
         # config fails at create time (HTTP 400) rather than at first read.
-        od_acq = _parse_od_acquisition(parameters or {})
+        curve_ds = bool(getattr(self._manager, "od_cal_dark_subtracted", False))
+        parameters = materialize_od_acquisition(parameters or {}, curve_ds)
+        od_acq = _parse_od_acquisition(parameters)
         # Dark-subtraction coherence guard (SPEC §19.2 / CALIBRATION_PROTOCOL
-        # §13): a curve fit on non-dark-subtracted signal gives silently wrong
-        # OD when the reader subtracts the dark first. Hard error, not a
-        # warning — the sidecar (OD_cal.meta.json) is the only thing that may
-        # authorise it.
-        if od_acq["dark_subtract"] and not getattr(
-            self._manager, "od_cal_dark_subtracted", False
-        ):
+        # §13), in BOTH directions: subtracting the dark before a curve fit
+        # on raw signal, or not subtracting it before a curve fit on
+        # dark-subtracted signal, are equally silently wrong OD. Hard errors,
+        # not warnings -- the sidecar (OD_cal.meta.json) decides.
+        if od_acq["dark_subtract"] and not curve_ds:
             raise ValueError(
                 "od_acquisition.dark_subtract=true requires an OD calibration "
                 "whose OD_cal.meta.json sidecar records dark_subtracted=true; "
                 "the loaded calibration was fit on non-dark-subtracted signal "
                 "(see CALIBRATION_PROTOCOL.md §5.4)"
+            )
+        if curve_ds and not od_acq["dark_subtract"]:
+            raise ValueError(
+                "od_acquisition.dark_subtract=false against a dark-subtracted "
+                "OD calibration: the installed curve was fit on LED-on minus "
+                "LED-off signal, so reading without the dark gives silently "
+                "wrong OD — omit the key (it defaults to true) or set it true"
+            )
+        if od_acq["dark_subtract"] and od_acq["n_dark"] < 1:
+            raise ValueError(
+                "od_acquisition.dark_subtract=true needs n_dark >= 1 — with no "
+                "dark read there is nothing to subtract"
             )
 
         # Validate pump_flow_rates shape up front so a malformed array fails
@@ -3515,6 +3548,33 @@ class ExperimentEngine:
         for vial in self._vials:
             stir_list[vial] = self._stir_by_vial.get(vial, 0)
         self._manager.set_stir(stir_list)
+
+    def reapply_temperature_targets(self) -> list[int]:
+        """Recompute every live vial's heater setpoint from its group's °C
+        target through the CURRENT calibration, and re-send.
+
+        For a run resumed onto a temperature calibration newer than the one
+        it started with (Session AA): the raw setpoints in state.json were
+        converted through the old curve, and ``resume_from_state`` restores
+        them verbatim. Latched-fault vials stay parked. An overrun step-down
+        is lost -- the heater safety re-derives it if still needed. Returns
+        the vials whose setpoint changed."""
+        with self._lock:
+            if self._temp_cal is None:
+                return []
+            targets = run_config.temperature_c_by_vial(self._groups)
+            changed: list[int] = []
+            for vial in self._vials:
+                if self._vial_faults.get(vial) is not None:
+                    continue
+                new_raw = self._C_to_raw(targets[vial], vial)
+                if new_raw != self._setpoint_raw.get(vial):
+                    self._setpoint_raw[vial] = new_raw
+                    changed.append(vial)
+            if changed:
+                self._state_dirty = True
+                self._apply_temperature_locked()
+            return changed
 
     def _apply_temperature_locked(self) -> None:
         """Re-send the temperature raw-setpoint array reflecting current

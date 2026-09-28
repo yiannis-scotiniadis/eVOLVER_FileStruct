@@ -40,6 +40,7 @@ from typing import Any, Callable, Optional
 
 import numpy as np
 
+import od_curve_fit
 import run_config
 from serial_manager import DEFAULT_RAW_FLOOR, HEATER_OFF_SETPOINT, MAX_SAFE_TEMP_C
 
@@ -118,6 +119,21 @@ TEMP_CAL_P2_HEATING_COUNTS = 5.0
 TEMP_CAL_PROBE_ADVISORY_C = 5.0
 TEMP_CAL_SOURCE = "two-point-reference"
 
+# --- OD dilution series (CALIBRATION_PROTOCOL §8.2, amended in Session AA).
+OD_SERIES_SOURCE = "dilution-series"
+OD_SERIES_MIN_LEVELS = 8             # "at least 8 points" (§8.2 step 1)
+OD_SERIES_R2_MIN = 0.99
+OD_SERIES_RESIDUAL_ABS = 0.02        # OD
+OD_SERIES_RESIDUAL_FRACTION = 0.05   # of the point's OD, whichever is larger
+OD_SERIES_LOWER_MARGIN_SD = 5.0      # lowest signal must clear a by this many SDs
+OD_SERIES_MIN_SD_COUNTS = 10.0       # floor on the SD used for that margin
+OD_SERIES_BLANK_OD_MAX = 0.05        # a point at or below this counts as a blank
+OD_SERIES_TOP_RESOLUTION_SD = 2.0    # counts per 0.01 OD at the top vs blank SD
+OD_SERIES_SD_WARN = 300.0            # counts, provisional (the blank's limit)
+OD_SERIES_SETTLE_TOL_C = 0.5
+OD_SERIES_SETTLE_MINUTES = 5.0
+ADC_CEILING = 65535.0                # b above this is an extrapolation (§8.2)
+
 # --- Staleness thresholds (CALIBRATION_PROTOCOL §13).
 PUMP_STALE_DAYS = 30.0
 PUMP_STALE_CUMULATIVE_SECONDS = 40.0 * 3600.0
@@ -191,6 +207,34 @@ def per_vial_sources(env: Optional[dict]) -> list[Optional[str]]:
 
 def _is_legacy_source(source: Optional[str]) -> bool:
     return str(source or "").startswith("legacy-import")
+
+
+def _per_vial_values(values) -> dict[int, float]:
+    """``{vial: value}`` from a 16-list or a ``{vial: value}`` map,
+    dropping missing and non-finite entries."""
+    if isinstance(values, dict):
+        items = values.items()
+    elif isinstance(values, list):
+        items = enumerate(values)
+    else:
+        return {}
+    out: dict[int, float] = {}
+    for key, value in items:
+        try:
+            v, x = int(key), float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(x):
+            out[v] = x
+    return out
+
+
+def _finite_or_none(x) -> Optional[float]:
+    try:
+        x = float(x)
+    except (TypeError, ValueError):
+        return None
+    return x if math.isfinite(x) else None
 
 
 def make_envelope(
@@ -988,6 +1032,13 @@ class TempStabilityTracker:
             while self._samples and self._samples[0][0] < cutoff:
                 self._samples.pop(0)
 
+    def latest(self) -> list[float]:
+        """The most recent reading (NaN per vial before the first)."""
+        with self._lock:
+            if not self._samples:
+                return [float("nan")] * N_VIALS
+            return list(self._samples[-1][1])
+
     def reset(self) -> None:
         """Forget the window. Called when a new temperature calibration is
         installed: the history is °C on the OLD scale, and the blank's
@@ -1697,6 +1748,105 @@ class TempCalSession(Tier3Session):
 
 
 TIER3_SESSION_CLASSES["temperature"] = TempCalSession
+
+
+class OdSeriesSession(Tier3Session):
+    """OD dilution series (CALIBRATION_PROTOCOL §8.2): known turbidity
+    standards in the vials, true OD600 from a benchtop spectrophotometer,
+    raw photodiode signal AND a dark read at every capture.
+
+    Every capture reads all sixteen vials lit and dark, so every vial --
+    measured or not -- has a dark median to convert its previous curve to
+    dark-subtracted signal with. Points may give each vial its own OD (a
+    rotated design) or one OD to many vials (one dilution in all of them).
+    Discarded points stay in the record."""
+
+    kind = "od_series"
+
+    def __init__(
+        self,
+        *,
+        operator: str,
+        vials: list[int],
+        stir_pwm: int,
+        led_power: int = 2125,
+        target_temp_c: Optional[float] = None,
+        n_samples: int = 5,
+        standard: str = "",
+        medium: str = "",
+        spectrophotometer: str = "",
+        points_expected: int = OD_SERIES_MIN_LEVELS,
+    ) -> None:
+        super().__init__(operator=operator, vials=vials, stir_pwm=stir_pwm)
+        led_power = int(led_power)
+        if not (1 <= led_power <= 2200):
+            raise ValueError(f"led_power must be in 1..2200, got {led_power}")
+        if target_temp_c is not None:
+            target_temp_c = float(target_temp_c)
+            if not (22.0 <= target_temp_c <= MAX_SAFE_TEMP_C):
+                raise ValueError(
+                    f"target_temp_c must be in 22..{MAX_SAFE_TEMP_C:.0f} °C, "
+                    "or null to run with the heaters off"
+                )
+        if not (1 <= int(n_samples) <= 25):
+            raise ValueError(f"n_samples must be in 1..25, got {n_samples}")
+        self.led_power = led_power
+        self.target_temp_c = target_temp_c
+        self.n_samples = int(n_samples)
+        self.standard = str(standard or "")
+        self.medium = str(medium or "")
+        self.spectrophotometer = str(spectrophotometer or "")
+        self.points_expected = int(points_expected)
+        self.points: list[dict] = []
+        # One per capture: the dark medians/SDs of ALL sixteen vials.
+        self.dark_captures: list[dict] = []
+        self._next_point = 1
+        self._next_capture = 1
+
+    def active_points(self, vial: int) -> list[dict]:
+        return [p for p in self.points if p["vial"] == vial and not p["discarded"]]
+
+    def dark_median(self, vial: int) -> float:
+        values = [c["median"][vial] for c in self.dark_captures
+                  if c["median"][vial] is not None and math.isfinite(c["median"][vial])]
+        return float(np.median(values)) if values else float("nan")
+
+    def to_dict(self) -> dict:
+        d = self._base_dict()
+        d.update({
+            "led_power": self.led_power,
+            "target_temp_c": self.target_temp_c,
+            "n_samples": self.n_samples,
+            "standard": self.standard,
+            "medium": self.medium,
+            "spectrophotometer": self.spectrophotometer,
+            "points_expected": self.points_expected,
+            "points": self.points,
+            "dark_captures": self.dark_captures,
+            "next_point": self._next_point,
+            "next_capture": self._next_capture,
+        })
+        return d
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "OdSeriesSession":
+        s = cls(
+            operator=d.get("operator", "unknown"), vials=d["vials"],
+            stir_pwm=d.get("stir_pwm", 8), led_power=d.get("led_power", 2125),
+            target_temp_c=d.get("target_temp_c"), n_samples=d.get("n_samples", 5),
+            standard=d.get("standard", ""), medium=d.get("medium", ""),
+            spectrophotometer=d.get("spectrophotometer", ""),
+            points_expected=d.get("points_expected", OD_SERIES_MIN_LEVELS),
+        )
+        s._restore_base(d)
+        s.points = list(d.get("points") or [])
+        s.dark_captures = list(d.get("dark_captures") or [])
+        s._next_point = int(d.get("next_point", len(s.points) + 1))
+        s._next_capture = int(d.get("next_capture", len(s.dark_captures) + 1))
+        return s
+
+
+TIER3_SESSION_CLASSES["od_series"] = OdSeriesSession
 
 
 # ---------------------------------------------------------------------------
@@ -2684,6 +2834,552 @@ class CalibrationService:
             self._end_tier3()
             return {"status": "aborted"}
 
+    # -- Tier 3: OD dilution series (§8.2) ---------------------------------
+
+    def series_start(self, body: dict) -> dict:
+        """Open an OD dilution-series session. It drives nothing until
+        ``series_apply``."""
+        with self._lock:
+            if self.store.get_current("od") is None:
+                raise CalibrationConflict(
+                    "no OD calibration is installed — vials this series does "
+                    "not measure are carried forward from it"
+                )
+            s = OdSeriesSession(
+                operator=body.get("operator", "unknown"),
+                vials=body.get("vials") or list(range(N_VIALS)),
+                stir_pwm=body.get("stir_pwm", 8),
+                led_power=body.get("led_power", 2125),
+                target_temp_c=body.get("target_temp_c"),
+                n_samples=body.get("n_samples", 5),
+                standard=body.get("standard", ""),
+                medium=body.get("medium", ""),
+                spectrophotometer=body.get("spectrophotometer", ""),
+                points_expected=body.get("points_expected", OD_SERIES_MIN_LEVELS),
+            )
+            if s.target_temp_c is not None:
+                self._installed_temp_cal()
+            self._begin_tier3(s)
+            warnings_: list[str] = []
+            if not s.standard:
+                warnings_.append(
+                    "record the turbidity standard (killed cells, heat-fixed "
+                    "cells or beads) — it has to hold still for ~2 hours"
+                )
+            if not s.spectrophotometer:
+                warnings_.append("record which spectrophotometer gave the true OD600")
+            if s.target_temp_c is not None:
+                warnings_.append(
+                    "the heaters are driven during this series — prerequisite "
+                    "P2 (heaters really turn off) should have passed first; "
+                    "the thermistor wizard's cold phase tests it"
+                )
+            self._vial_map_version({"warnings": warnings_})
+            return {"status": "started", "warnings": warnings_, **self.series_session()}
+
+    def series_apply(self) -> dict:
+        """(Re-)command stir, and the heaters (to the series' temperature
+        through the installed curve, or off), and ARM the session."""
+        with self._lock:
+            s = self._require_tier3("od_series")
+            setpoints = [HEATER_OFF_SETPOINT] * N_VIALS
+            if s.target_temp_c is not None:
+                cal = self._installed_temp_cal()
+                for v in s.vials:
+                    if v not in s.vial_faults:
+                        setpoints[v] = int(np.rint((s.target_temp_c - cal[1][v]) / cal[0][v]))
+            self.manager.set_temperature_raw(setpoints, floor_override=s.floor_overrides())
+            self.manager.set_stir(s.stir_vector())
+            sent = [int(x) for x in np.asarray(self.manager.temp_setpoint_raw)]
+            s.commanded_raw = {v: sent[v] for v in range(N_VIALS)}
+            self._arm_tier3(s, "points")
+            return self.series_session()
+
+    def series_session(self, preview: bool = False) -> dict:
+        """Progress: per-vial points, OD levels and dark medians; with
+        ``preview`` a provisional fit for every vial that has enough levels
+        (so the operator sees early whether the top of the range is
+        constraining the curve)."""
+        with self._lock:
+            s = self._tier3
+            if not isinstance(s, OdSeriesSession):
+                return {"active": False}
+            live = [v for v in s.vials if v not in s.vial_faults]
+            thermal = None
+            if s.target_temp_c is not None and live:
+                thermal = self.tracker.settled(
+                    live, {v: s.target_temp_c for v in live},
+                    tol_c=OD_SERIES_SETTLE_TOL_C, minutes=OD_SERIES_SETTLE_MINUTES,
+                )
+            per_vial: dict = {}
+            for v in range(N_VIALS):
+                pts = s.active_points(v)
+                levels = sorted({p["true_od600"] for p in pts})
+                entry = {
+                    "in_session": v in s.vials,
+                    "fault": s.vial_faults.get(v),
+                    "n_points": len(pts),
+                    "n_levels": len(levels),
+                    "od_range": [levels[0], levels[-1]] if levels else None,
+                    "dark_median": _finite_or_none(s.dark_median(v)),
+                    "points": [p for p in s.points if p["vial"] == v],
+                }
+                if preview and len(levels) >= od_curve_fit.MIN_OD_LEVELS:
+                    try:
+                        f = od_curve_fit.fit_logistic4(
+                            [p["true_od600"] for p in pts], [p["signal"] for p in pts],
+                        )
+                        entry["preview"] = {k: f[k] for k in (
+                            "a", "b", "c", "d", "r2", "rmse", "b_at_bound", "residuals",
+                        )}
+                    except ValueError as exc:
+                        entry["preview_error"] = str(exc)
+                per_vial[str(v)] = entry
+            return {
+                "active": True,
+                **s.summary(),
+                "config": {
+                    "led_power": s.led_power,
+                    "stir_pwm": s.stir_pwm,
+                    "target_temp_c": s.target_temp_c,
+                    "n_samples": s.n_samples,
+                    "standard": s.standard,
+                    "medium": s.medium,
+                    "spectrophotometer": s.spectrophotometer,
+                    "points_expected": s.points_expected,
+                },
+                "thermal": thermal,
+                "n_captures": len(s.dark_captures),
+                "per_vial": per_vial,
+            }
+
+    def series_point(
+        self,
+        *,
+        entries: Optional[list] = None,
+        spec_reading=None,
+        dilution_factor=1,
+        vials: Optional[list] = None,
+        settle_check: bool = True,
+    ) -> dict:
+        """Capture one loading: a lit read and a dark read of all sixteen
+        vials, recorded as a point for each listed vial at its true OD600
+        (``spec_reading x dilution_factor``: benchtop spectrophotometers are
+        only linear to ~OD 1, so dense standards are read diluted)."""
+        with self._lock:
+            s = self._require_tier3("od_series")
+            self._require_armed(s)
+            live = [v for v in s.vials if v not in s.vial_faults]
+            if entries is None:
+                entries = [{"vial": v, "spec_reading": spec_reading,
+                            "dilution_factor": dilution_factor} for v in (vials or [])]
+            if not isinstance(entries, list) or not entries:
+                raise ValueError(
+                    "give 'entries' [{vial, spec_reading, dilution_factor}] or "
+                    "'spec_reading' with 'vials'"
+                )
+            wanted: list[tuple[int, float, float]] = []
+            for e in entries:
+                if not isinstance(e, dict):
+                    raise ValueError("each entry must be an object")
+                v = int(e.get("vial", -1))
+                spec = e.get("spec_reading")
+                factor = e.get("dilution_factor", 1)
+                if v not in live:
+                    raise ValueError(f"vial {v} is not live in this session")
+                for label, x, lo, hi in (("spec_reading", spec, 0.0, 5.0),
+                                         ("dilution_factor", factor, 1.0, 1000.0)):
+                    if (not isinstance(x, (int, float)) or isinstance(x, bool)
+                            or not math.isfinite(float(x)) or not (lo <= float(x) <= hi)):
+                        raise ValueError(f"vial {v}: '{label}' must be a number in {lo:g}..{hi:g}")
+                wanted.append((v, float(spec), float(factor)))
+            if len({v for v, _s, _f in wanted}) != len(wanted):
+                raise ValueError("a vial is listed twice in one capture")
+            unsettled: list[int] = []
+            if s.target_temp_c is not None:
+                thermal = self.tracker.settled(
+                    [v for v, _s, _f in wanted],
+                    {v: s.target_temp_c for v, _s, _f in wanted},
+                    tol_c=OD_SERIES_SETTLE_TOL_C, minutes=OD_SERIES_SETTLE_MINUTES,
+                )
+                unsettled = [int(k) for k, d in thermal["per_vial"].items() if not d["settled"]]
+                if unsettled and settle_check:
+                    raise CalibrationConflict(
+                        f"vials {unsettled} have not held ±{OD_SERIES_SETTLE_TOL_C} °C "
+                        f"of {s.target_temp_c} °C for {OD_SERIES_SETTLE_MINUTES:.0f} "
+                        "min since loading — wait, or capture with "
+                        "settle_check=false (recorded)"
+                    )
+            lit = self.manager.collect_od_raw(s.led_power, n_samples=s.n_samples)
+            dark = self.manager.collect_od_raw(0, n_samples=s.n_samples)
+            capture = s._next_capture
+            s._next_capture += 1
+            when = _iso_now()
+            s.dark_captures.append({
+                "capture": capture, "at": when,
+                "median": [_finite_or_none(x) for x in dark["median"]],
+                "sd": [_finite_or_none(x) for x in dark["sd"]],
+            })
+            temps = self.tracker.latest()
+            captured: list[dict] = []
+            rejected: list[dict] = []
+            for v, spec, factor in wanted:
+                lm, dm = lit["median"][v], dark["median"][v]
+                if not (lm is not None and dm is not None
+                        and math.isfinite(lm) and math.isfinite(dm)):
+                    rejected.append({"vial": v, "reason": "dropped read — repeat"})
+                    continue
+                signal = float(lm) - float(dm)
+                if signal <= 0:
+                    rejected.append({
+                        "vial": v,
+                        "reason": f"LED-on {lm:.0f} is not above the dark {dm:.0f}",
+                    })
+                    continue
+                flags = []
+                if lit["sd"][v] > OD_SERIES_SD_WARN:
+                    flags.append(
+                        f"signal SD {lit['sd'][v]:.0f} counts > {OD_SERIES_SD_WARN:.0f} "
+                        "(provisional) — bubbles, a wobbling bar, or a poorly seated vial"
+                    )
+                point = {
+                    "id": s._next_point, "capture": capture, "vial": v,
+                    "spec_reading": spec, "dilution_factor": factor,
+                    "true_od600": round(spec * factor, 6),
+                    "lit_median": float(lm), "lit_sd": float(lit["sd"][v]),
+                    "dark_median": float(dm), "dark_sd": float(dark["sd"][v]),
+                    "signal": signal, "n_valid": int(lit["n_valid"][v]),
+                    "temp_c": _finite_or_none(temps[v]) if v < len(temps) else None,
+                    "captured_at": when,
+                    "settle_checked": v not in unsettled,
+                    "flags": flags,
+                    "discarded": False,
+                }
+                s._next_point += 1
+                s.points.append(point)
+                captured.append(point)
+            self._persist_tier3()
+            if not captured:
+                raise ValueError(f"no point recorded: {rejected}")
+            return {"captured": captured, "rejected": rejected,
+                    "session": self.series_session()}
+
+    def series_discard(self, point_id) -> dict:
+        with self._lock:
+            s = self._require_tier3("od_series")
+            for p in s.points:
+                if p["id"] == int(point_id):
+                    p["discarded"] = True
+                    p["discarded_at"] = _iso_now()
+                    self._persist_tier3()
+                    return self.series_session()
+            raise ValueError(f"no point {point_id} in this session")
+
+    def _series_fit_and_qc_locked(
+        self, s: "OdSeriesSession", exclude_vials, version: str,
+    ) -> tuple[np.ndarray, dict, dict, Optional[str]]:
+        prev_env = self.store.get_current("od")
+        if prev_env is None:
+            raise CalibrationConflict("no OD calibration installed to carry vials forward from")
+        prev_rows = np.asarray(prev_env["data"]["rows"], dtype=float)
+        prev_ds = bool(prev_env["data"].get("dark_subtracted", False))
+        per_vial_source = per_vial_sources(prev_env)
+        per_vial_version = list(
+            (prev_env.get("fit") or {}).get("per_vial_version")
+            or [prev_env.get("version")] * N_VIALS
+        )
+        exclude = {int(v) for v in (exclude_vials or [])}
+        failures: list[str] = []
+        warnings_: list[str] = []
+        dark = np.array([s.dark_median(v) for v in range(N_VIALS)])
+
+        # The previous curve in dark-subtracted terms. Exact: with a' = a-D
+        # and b' = b-D, (b'-a')/((S-D)-a') == (b-a)/(S-a), so the shifted
+        # curve reads the same OD from dark-subtracted signal as the old one
+        # did from raw -- as long as the dark offset is this session's.
+        prev_ds_rows = prev_rows.copy()
+        converted: list[int] = []
+        if not prev_ds:
+            for v in range(N_VIALS):
+                if not math.isfinite(dark[v]):
+                    failures.append(
+                        f"vial {v}: no dark reading to convert its previous curve "
+                        "to dark-subtracted signal"
+                    )
+                    continue
+                prev_ds_rows[0, v] -= dark[v]
+                prev_ds_rows[1, v] -= dark[v]
+                if prev_ds_rows[0, v] <= 0:
+                    failures.append(
+                        f"vial {v}: its previous lower asymptote does not clear "
+                        f"the dark ({prev_rows[0, v]:.0f} vs {dark[v]:.0f})"
+                    )
+        rows = prev_ds_rows.copy()
+
+        measured: list[int] = []
+        review: dict = {}
+        criteria: dict = {}
+        for v in s.vials:
+            if v in s.vial_faults:
+                warnings_.append(f"vial {v} excluded ({s.vial_faults[v]})")
+                continue
+            if v in exclude:
+                warnings_.append(f"vial {v} excluded by the operator")
+                continue
+            pts = s.active_points(v)
+            ods = np.array([p["true_od600"] for p in pts], dtype=float)
+            sig = np.array([p["signal"] for p in pts], dtype=float)
+            sds = np.array([p["lit_sd"] for p in pts], dtype=float)
+            n_levels = len(set(ods.tolist()))
+            if n_levels < od_curve_fit.MIN_OD_LEVELS:
+                failures.append(
+                    f"vial {v}: {n_levels} OD levels — the fit needs at least "
+                    f"{od_curve_fit.MIN_OD_LEVELS}, §8.2 asks for "
+                    f"{OD_SERIES_MIN_LEVELS} (or exclude it)"
+                )
+                continue
+            try:
+                f = od_curve_fit.fit_logistic4(ods, sig, sds)
+            except ValueError as exc:
+                failures.append(f"vial {v}: {exc}")
+                continue
+            measured.append(v)
+            rows[:, v] = (f["a"], f["b"], f["c"], f["d"])
+            per_vial_source[v] = OD_SERIES_SOURCE
+            per_vial_version[v] = version
+
+            res = np.asarray(f["residuals"])
+            allowed = np.maximum(OD_SERIES_RESIDUAL_ABS, OD_SERIES_RESIDUAL_FRACTION * ods)
+            worst = int(np.argmax(np.abs(res) / allowed))
+            lowest = int(np.argmin(sig))
+            margin_sd = max(OD_SERIES_MIN_SD_COUNTS, float(sds[lowest]))
+            margin = float(sig[lowest] - f["a"])
+            blank_idx = [i for i in range(len(ods)) if ods[i] <= OD_SERIES_BLANK_OD_MAX]
+            blank_sd = (max(OD_SERIES_MIN_SD_COUNTS, float(np.median(sds[blank_idx])))
+                        if blank_idx else None)
+            top = int(np.argmax(ods))
+            top_resolution = float(f["counts_per_0p01_od"][top])
+            crit = {
+                "n_levels": n_levels >= OD_SERIES_MIN_LEVELS,
+                "r2": f["r2"] >= OD_SERIES_R2_MIN,
+                "monotone": not f["monotone_violations"],
+                "residuals": bool(np.all(np.abs(res) <= allowed)),
+                "lower_asymptote_margin": margin >= OD_SERIES_LOWER_MARGIN_SD * margin_sd,
+                "blank_point": bool(blank_idx),
+                "inflection_in_range": bool(ods.min() <= f["c"] <= ods.max()),
+                "upper_asymptote_measured": not (f["b"] > ADC_CEILING or f["b_at_bound"]),
+                "top_resolvable": (blank_sd is None
+                                   or top_resolution >= OD_SERIES_TOP_RESOLUTION_SD * blank_sd),
+            }
+            criteria[str(v)] = crit
+            if not crit["n_levels"]:
+                failures.append(
+                    f"vial {v}: {n_levels} OD levels < {OD_SERIES_MIN_LEVELS} (§8.2)"
+                )
+            if not crit["r2"]:
+                failures.append(f"vial {v}: R² {f['r2']:.4f} < {OD_SERIES_R2_MIN}")
+            if not crit["monotone"]:
+                bad = f["monotone_violations"][0]
+                failures.append(
+                    f"vial {v}: signal does not fall between OD {bad['od_low']} and "
+                    f"{bad['od_high']} — a mis-loaded vial, a bubble or a "
+                    "transcription error"
+                )
+            if not crit["residuals"]:
+                failures.append(
+                    f"vial {v}: residual {res[worst]:+.3f} OD at OD {ods[worst]:.3f} "
+                    f"exceeds ±{allowed[worst]:.3f} (0.02 OD or 5 %)"
+                )
+            if not crit["lower_asymptote_margin"]:
+                failures.append(
+                    f"vial {v}: lower asymptote {f['a']:.0f} sits only {margin:.0f} "
+                    f"counts below the lowest signal ({OD_SERIES_LOWER_MARGIN_SD:.0f} SD "
+                    f"= {OD_SERIES_LOWER_MARGIN_SD * margin_sd:.0f} needed) — the "
+                    "curve diverges inside its own range (vial 1's 2016 failure)"
+                )
+            if not crit["blank_point"]:
+                warnings_.append(
+                    f"vial {v}: no point at or below OD {OD_SERIES_BLANK_OD_MAX} — "
+                    "the bottom of the curve is extrapolated"
+                )
+            if not crit["inflection_in_range"]:
+                warnings_.append(
+                    f"vial {v}: inflection c = {f['c']:.2f} lies outside the "
+                    f"measured OD range [{ods.min():g}, {ods.max():g}] — expected "
+                    "for transmitted light (§8.2 as amended); reported, not refused"
+                )
+            if not crit["upper_asymptote_measured"]:
+                warnings_.append(
+                    f"vial {v}: upper asymptote b = {f['b']:.0f} is an "
+                    "extrapolation" + (" at the fit's cap" if f["b_at_bound"] else "")
+                    + " — OD inside the measured range is unaffected"
+                )
+            if not crit["top_resolvable"]:
+                warnings_.append(
+                    f"vial {v}: at OD {ods[top]:g} a 0.01 OD step moves the signal "
+                    f"only {top_resolution:.0f} counts (< {OD_SERIES_TOP_RESOLUTION_SD:.0f} "
+                    "x blank SD) — the top of the range is not resolvable"
+                )
+
+            # Review: the new curve against the previous one, both anchored
+            # to this session's blank point so the numbers compare.
+            prev = prev_ds_rows[:, v]
+            entry = {
+                "measured": True,
+                "a": f["a"], "b": f["b"], "c": f["c"], "d": f["d"],
+                "previous": prev.tolist(),
+                "r2": f["r2"], "rmse": f["rmse"],
+                "max_abs_residual": float(np.max(np.abs(res))),
+                "n_points": int(ods.size), "n_levels": n_levels,
+                "od_range": [float(ods.min()), float(ods.max())],
+                "b_at_bound": f["b_at_bound"],
+                "practical_od_ceiling": f["practical_od_ceiling"],
+                "counts_per_0p01_od_at_0p3": float(
+                    0.01 * od_curve_fit.counts_per_od(0.3, f["a"], f["b"], f["c"], f["d"])),
+                "criteria": crit,
+                "points": [
+                    {"id": p["id"], "true_od600": p["true_od600"], "signal": p["signal"],
+                     "residual": float(r)}
+                    for p, r in zip(pts, res)
+                ],
+            }
+            if blank_idx and prev[0] < float(sig[blank_idx[0]]) < prev[1]:
+                blank_signal = float(np.median(sig[blank_idx]))
+                entry["previous_od_at_blank"] = _finite_or_none(float(
+                    od_curve_fit.od_from_signal(blank_signal, *prev)))
+                a0, b0, _c0, d0 = prev
+                if a0 < blank_signal < b0:
+                    c_anchor = math.log10((b0 - a0) / (blank_signal - a0) - 1.0) / d0
+                    entry["previous_counts_per_0p01_od_at_0p3"] = float(
+                        0.01 * od_curve_fit.counts_per_od(0.3, a0, b0, c_anchor, d0))
+                    ceiling = a0 + od_curve_fit.PRACTICAL_CEILING_FRACTION * (b0 - a0)
+                    entry["previous_practical_od_ceiling"] = _finite_or_none(float(
+                        od_curve_fit.od_from_signal(ceiling, a0, b0, c_anchor, d0)))
+            review[str(v)] = entry
+
+        if not measured and not failures:
+            raise ValueError("no vial was measured — nothing to install")
+        converted = [v for v in range(N_VIALS) if v not in measured and not prev_ds]
+        if converted:
+            warnings_.append(
+                f"vials {converted} keep their previous curve, converted to "
+                "dark-subtracted signal with this session's dark (a-D, b-D; "
+                "exact while the dark offset holds)"
+            )
+        carried_legacy = [v for v in range(N_VIALS)
+                          if v not in measured and _is_legacy_source(per_vial_source[v])]
+        if carried_legacy:
+            warnings_.append(
+                f"vials {carried_legacy} are still on 2016 constants never "
+                "verified against a spectrophotometer"
+            )
+        for v in range(N_VIALS):
+            review.setdefault(str(v), {
+                "measured": False,
+                "previous": prev_ds_rows[:, v].tolist(),
+                "converted_from_raw": v in converted,
+                "source": per_vial_source[v],
+            })
+        qc = {
+            "passed": not failures,
+            "warnings": warnings_,
+            "failures": failures,
+            "overridden_by": None,
+            "criteria": criteria,
+            "excluded_vials": sorted(exclude),
+        }
+        vial_map_version = self._vial_map_version(qc)
+        fit = {
+            "measured_vials": measured,
+            "converted_vials": converted,
+            "per_vial_source": per_vial_source,
+            "per_vial_version": per_vial_version,
+            "dark_medians": [_finite_or_none(x) for x in dark],
+            "review": review,
+        }
+        return rows, fit, qc, vial_map_version
+
+    def series_fit(self, exclude_vials: Optional[list] = None) -> dict:
+        """The review screen for the series, written nowhere."""
+        with self._lock:
+            s = self._require_tier3("od_series")
+            _rows, fit, qc, _vm = self._series_fit_and_qc_locked(
+                s, exclude_vials, self.store.fresh_version("od"),
+            )
+            return {"fit": fit, "qc": qc}
+
+    def series_finish(
+        self,
+        *,
+        exclude_vials: Optional[list] = None,
+        override_reason: Optional[str] = None,
+        operator: Optional[str] = None,
+    ) -> dict:
+        """Fit, QC, and install a DARK-SUBTRACTED OD version (writes the
+        ``OD_cal.meta.json`` sidecar that lets the dark read graduate from
+        diagnostic to correction). The caller makes it live."""
+        with self._lock:
+            s = self._require_tier3("od_series")
+            version = self.store.fresh_version("od")
+            prev_version = self.store.current_versions().get("od")
+            rows, fit, qc, vial_map_version = self._series_fit_and_qc_locked(
+                s, exclude_vials, version,
+            )
+            if not qc["passed"]:
+                if not override_reason:
+                    raise QCRefusal(
+                        "OD dilution series failed its acceptance criteria "
+                        "(§8.2) — re-capture, discard bad points, exclude the "
+                        "failing vials, or finish with an explicit override_reason",
+                        qc,
+                    )
+                qc["overridden_by"] = str(override_reason)
+            envelope = make_envelope(
+                "od",
+                operator=operator or s.operator,
+                source=OD_SERIES_SOURCE,
+                conditions={
+                    "led_power": s.led_power,
+                    "stir_pwm": s.stir_pwm,
+                    "target_temp_c": s.target_temp_c,
+                    "n_samples": s.n_samples,
+                    "standard": s.standard or None,
+                    "medium": s.medium or None,
+                    "spectrophotometer": s.spectrophotometer or None,
+                    "dark_subtracted": True,
+                    "vial_map_version": vial_map_version,
+                    "settle_overridden_points": [
+                        p["id"] for p in s.points if not p.get("settle_checked", True)
+                    ],
+                },
+                data={
+                    "rows": rows.tolist(),
+                    "dark_subtracted": True,
+                    "points": s.points,
+                    "dark_captures": s.dark_captures,
+                    "previous_version": prev_version,
+                },
+                fit=fit,
+                qc=qc,
+                version=version,
+            )
+            installed = self.store.save_version("od", envelope)
+            self._end_tier3()
+            return {
+                "status": "installed",
+                "version": installed,
+                "measured_vials": fit["measured_vials"],
+                "converted_vials": fit["converted_vials"],
+                "review": fit["review"],
+                "qc": qc,
+            }
+
+    def series_abort(self) -> dict:
+        with self._lock:
+            self._require_tier3("od_series")
+            self._end_tier3()
+            return {"status": "aborted"}
+
     # -- per-run OD blank (O2) -------------------------------------------
 
     def blank_start(
@@ -2889,14 +3585,22 @@ class CalibrationService:
             if od_env is None:
                 raise CalibrationConflict("no OD calibration installed")
             od_cal = np.asarray(od_env["data"]["rows"], dtype=float)
+            # A dark-subtracted curve (Session AA's dilution series) needs a
+            # dark-subtracted blank, and the reverse: mixing the two is
+            # silently wrong OD (§5.4). The curve's own flag decides.
+            dark_subtracted = bool(od_env["data"].get("dark_subtracted", False))
 
             blank_median = np.asarray(s.blank["median"], dtype=float)
+            blank_signal = (
+                blank_median - np.asarray(s.dark["median"], dtype=float)
+                if dark_subtracted else blank_median
+            )
             # Domain guard evaluated per included vial (excluded vials may
             # be NaN or out of domain without blocking the rest).
             a, b, _c, d = od_cal
             domain_bad = [
                 v for v in vials
-                if not (a[v] < blank_median[v] < b[v])
+                if not (a[v] < blank_signal[v] < b[v])
             ]
             if domain_bad:
                 raise ValueError(
@@ -2907,7 +3611,7 @@ class CalibrationService:
             # Re-anchor c for the included vials only.
             with np.errstate(invalid="ignore", divide="ignore"):
                 c_run_all = np.log10(
-                    (b - a) / (blank_median - a) - 1.0
+                    (b - a) / (blank_signal - a) - 1.0
                 ) / d
             c_run = {v: float(c_run_all[v]) for v in vials}
             od_offset_removed = {
@@ -2938,6 +3642,19 @@ class CalibrationService:
                 reference = previous.get("version")
                 prev_blank = previous.get("data", {}).get("blank_median")
                 prev_c_run = previous.get("fit", {}).get("c_run", {})
+                # c_run is a position on ONE curve: against a blank taken on a
+                # different OD calibration its drift is meaningless (a new
+                # Tier 3 curve moves every c). The raw blank median still
+                # compares -- it is counts, not OD.
+                prev_parent = (previous.get("conditions") or {}).get("parent_od_cal")
+                if prev_parent != od_env.get("version"):
+                    prev_c_run = {}
+                    warnings.append(
+                        "first blank against OD calibration "
+                        f"{od_env.get('version')} — the c_run drift reference "
+                        "resets (the previous blank used "
+                        f"{prev_parent or 'an unrecorded curve'})"
+                    )
                 for v in vials:
                     if isinstance(prev_blank, list) and not math.isnan(
                         blank_median[v]
@@ -2999,13 +3716,16 @@ class CalibrationService:
                     },
                     "target_temp_c": {str(k): v for k, v in s.targets_c.items()},
                     "parent_od_cal": od_env.get("version"),
-                    "dark_subtracted": False,
+                    "dark_subtracted": dark_subtracted,
                 },
                 data={
                     "dark_median": s.dark["median"],
                     "dark_sd": s.dark["sd"],
                     "blank_median": s.blank["median"],
                     "blank_sd": s.blank["sd"],
+                    # What c_run was computed from: blank_median, or blank
+                    # minus dark against a dark-subtracted curve.
+                    "blank_signal": [_finite_or_none(x) for x in blank_signal],
                     "n_samples": s.n_samples,
                 },
                 fit={
@@ -3132,18 +3852,19 @@ class CalibrationService:
         ) or None
         if blank:
             data = blank.get("data") or {}
-            sd = data.get("blank_sd") or {}
-            median = data.get("blank_median") or {}
-            for key, sd_counts in sd.items():
-                try:
-                    v = int(key)
-                except (TypeError, ValueError):
-                    continue
-                signal = median.get(key, median.get(str(v)))
+            # blank_commit writes 16-element lists; accept a {vial: value}
+            # map too. (Before Session AA this iterated .items() on the list
+            # and raised on every real blank -- caught upstream, so no run
+            # ever got its per-vial floors.)
+            sd = _per_vial_values(data.get("blank_sd"))
+            signal = _per_vial_values(
+                data.get("blank_signal") or data.get("blank_median")
+            )
+            for v, sd_counts in sd.items():
                 sd_od = None
-                if od_rows is not None and signal is not None:
+                if od_rows is not None and v in signal:
                     sd_od = self._od_counts_to_od_sd(
-                        od_rows, v, signal, sd_counts,
+                        od_rows, v, signal[v], sd_counts,
                     )
                 if sd_od is None or not math.isfinite(sd_od):
                     continue

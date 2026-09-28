@@ -305,3 +305,89 @@ def test_thermistor_finish_refusal_is_422_with_the_qc_block():
             assert client.get("/api/calibration/temperature/session").get_json() == {"active": False}
         finally:
             _stop(flask_app)
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: the OD dilution series over HTTP + the dark-subtraction switch
+# ---------------------------------------------------------------------------
+
+import json  # noqa: E402
+
+from test_calibration_tier3 import SERIES_LEVELS, _true_ds_rows  # noqa: E402
+
+
+def _run_http_series(client, mgr, rows, vials):
+    mgr.set_true_od_curve(rows, dark_counts=1200.0)
+    mgr.mock_signal_noise_sd = 0.0
+    mgr.mock_dark_noise_sd = 0.0
+    _post(client, "/api/calibration/od/series/start",
+          {"operator": "t", "vials": vials, "standard": "beads",
+           "spectrophotometer": "Genesys 30"})
+    _post(client, "/api/calibration/od/series/apply")
+    for od in SERIES_LEVELS:
+        mgr.set_true_od(vials, od)
+        _post(client, "/api/calibration/od/series/point",
+              {"spec_reading": od, "vials": vials})
+
+
+def test_od_series_over_http_installs_a_dark_subtracted_curve_live():
+    with tempfile.TemporaryDirectory() as tmp:
+        flask_app = _make_app(Path(tmp))
+        try:
+            state = _state(flask_app)
+            mgr = state.manager
+            client = flask_app.test_client()
+            rows = _true_ds_rows()
+            _run_http_series(client, mgr, rows, list(range(N_VIALS)))
+            sess = client.get("/api/calibration/od/series/session?preview=1").get_json()
+            assert sess["per_vial"]["0"]["n_levels"] == len(SERIES_LEVELS)
+            assert sess["per_vial"]["0"]["preview"]["r2"] > 0.9999
+            review = _post(client, "/api/calibration/od/series/fit")
+            assert review["qc"]["passed"], review["qc"]
+            out = _post(client, "/api/calibration/od/series/finish")
+            # Live without a restart, and flagged dark-subtracted everywhere.
+            assert mgr.od_cal_dark_subtracted is True
+            assert np.allclose(mgr.od_cal, rows, rtol=1e-6)
+            assert np.allclose(state.od_cal, mgr.od_cal)
+            idx = client.get("/api/calibration/").get_json()
+            assert idx["subsystems"]["od"]["version"] == out["version"]
+            assert not any("never verified" in r
+                           for r in idx["staleness"]["od"]["reasons"])
+
+            # An experiment that asks to read WITHOUT the dark is refused
+            # (the engine's guard: nothing else is loaded to conflict with).
+            body = _experiment_body("ds0")
+            body["parameters"]["od_acquisition"] = {"dark_subtract": False}
+            r = client.post("/api/experiments/create", json=body)
+            assert r.status_code == 400 and "dark-subtracted" in r.get_json()["error"]
+            # One that says nothing defaults to dark subtraction, written
+            # into config.json so a resume cannot re-resolve it.
+            _post(client, "/api/experiments/create", _experiment_body("ds1"))
+            cfg = json.loads((Path(tmp) / "experiments" / "ds1" / "config.json").read_text())
+            assert cfg["parameters"]["od_acquisition"]["dark_subtract"] is True
+            assert cfg["calibration"]["od"] == out["version"]
+        finally:
+            _stop(flask_app)
+
+
+def test_a_blank_taken_on_a_replaced_od_curve_is_refused_at_start():
+    with tempfile.TemporaryDirectory() as tmp:
+        flask_app = _make_app(Path(tmp))
+        try:
+            client = flask_app.test_client()
+            _post(client, "/api/experiments/create", _experiment_body("old"))
+            (Path(tmp) / "experiments" / "old" / "od_blank.json").write_text(json.dumps({
+                "conditions": {"parent_od_cal": "2020-01-01T000000Z"},
+                "fit": {"c_run": {"0": -0.5}},
+            }))
+            r = client.post("/api/experiments/old/start", json={})
+            assert r.status_code == 409 and r.get_json()["code"] == "stale_od_blank"
+            # The recorded escape hatch starts it WITHOUT applying the blank.
+            state = _state(flask_app)
+            row2_before = float(state.manager.od_cal[2, 0])
+            _post(client, "/api/experiments/old/start", {"allow_missing_od_blank": True})
+            assert float(state.manager.od_cal[2, 0]) == row2_before
+            messages = [e.get("message", "") for e in state.event_log.recent()]
+            assert any("WITHOUT a per-run OD blank" in m for m in messages)
+        finally:
+            _stop(flask_app)
