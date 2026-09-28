@@ -1644,6 +1644,62 @@
       background: rgba(249, 115, 22, 0.10);
       color: var(--status-warn);
     }
+    .blank-status.bad {
+      background: rgba(220, 38, 38, 0.10);
+      color: var(--status-critical);
+    }
+
+    /* Tier 3 wizards (Session AA): wider, 16-vial live strips, fit plots. */
+    .modal.xlarge { width: min(980px, 100%); }
+    .t3-strip {
+      display: grid;
+      grid-template-columns: repeat(8, 1fr);
+      gap: 6px;
+      margin: 10px 0;
+    }
+    .t3-tile {
+      border: 1px solid var(--border-strong);
+      border-left: 4px solid var(--vial-color, var(--border-strong));
+      border-radius: 6px;
+      padding: 6px 6px 5px;
+      font-size: 11px;
+      font-variant-numeric: tabular-nums;
+      background: var(--card);
+      line-height: 1.35;
+    }
+    .t3-tile b { font-size: 12px; }
+    .t3-tile .muted { color: var(--text-muted); }
+    .t3-tile.settled { background: rgba(22, 163, 74, 0.08); }
+    .t3-tile.waiting { background: rgba(249, 115, 22, 0.08); }
+    .t3-tile.fault {
+      background: rgba(220, 38, 38, 0.10);
+      border-color: var(--status-critical);
+    }
+    .t3-tile.off { opacity: 0.35; }
+    .t3-tile .flag { color: var(--status-warn); font-weight: 600; }
+    .t3-tile .bad { color: var(--status-critical); font-weight: 600; }
+    .t3-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 12px;
+      align-items: center;
+      font-size: 13px;
+      margin: 8px 0;
+    }
+    .t3-row input[type="number"], .t3-row input[type="text"], .t3-row select {
+      padding: 5px 7px;
+      border: 1px solid var(--border-strong);
+      border-radius: 6px;
+      background: var(--card);
+      color: var(--text);
+      font: inherit;
+      width: 110px;
+    }
+    .t3-row input.wide { width: 220px; }
+    .t3-chart { width: 100%; min-height: 240px; margin-top: 8px; }
+    .cal-table td.ok, .cal-table span.ok { color: var(--status-ok); font-weight: 600; }
+    .cal-table input[type="number"] { width: 78px; font: inherit; padding: 2px 4px; }
+    .cal-card .card-action { margin-top: 8px; }
 
     /* ---------- Refill modal ---------- */
     .refill-row {
@@ -2106,6 +2162,14 @@
                   title="Post-run mass reconciliation (§6)">
             Mass reconciliation
           </button>
+          <button id="cal-open-temp" class="range-btn" type="button"
+                  title="Two-point thermistor calibration (Tier 3 §8.1) — reserves the whole machine">
+            Thermistor (Tier 3)
+          </button>
+          <button id="cal-open-odseries" class="range-btn" type="button"
+                  title="OD dilution series, all four sigmoid parameters (Tier 3 §8.2) — reserves the whole machine">
+            OD series (Tier 3)
+          </button>
           <button id="cal-refresh" class="range-btn" type="button">Refresh</button>
         </div>
       </div>
@@ -2114,8 +2178,10 @@
       Bench procedures live in CALIBRATION_PROTOCOL.md. Tier 0 pre-flight,
       priming, spot-checks and temperature verification stay on the printed
       run sheet; the wizards here are the steps that change or validate a
-      number. Tier 3 (thermistor two-point, OD dilution series, stir RPM) is
-      not built yet — see ROADMAP Session AA.
+      number. The two Tier 3 wizards (thermistor, OD series) reserve the whole
+      machine for hours: nothing may be loaded while one is open, and no
+      experiment can be created until it is finished or aborted. Stir RPM
+      (Tier 3 §8.3) is not built — ROADMAP Session AC.
     </p>
     <div class="cal-cards" id="cal-cards"></div>
   </section>
@@ -2629,6 +2695,69 @@
         <span class="wizard-footer-right">
           <button class="btn" id="recon-cancel" type="button">Close</button>
           <button class="btn btn-primary" id="recon-submit" type="button">Reconcile</button>
+        </span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ---------- Tier 3: two-point thermistor calibration (§8.1) ---------- -->
+  <div class="modal-backdrop" id="tempcal-modal" hidden>
+    <div class="modal xlarge" role="dialog" aria-modal="true"
+         aria-labelledby="tempcal-modal-title">
+      <div class="modal-header">
+        <h2 id="tempcal-modal-title">Thermistor calibration (two-point, Tier 3)</h2>
+        <button class="modal-close" id="tempcal-modal-close"
+                type="button" aria-label="Close">&times;</button>
+      </div>
+      <div class="wizard-steps" id="tempcal-steps">
+        <span class="wizard-step" data-step="1">Setup</span>
+        <span class="wizard-step" data-step="2">Cold point</span>
+        <span class="wizard-step" data-step="3">Hot point</span>
+        <span class="wizard-step" data-step="4">Review</span>
+        <span class="wizard-step" data-step="5">Verify</span>
+        <span class="wizard-step" data-step="6">Install</span>
+      </div>
+      <div class="modal-body">
+        <div id="tempcal-state"></div>
+        <div id="tempcal-live"></div>
+        <div id="tempcal-body"></div>
+      </div>
+      <div class="modal-footer wizard-footer">
+        <button class="btn" id="tempcal-abort" type="button">Abort session</button>
+        <span class="wizard-footer-right">
+          <button class="btn" id="tempcal-back" type="button">Back</button>
+          <button class="btn" id="tempcal-close" type="button">Close</button>
+          <button class="btn btn-primary" id="tempcal-next" type="button">Next</button>
+        </span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ---------- Tier 3: OD dilution series (§8.2) ---------- -->
+  <div class="modal-backdrop" id="odseries-modal" hidden>
+    <div class="modal xlarge" role="dialog" aria-modal="true"
+         aria-labelledby="odseries-modal-title">
+      <div class="modal-header">
+        <h2 id="odseries-modal-title">OD dilution series (Tier 3)</h2>
+        <button class="modal-close" id="odseries-modal-close"
+                type="button" aria-label="Close">&times;</button>
+      </div>
+      <div class="wizard-steps" id="odseries-steps">
+        <span class="wizard-step" data-step="1">Setup</span>
+        <span class="wizard-step" data-step="2">Points</span>
+        <span class="wizard-step" data-step="3">Review</span>
+        <span class="wizard-step" data-step="4">Install</span>
+      </div>
+      <div class="modal-body">
+        <div id="odseries-state"></div>
+        <div id="odseries-body"></div>
+      </div>
+      <div class="modal-footer wizard-footer">
+        <button class="btn" id="odseries-abort" type="button">Abort session</button>
+        <span class="wizard-footer-right">
+          <button class="btn" id="odseries-back" type="button">Back</button>
+          <button class="btn" id="odseries-close" type="button">Close</button>
+          <button class="btn btn-primary" id="odseries-next" type="button">Next</button>
         </span>
       </div>
     </div>
@@ -5455,7 +5584,8 @@
         height: opts.height || 240,
         legend: { show: opts.legend !== false },
         cursor: { drag: { x: true, y: false }, focus: { prox: 30 } },
-        scales: { x: { time: true } },
+        // opts.xTime === false: a numeric x axis (the Tier 3 fit plots).
+        scales: { x: { time: opts.xTime !== false } },
         axes: [
           { stroke: axisColor, grid: { stroke: gridStroke, width: 1 },
             ticks: { stroke: gridStroke, width: 1 } },
@@ -6087,6 +6217,14 @@
         session: null, selected: null, review: null, needOverride: false,
         setupPumps: new Set([...Array(32).keys()]),
       },
+      temp: {               // Tier 3 thermistor wizard (Session AA)
+        session: null, step: 1, review: null, installed: null,
+        needOverride: false, selected: 0, poll: null, chart: null,
+      },
+      odseries: {           // Tier 3 OD dilution series (Session AA)
+        session: null, step: 1, review: null, installed: null,
+        needOverride: false, selected: null, chart: null,
+      },
     };
 
     function _fmt(x, digits = 2) {
@@ -6140,6 +6278,30 @@
         stir: "Stir PWM → RPM",
       };
       const cards = [];
+
+      // An open Tier 3 session reserves the whole machine: say so first, or
+      // every 409 elsewhere is a mystery.
+      const t3 = idx.tier3_session;
+      if (t3) {
+        const label = t3.kind === "temperature" ? "Thermistor calibration" : "OD dilution series";
+        const badge = t3.state === "armed"
+          ? '<span class="cal-badge stale">in progress</span>'
+          : `<span class="cal-badge missing">${escapeHtml(t3.state)}</span>`;
+        cards.push(`
+          <div class="cal-card">
+            <h3>${label} (Tier 3) ${badge}</h3>
+            <p class="cal-meta">Started ${escapeHtml(formatTime(t3.started_at))} by
+              ${escapeHtml(t3.operator)} · phase ${escapeHtml(t3.phase || "—")}</p>
+            <ul class="cal-reasons">
+              <li>Reserves the whole machine: experiments, manual actuators and the
+                other wizards are refused until it is finished or aborted.</li>
+              ${t3.state_reason ? `<li>${escapeHtml(t3.state_reason)}</li>` : ""}
+            </ul>
+            <button class="btn card-action" type="button" data-open-t3="${escapeHtml(t3.kind)}">
+              Open wizard</button>
+          </div>
+        `);
+      }
 
       // Per-run blank card first — it is the every-run action.
       const blankStale = stale.od_blank || {};
@@ -6837,6 +6999,913 @@
     //  Calibration UI wiring
     // ------------------------------------------------------------
 
+    // ------------------------------------------------------------
+    //  Tier 3 wizards (ROADMAP Session AA): shared helpers
+    // ------------------------------------------------------------
+    // Both wizards reserve the whole machine for hours and survive a server
+    // restart (reloaded SUSPENDED: nothing is driven until "Re-apply").
+    // The server is the source of truth; these screens render its session
+    // and never compute a fit themselves.
+
+    function _openModal(el) {
+      el.hidden = false;
+      requestAnimationFrame(() => el.classList.add("open"));
+    }
+    function _closeModal(el) {
+      el.classList.remove("open");
+      setTimeout(() => { if (!el.classList.contains("open")) el.hidden = true; }, 160);
+    }
+    function _t3Vials(text) {
+      const t = String(text || "").trim();
+      if (!t) return null;  // null = all sixteen
+      return t.split(/[\s,]+/).filter(Boolean).map(Number)
+        .filter(v => Number.isInteger(v) && v >= 0 && v < N_VIALS);
+    }
+    function _t3Num(id) {
+      const el = document.getElementById(id);
+      if (!el || String(el.value).trim() === "") return null;
+      const x = Number(el.value);
+      return Number.isFinite(x) ? x : null;
+    }
+    function _t3Val(id) {
+      const el = document.getElementById(id);
+      return el ? String(el.value).trim() : "";
+    }
+    function _t3StateBanner(session, reapplyLabel) {
+      if (!session || !session.active || session.state === "armed") return "";
+      const cls = session.state === "faulted" ? "bad" : "wait";
+      return `<div class="blank-status ${cls}">
+        Session <strong>${escapeHtml(session.state)}</strong>${
+          session.state_reason ? ` — ${escapeHtml(session.state_reason)}` : ""}.
+        Nothing is being driven.
+        <button class="btn" type="button" data-t3-reapply>${escapeHtml(reapplyLabel)}</button>
+      </div>`;
+    }
+    function _t3QcLists(qc) {
+      if (!qc) return "";
+      const f = (qc.failures || []).map(x => `<li class="bad">✗ ${escapeHtml(x)}</li>`).join("");
+      const w = (qc.warnings || []).map(x => `<li>⚠ ${escapeHtml(x)}</li>`).join("");
+      if (!f && !w) return `<p class="blank-status ok">Every acceptance criterion passes.</p>`;
+      return `<ul class="cal-reasons">${f}${w}</ul>`;
+    }
+    async function _t3Post(url, body, okMsg) {
+      // Returns the payload, or null after a toast. A QC refusal (422) is
+      // re-thrown: the caller shows the failures and asks for an override.
+      try {
+        const d = await postJson(url, body || {});
+        if (okMsg) showToast(okMsg, "ok");
+        return d;
+      } catch (err) {
+        if (err.code === "qc_refused") throw err;
+        showToast(err.message, err.status === 409 ? "warn" : "error");
+        return null;
+      }
+    }
+
+    // Measured points + model curves on ONE ascending x axis (uPlot needs a
+    // single x array; each series is null wherever it has no value).
+    //   pointSets: [{label, color, pts: [[x, y], ...]}]
+    //   curves:    [{label, color, fn: x => y, dash}]
+    function _t3XyChart(el, pointSets, curves, opts) {
+      if (!chartingReady() || !el) return null;
+      opts = opts || {};
+      const xs = new Set();
+      pointSets.forEach(ps => ps.pts.forEach(([x]) => xs.add(x)));
+      const [lo, hi] = opts.xRange;
+      for (let i = 0; i <= 80; i++) xs.add(lo + (hi - lo) * i / 80);
+      const x = [...xs].filter(Number.isFinite).sort((a, b) => a - b);
+      const data = [x];
+      const series = [{ label: opts.xLabel || "x" }];
+      pointSets.forEach(ps => {
+        const byX = new Map(ps.pts.map(([px, py]) => [px, py]));
+        data.push(x.map(v => (byX.has(v) ? byX.get(v) : null)));
+        series.push({
+          label: ps.label, stroke: ps.color, width: 0,
+          paths: () => null,
+          points: { show: true, size: 8, fill: ps.color, stroke: ps.color },
+        });
+      });
+      curves.forEach(c => {
+        data.push(x.map(v => { const y = c.fn(v); return Number.isFinite(y) ? y : null; }));
+        series.push({
+          label: c.label, stroke: c.color, width: 1.5, dash: c.dash,
+          spanGaps: true, points: { show: false },
+        });
+      });
+      return makeChart(el, series, data, { xTime: false, height: 260 });
+    }
+
+    // ------------------------------------------------------------
+    //  Tier 3: two-point thermistor calibration (§8.1)
+    // ------------------------------------------------------------
+
+    const tempCalModal = document.getElementById("tempcal-modal");
+    const TC_STEP_OF_PHASE = { cold: 2, hot: 3, verify: 5 };
+
+    async function openTempCalModal() {
+      const t = calState.temp;
+      t.review = null; t.installed = null; t.needOverride = false;
+      _openModal(tempCalModal);
+      await tempCalRefresh();
+      const s = t.session;
+      t.step = (s && s.active) ? (TC_STEP_OF_PHASE[s.phase] || 2) : 1;
+      renderTempCal();
+      tempCalPoll(true);
+    }
+
+    function closeTempCalModal() {
+      tempCalPoll(false);
+      destroyChart(calState.temp.chart);
+      calState.temp.chart = null;
+      _closeModal(tempCalModal);
+      refreshCalibration();
+    }
+
+    function tempCalPoll(on) {
+      const t = calState.temp;
+      clearInterval(t.poll);
+      t.poll = null;
+      if (!on) return;
+      // The equilibrium gates move on a 10 s tick; so does this.
+      t.poll = setInterval(async () => {
+        if (tempCalModal.hidden) { tempCalPoll(false); return; }
+        await tempCalRefresh();
+        renderTempCalLive();
+      }, 10000);
+    }
+
+    async function tempCalRefresh() {
+      try {
+        const res = await fetch("/api/calibration/temperature/session");
+        calState.temp.session = await res.json();
+      } catch (err) {
+        console.warn("thermistor session refresh failed:", err.message);
+      }
+    }
+
+    function _tcLive() {
+      const s = calState.temp.session;
+      return (s && s.active) ? s.vials.filter(v => !s.vial_faults[String(v)]) : [];
+    }
+    function _tcPoints(pv, label) {
+      return (pv.points || []).filter(p => p.label === label && !p.superseded);
+    }
+
+    // Live area: redrawn by the poll WITHOUT touching the forms below, so a
+    // half-typed reference reading survives the 10 s refresh.
+    function renderTempCalLive() {
+      const t = calState.temp;
+      const s = t.session;
+      const stateEl = document.getElementById("tempcal-state");
+      const liveEl = document.getElementById("tempcal-live");
+      if (!s || !s.active || t.installed) { stateEl.innerHTML = ""; liveEl.innerHTML = ""; return; }
+      const phase = s.phase || "cold";
+      stateEl.innerHTML = _t3StateBanner(s, `Re-apply ${phase} phase`);
+      if (t.step === 2) {
+        const tiles = [];
+        for (let v = 0; v < N_VIALS; v++) {
+          const pv = s.per_vial[String(v)];
+          if (!pv.in_session) { tiles.push(`<div class="t3-tile off"><b>V${v}</b><br>not in session</div>`); continue; }
+          const st = pv.stability || {};
+          const p2 = pv.p2 && pv.p2.status;
+          const cls = pv.fault ? "fault" : (st.settled ? "settled" : "waiting");
+          const cold = _tcPoints(pv, "cold")[0];
+          tiles.push(`
+            <div class="t3-tile ${cls}" style="--vial-color:${vialColor(v)}"
+                 title="${escapeHtml(pv.fault || st.reason || "equilibrated")}">
+              <b>V${v}</b> ${pv.advisory ? '<span class="flag" title="' + escapeHtml(pv.advisory) + '">⚠ probe</span>' : ""}<br>
+              raw ${_fmt(pv.latest_raw, 1)}<br>
+              <span class="muted">drift ${_fmt(st.drift_counts, 1)}</span><br>
+              ${pv.fault ? '<span class="bad">heater fault</span>'
+                : (st.settled ? "settled" : '<span class="muted">waiting</span>')}<br>
+              <span class="muted">P2: ${escapeHtml(p2 || "pending")}</span>
+              ${cold ? `<br>✓ ${_fmt(cold.reference_c, 2)} °C` : ""}
+            </div>`);
+        }
+        const blockers = s.cold_blockers || [];
+        liveEl.innerHTML = `
+          <p class="blank-status ${s.cold_ready ? "ok" : "wait"}">${
+            s.cold_ready ? "Every live vial has equilibrated — capture the cold point."
+              : `Equilibrating (${_fmt(s.phase_age_minutes, 1)} min in phase) — waiting on vials ${escapeHtml(blockers.join(", "))}.`}
+          </p>
+          <div class="t3-strip">${tiles.join("")}</div>`;
+        return;
+      }
+      if (t.step === 3 || t.step === 5) {
+        const label = t.step === 3 ? "hot" : "verify";
+        const rows = [];
+        for (const v of s.vials) {
+          const pv = s.per_vial[String(v)];
+          const st = pv.stability || {};
+          const pts = _tcPoints(pv, label);
+          const last = pts[pts.length - 1];
+          let status = "";
+          if (pv.fault) status = `<span class="bad">${escapeHtml(pv.fault)}</span>`;
+          else if (label === "hot" && pv.retarget_suggested) status = '<span class="warn">retarget</span>';
+          else if (label === "hot" && pv.retargeted && !last) status = "retargeted — re-probe";
+          else if (label === "verify" && pv.verification_delta_c !== null && pv.verification_delta_c !== undefined) {
+            const ok = Math.abs(pv.verification_delta_c) <= 0.5;
+            status = `<span class="${ok ? "ok" : "bad"}">${ok ? "pass" : "FAIL"}</span>`;
+          } else if (last) status = '<span class="ok">captured</span>';
+          rows.push(`<tr>
+            <td style="border-left:4px solid ${vialColor(v)}">Vial ${v}</td>
+            <td>${pv.commanded_raw ?? "—"}</td>
+            <td>${_fmt(pv.latest_raw, 1)}</td>
+            <td>${_fmt(pv.provisional_c, 2)}</td>
+            <td class="${st.settled ? "" : "warn"}">${st.settled ? "settled" : escapeHtml(st.reason || "…")}</td>
+            <td>${last ? _fmt(last.reference_c, 2) : "—"}</td>
+            <td>${label === "hot" ? _fmt(pv.span_c, 1) : _fmt(pv.verification_delta_c, 2)}</td>
+            <td>${status}</td></tr>`);
+        }
+        liveEl.innerHTML = `
+          <table class="cal-table"><thead><tr>
+            <th>Vial</th><th>xr sent</th><th>raw</th><th>own-line °C</th><th>equilibrium</th>
+            <th>${label} ref °C</th><th>${label === "hot" ? "span °C" : "Δ vs ref °C"}</th><th></th>
+          </tr></thead><tbody>${rows.join("")}</tbody></table>`;
+        return;
+      }
+      liveEl.innerHTML = "";
+    }
+
+    function _tcVialOptions(vials, selected) {
+      return vials.map(v => `<option value="${v}" ${v === selected ? "selected" : ""}>Vial ${v}</option>`).join("");
+    }
+
+    function renderTempCal() {
+      const t = calState.temp;
+      const s = (t.session && t.session.active) ? t.session : null;
+      document.querySelectorAll("#tempcal-steps .wizard-step").forEach(el => {
+        const n = Number(el.dataset.step);
+        el.classList.toggle("active", n === t.step);
+        el.classList.toggle("done", n < t.step);
+      });
+      const body = document.getElementById("tempcal-body");
+      const next = document.getElementById("tempcal-next");
+      document.getElementById("tempcal-back").disabled = !(t.step === 4 || t.step === 6) || !!t.installed;
+      document.getElementById("tempcal-abort").hidden = !s || !!t.installed;
+      next.disabled = false;
+      renderTempCalLive();
+
+      if (t.installed) {
+        const r = t.installed;
+        const rows = (r.measured_vials || []).map(v => {
+          const e = r.review[String(v)];
+          return `<tr><td>Vial ${v}</td><td>${_fmt(e.slope, 5)}</td><td>${_fmt(e.intercept, 3)}</td>
+            <td>${_fmt(e.previous_delivered_at_37_c, 2)} °C</td></tr>`;
+        }).join("");
+        body.innerHTML = `
+          <p class="blank-status ok">Installed as version ${escapeHtml(r.version)} and live —
+          heaters parked off, the machine released.</p>
+          <table class="cal-table"><thead><tr><th>Vial</th><th>slope</th><th>intercept</th>
+          <th>the old curve delivered, commanding 37 °C</th></tr></thead><tbody>${rows}</tbody></table>
+          ${_t3QcLists(r.qc)}`;
+        next.textContent = "Done";
+        return;
+      }
+
+      if (t.step === 1) {
+        body.innerHTML = `
+          <p class="cal-hint">Tier 3 §8.1. Fill every vial with 25 mL water and seat the
+          sleeves; have the reference thermometer ready. The session <strong>reserves the
+          whole machine</strong> (no experiment can be created until it is finished or
+          aborted) and survives a server restart. The cold phase doubles as prerequisite
+          P2: a vial that heats while its heater is commanded off is excluded and alerted
+          as a hardware fault.</p>
+          <div class="cal-form-grid">
+            <label for="tc-operator">Operator</label><input id="tc-operator" type="text">
+            <label for="tc-ref">Reference thermometer</label>
+            <input id="tc-ref" type="text" placeholder="make / model / serial">
+            <label for="tc-bench">Bench temperature (°C)</label>
+            <input id="tc-bench" type="number" step="0.1" placeholder="optional">
+            <label for="tc-vials">Vials</label>
+            <input id="tc-vials" type="text" placeholder="blank = all 16, or e.g. 0,1,6">
+            <label for="tc-stir">Stir PWM</label><input id="tc-stir" type="number" value="8" min="0" max="15">
+            <label for="tc-hot">Hot target (°C)</label><input id="tc-hot" type="number" value="40" step="0.5">
+            <label for="tc-verify">Verification target (°C)</label>
+            <input id="tc-verify" type="number" value="30" step="0.5">
+          </div>`;
+        next.textContent = "Start: heaters off, stir on";
+        return;
+      }
+      const live = _tcLive();
+      if (t.step === 2) {
+        const coldDone = s && live.length && live.every(v =>
+          _tcPoints(s.per_vial[String(v)], "cold").length);
+        body.innerHTML = `
+          <p class="cal-hint">Heaters are OFF (xr = 4095), stir is on. Wait until every
+          vial has equilibrated — judged on raw counts relative to the pack, so room
+          drift does not block it (typically ~45 min). Then put the probe <em>in</em> a
+          vial and capture: one reading serves every vial.</p>
+          <div class="t3-row">
+            <label>Reference °C <input id="tc-cold-ref" type="number" step="0.01"></label>
+            <label>Probe in <select id="tc-cold-vial">${_tcVialOptions(live, live[0])}</select></label>
+            <label><input type="checkbox" id="tc-cold-force"> before equilibrium (recorded)</label>
+            <button class="btn btn-primary" type="button" id="tc-cold-capture">Capture cold point</button>
+          </div>`;
+        document.getElementById("tc-cold-capture").addEventListener("click", tempCalCaptureCold);
+        next.textContent = "Next: heat to the hot point";
+        next.disabled = !coldDone;
+        return;
+      }
+      if (t.step === 3) {
+        const cfg = s ? s.config : {};
+        const suggested = live.filter(v => s.per_vial[String(v)].retarget_suggested);
+        body.innerHTML = `
+          <p class="cal-hint">Every vial is commanded to ${_fmt(cfg.target_hot_c, 1)} °C through
+          the installed curve. After ~30 min, move the probe vial to vial: insert, wait
+          2 min, capture. A vial whose span falls short of 15 °C — vial 0's installed curve
+          is the known offender — is flagged: <strong>retarget</strong> it through its own
+          two readings, wait, and capture it again.</p>
+          <div class="t3-row">
+            <label>Probe in <select id="tc-hot-vial">${_tcVialOptions(live, calState.temp.selected)}</select></label>
+            <label>Reference °C <input id="tc-hot-ref" type="number" step="0.01"></label>
+            <label><input type="checkbox" id="tc-hot-force"> before equilibrium (recorded)</label>
+            <button class="btn btn-primary" type="button" id="tc-hot-capture">Capture hot point</button>
+            <button class="btn" type="button" id="tc-retarget" ${suggested.length ? "" : "disabled"}>
+              Retarget ${suggested.length ? "vials " + suggested.join(", ") : "(none flagged)"}</button>
+          </div>`;
+        document.getElementById("tc-hot-capture").addEventListener("click", () => tempCalCaptureProbe("hot"));
+        document.getElementById("tc-retarget").addEventListener("click", () => tempCalRetarget(suggested));
+        next.textContent = "Next: review the fit";
+        return;
+      }
+      if (t.step === 4 || t.step === 6) {
+        renderTempCalReview(body, t.step === 6);
+        next.textContent = t.step === 4 ? "Next: verify at the middle" : "Install calibration";
+        return;
+      }
+      if (t.step === 5) {
+        const cfg = s ? s.config : {};
+        const review = t.review;
+        const flagged = review ? Object.keys(review.fit.flagged_vials || {}).map(Number) : [];
+        const order = [...new Set([...flagged, 0, ...live])].filter(v => live.includes(v));
+        const required = review ? review.qc.verification.required : Math.min(4, live.length);
+        body.innerHTML = `
+          <p class="cal-hint">Heaters are commanded to ${_fmt(cfg.target_verify_c, 1)} °C through the
+          <strong>candidate</strong> fit — nothing is installed yet. A two-point fit reproduces
+          its own two points trivially; only the middle tests it. Probe at least
+          <strong>${required}</strong> vial(s), flagged ones first: ${escapeHtml(order.slice(0, Math.max(required, 4)).join(", "))}.
+          Pass: within ±0.5 °C.</p>
+          <div class="t3-row">
+            <label>Probe in <select id="tc-verify-vial">${_tcVialOptions(order, order[0])}</select></label>
+            <label>Reference °C <input id="tc-verify-ref" type="number" step="0.01"></label>
+            <label><input type="checkbox" id="tc-verify-force"> before equilibrium (recorded)</label>
+            <button class="btn btn-primary" type="button" id="tc-verify-capture">Capture verification</button>
+          </div>`;
+        document.getElementById("tc-verify-capture").addEventListener("click", () => tempCalCaptureProbe("verify"));
+        next.textContent = "Next: final review";
+      }
+    }
+
+    function renderTempCalReview(body, final) {
+      const t = calState.temp;
+      const r = t.review;
+      if (!r) { body.innerHTML = "<p class='cal-hint'>Computing…</p>"; return; }
+      const rows = [];
+      for (let v = 0; v < N_VIALS; v++) {
+        const e = r.fit.review[String(v)];
+        if (!e.measured) continue;
+        rows.push(`<tr data-tc-vial="${v}" style="cursor:pointer">
+          <td style="border-left:4px solid ${vialColor(v)}">Vial ${v}</td>
+          <td>${_fmt(e.previous_slope, 5)} → ${_fmt(e.slope, 5)}</td>
+          <td class="${Math.abs(e.delta_slope_pct || 0) > 10 ? "warn" : ""}">${_fmt(e.delta_slope_pct, 1)} %</td>
+          <td>${_fmt(e.previous_intercept, 2)} → ${_fmt(e.intercept, 2)}</td>
+          <td>${e.xr_37_previous} → ${e.xr_37_new ?? "—"}</td>
+          <td class="${Math.abs((e.previous_delivered_at_37_c ?? 37) - 37) > 1 ? "bad" : ""}">${_fmt(e.previous_delivered_at_37_c, 2)} °C</td>
+          <td>${_fmt(e.span_c, 1)}</td>
+          <td>${e.verification_delta_c === null || e.verification_delta_c === undefined ? "—" : _fmt(e.verification_delta_c, 2)}</td>
+          <td class="warn">${e.flag ? "flag" : ""}</td></tr>`);
+      }
+      const unmeasured = Object.entries(r.fit.review).filter(([_v, e]) => !e.measured).map(([v]) => v);
+      body.innerHTML = `
+        <p class="cal-hint">Before anything is installed: the new line against the old, and
+        what the old curve actually delivered when the dashboard said 37 °C.
+        ${unmeasured.length ? `Vials ${escapeHtml(unmeasured.join(", "))} are not measured and keep their previous constants.` : ""}
+        Click a row to plot it.</p>
+        <table class="cal-table"><thead><tr><th>Vial</th><th>slope</th><th>Δ</th><th>intercept</th>
+          <th>xr @ 37 °C</th><th>old curve delivered @ "37 °C"</th><th>span</th><th>verify Δ</th><th></th>
+        </tr></thead><tbody>${rows.join("")}</tbody></table>
+        ${_t3QcLists(r.qc)}
+        <div class="t3-chart" id="tc-chart"></div>
+        ${final ? `
+          <div class="cal-form-grid">
+            <label for="tc-exclude">Exclude vials</label>
+            <input id="tc-exclude" type="text" placeholder="e.g. 6 (keeps its previous constants)">
+            ${t.needOverride || (r.qc.failures || []).length ? `
+              <label for="tc-override">Override reason</label>
+              <input id="tc-override" type="text" placeholder="recorded in the calibration's qc">` : ""}
+          </div>` : ""}`;
+      body.querySelectorAll("[data-tc-vial]").forEach(tr =>
+        tr.addEventListener("click", () => { t.selected = Number(tr.dataset.tcVial); renderTempCalChart(); }));
+      renderTempCalChart();
+    }
+
+    function renderTempCalChart() {
+      const t = calState.temp;
+      destroyChart(t.chart);
+      t.chart = null;
+      const el = document.getElementById("tc-chart");
+      if (!el || !t.review || !t.session || !t.session.active) return;
+      const v = t.selected;
+      const e = t.review.fit.review[String(v)];
+      const pv = t.session.per_vial[String(v)];
+      if (!e || !pv) return;
+      const pts = (pv.points || []).filter(p => !p.superseded);
+      const raws = pts.map(p => p.raw_median);
+      if (!raws.length) return;
+      const pad = 30;
+      const lo = Math.min(...raws) - pad, hi = Math.max(...raws) + pad;
+      const set = (label, color) => ({
+        label: `${label} (probe)`, color,
+        pts: pts.filter(p => p.label === label).map(p => [p.raw_median, p.reference_c]),
+      });
+      t.chart = _t3XyChart(el,
+        [set("cold", "#2563eb"), set("hot", "#dc2626"), set("verify", "#16a34a")],
+        [
+          { label: `vial ${v} new`, color: vialColor(v), fn: x => e.slope * x + e.intercept },
+          { label: "previous", color: "#94a3b8", dash: [6, 4],
+            fn: x => e.previous_slope * x + e.previous_intercept },
+        ],
+        { xRange: [lo, hi], xLabel: "raw counts" });
+    }
+
+    async function tempCalCaptureCold() {
+      const ref = _t3Num("tc-cold-ref");
+      if (ref === null) { showToast("Enter the reference thermometer reading", "warn"); return; }
+      const d = await _t3Post("/api/calibration/temperature/point", {
+        label: "cold", reference_c: ref,
+        reference_vial: Number(_t3Val("tc-cold-vial")),
+        settle_check: !document.getElementById("tc-cold-force").checked,
+      }, "Cold point captured");
+      if (d) { calState.temp.session = d.session; renderTempCal(); }
+    }
+
+    async function tempCalCaptureProbe(label) {
+      const ref = _t3Num(`tc-${label}-ref`);
+      const v = Number(_t3Val(`tc-${label}-vial`));
+      if (ref === null) { showToast("Enter the reference thermometer reading", "warn"); return; }
+      const d = await _t3Post("/api/calibration/temperature/point", {
+        label, reference_c: ref, vials: [v],
+        settle_check: !document.getElementById(`tc-${label}-force`).checked,
+      }, `Vial ${v}: ${label} point captured`);
+      if (!d) return;
+      calState.temp.session = d.session;
+      // Step the probe along to the next vial.
+      const sel = document.getElementById(`tc-${label}-vial`);
+      const opts = [...sel.options].map(o => Number(o.value));
+      calState.temp.selected = opts[(opts.indexOf(v) + 1) % opts.length];
+      renderTempCal();
+      const refEl = document.getElementById(`tc-${label}-ref`);
+      if (refEl) refEl.focus();
+    }
+
+    async function tempCalRetarget(vials) {
+      if (!vials.length) return;
+      const d = await _t3Post("/api/calibration/temperature/retarget", { vials },
+        `Retargeted vials ${vials.join(", ")} through their own lines — wait, then probe again`);
+      if (d) { calState.temp.session = d.session; renderTempCal(); }
+    }
+
+    async function tempCalFit() {
+      const t = calState.temp;
+      const exclude = _t3Vials(_t3Val("tc-exclude")) || [];
+      const d = await _t3Post("/api/calibration/temperature/fit", { exclude_vials: exclude });
+      if (d) t.review = d;
+      return !!d;
+    }
+
+    async function tempCalNext() {
+      const t = calState.temp;
+      if (t.installed) { closeTempCalModal(); return; }
+      if (t.step === 1) {
+        const body = {
+          operator: _t3Val("tc-operator") || "gui",
+          reference_thermometer: _t3Val("tc-ref"),
+          bench_temp_c: _t3Num("tc-bench"),
+          stir_pwm: _t3Num("tc-stir") ?? 8,
+          target_hot_c: _t3Num("tc-hot") ?? 40,
+          target_verify_c: _t3Num("tc-verify") ?? 30,
+        };
+        const vials = _t3Vials(_t3Val("tc-vials"));
+        if (vials) body.vials = vials;
+        const started = await _t3Post("/api/calibration/temperature/start", body);
+        if (!started) return;
+        (started.warnings || []).forEach(w => showToast(w, "warn"));
+        const d = await _t3Post("/api/calibration/temperature/apply", { phase: "cold" },
+          "Heaters off, stir on — equilibrating");
+        if (!d) return;
+        t.session = d; t.step = 2;
+      } else if (t.step === 2) {
+        const d = await _t3Post("/api/calibration/temperature/apply", { phase: "hot" },
+          "Heating to the hot point");
+        if (!d) return;
+        t.session = d; t.step = 3;
+        t.selected = _tcLive()[0] ?? 0;
+      } else if (t.step === 3) {
+        if (!(await tempCalFit())) return;
+        t.step = 4;
+      } else if (t.step === 4) {
+        const d = await _t3Post("/api/calibration/temperature/apply", { phase: "verify" },
+          "Heating to the verification point through the candidate fit");
+        if (!d) return;
+        t.session = d; t.step = 5;
+      } else if (t.step === 5) {
+        if (!(await tempCalFit())) return;
+        t.step = 6;
+      } else if (t.step === 6) {
+        const payload = {
+          operator: "gui",
+          exclude_vials: _t3Vials(_t3Val("tc-exclude")) || [],
+        };
+        const reason = _t3Val("tc-override");
+        if (reason) payload.override_reason = reason;
+        try {
+          t.installed = await postJson("/api/calibration/temperature/finish", payload);
+          t.session = { active: false };
+          tempCalPoll(false);
+          showToast(`Thermistor calibration installed (${t.installed.version})`, "ok");
+          fetchActuatorState();
+          refreshCalibration();
+        } catch (err) {
+          if (err.code === "qc_refused") {
+            t.needOverride = true;
+            if (t.review && err.data && err.data.qc) t.review.qc = err.data.qc;
+            showToast("Acceptance criteria failed — fix, exclude, or record an override", "warn");
+          } else {
+            showToast(err.message, err.status === 409 ? "warn" : "error");
+          }
+        }
+      }
+      renderTempCal();
+    }
+
+    function tempCalBack() {
+      const t = calState.temp;
+      if (t.step === 4) t.step = 3;
+      else if (t.step === 6) t.step = 5;
+      renderTempCal();
+    }
+
+    async function tempCalReapply() {
+      const s = calState.temp.session;
+      const phase = (s && s.phase) || "cold";
+      const d = await _t3Post("/api/calibration/temperature/apply", { phase },
+        `Re-applied the ${phase} phase`);
+      if (d) { calState.temp.session = d; renderTempCal(); }
+    }
+
+    async function tempCalAbort() {
+      if (!confirm("Abort the thermistor calibration? Captured points are discarded, heaters park off, nothing is installed.")) return;
+      const d = await _t3Post("/api/calibration/temperature/abort", {}, "Thermistor calibration aborted");
+      if (d) closeTempCalModal();
+    }
+
+    // ------------------------------------------------------------
+    //  Tier 3: OD dilution series (§8.2)
+    // ------------------------------------------------------------
+
+    const odSeriesModal = document.getElementById("odseries-modal");
+
+    async function openOdSeriesModal() {
+      const o = calState.odseries;
+      o.review = null; o.installed = null; o.needOverride = false;
+      _openModal(odSeriesModal);
+      await odSeriesRefresh();
+      o.step = (o.session && o.session.active) ? 2 : 1;
+      renderOdSeries();
+    }
+
+    function closeOdSeriesModal() {
+      destroyChart(calState.odseries.chart);
+      calState.odseries.chart = null;
+      _closeModal(odSeriesModal);
+      refreshCalibration();
+    }
+
+    async function odSeriesRefresh() {
+      try {
+        const res = await fetch("/api/calibration/od/series/session?preview=1");
+        calState.odseries.session = await res.json();
+      } catch (err) {
+        console.warn("OD series refresh failed:", err.message);
+      }
+    }
+
+    function _osLive() {
+      const s = calState.odseries.session;
+      return (s && s.active) ? s.vials.filter(v => !s.vial_faults[String(v)]) : [];
+    }
+
+    function renderOdSeries() {
+      const o = calState.odseries;
+      const s = (o.session && o.session.active) ? o.session : null;
+      document.querySelectorAll("#odseries-steps .wizard-step").forEach(el => {
+        const n = Number(el.dataset.step);
+        el.classList.toggle("active", n === o.step);
+        el.classList.toggle("done", n < o.step);
+      });
+      const stateEl = document.getElementById("odseries-state");
+      const body = document.getElementById("odseries-body");
+      const next = document.getElementById("odseries-next");
+      document.getElementById("odseries-back").disabled = !(o.step === 3 || o.step === 4) || !!o.installed;
+      document.getElementById("odseries-abort").hidden = !s || !!o.installed;
+      next.disabled = false;
+      stateEl.innerHTML = s ? _t3StateBanner(s, "Re-apply conditions") : "";
+      if (s && s.thermal && o.step === 2) {
+        stateEl.innerHTML += `<p class="blank-status ${s.thermal.settled ? "ok" : "wait"}">${
+          s.thermal.settled ? `Held at ${_fmt(s.config.target_temp_c, 1)} °C.`
+            : `Waiting for ${_fmt(s.config.target_temp_c, 1)} °C ±${s.thermal.tolerance_c} for ${s.thermal.required_minutes} min after loading.`}</p>`;
+      }
+
+      if (o.installed) {
+        const r = o.installed;
+        body.innerHTML = `
+          <p class="blank-status ok">Installed as version ${escapeHtml(r.version)}, dark-subtracted,
+          and live. Measured: ${escapeHtml((r.measured_vials || []).join(", ") || "none")}.
+          ${(r.converted_vials || []).length ? `Converted to dark-subtracted signal: ${escapeHtml(r.converted_vials.join(", "))}.` : ""}
+          New experiments now read OD dark-subtracted; take a fresh per-run blank.</p>
+          ${_t3QcLists(r.qc)}`;
+        next.textContent = "Done";
+        return;
+      }
+      if (o.step === 1) {
+        body.innerHTML = `
+          <p class="cal-hint">Tier 3 §8.2. Prepare ≥ 8 dilutions of a <strong>non-growing</strong>
+          turbidity standard (killed cells, heat-fixed cells or beads) in the run's medium, from
+          a blank to above the highest OD you will run. The series fits all four sigmoid
+          parameters on <strong>dark-subtracted</strong> signal and installs the sidecar that makes
+          the dark read a correction. It reserves the whole machine and survives a restart.</p>
+          <div class="cal-form-grid">
+            <label for="os-operator">Operator</label><input id="os-operator" type="text">
+            <label for="os-standard">Turbidity standard</label>
+            <input id="os-standard" type="text" placeholder="e.g. heat-killed E. coli">
+            <label for="os-medium">Medium</label><input id="os-medium" type="text">
+            <label for="os-spectro">Spectrophotometer</label>
+            <input id="os-spectro" type="text" placeholder="make / model">
+            <label for="os-vials">Vials</label>
+            <input id="os-vials" type="text" placeholder="blank = all 16; short on time: 0,1,6,14,15">
+            <label for="os-led">LED power</label><input id="os-led" type="number" value="2125" min="1" max="2200">
+            <label for="os-stir">Stir PWM (the run's)</label><input id="os-stir" type="number" value="8" min="0" max="15">
+            <label for="os-temp">Temperature (°C)</label>
+            <input id="os-temp" type="number" step="0.5" placeholder="blank = heaters off">
+          </div>`;
+        next.textContent = "Start: apply conditions";
+        return;
+      }
+      if (o.step === 2) {
+        const live = _osLive();
+        const rows = live.map(v => {
+          const pv = s.per_vial[String(v)];
+          const prev = pv.preview;
+          return `<tr data-os-vial="${v}" style="cursor:pointer">
+            <td style="border-left:4px solid ${vialColor(v)}">Vial ${v}</td>
+            <td><input type="number" step="0.001" min="0" id="os-spec-${v}"></td>
+            <td><input type="number" step="1" min="1" value="1" id="os-dil-${v}"></td>
+            <td>${pv.n_points}</td>
+            <td class="${pv.n_levels >= 8 ? "" : "warn"}">${pv.n_levels}</td>
+            <td>${pv.od_range ? `${_fmt(pv.od_range[0], 2)}–${_fmt(pv.od_range[1], 2)}` : "—"}</td>
+            <td>${prev ? _fmt(prev.r2, 5) : (pv.preview_error ? '<span class="bad">✗</span>' : "—")}</td></tr>`;
+        }).join("");
+        body.innerHTML = `
+          <p class="cal-hint">Per loading: read true OD600 on the spectrophotometer immediately before
+          loading (dilute dense standards and enter the factor), load, stir, wait ~5 min, capture.
+          A capture reads every vial lit <em>and</em> dark. Leave a vial's reading blank to skip it.
+          Click a row to see its points.</p>
+          <div class="t3-row">
+            <label>Same reading for all: <input id="os-all-spec" type="number" step="0.001"></label>
+            <label>× <input id="os-all-dil" type="number" value="1" min="1"></label>
+            <button class="btn" type="button" id="os-fill">Fill</button>
+          </div>
+          <table class="cal-table"><thead><tr><th>Vial</th><th>spec reading</th><th>dilution ×</th>
+            <th>points</th><th>levels</th><th>OD range</th><th>preview R²</th></tr></thead>
+            <tbody>${rows}</tbody></table>
+          <div class="t3-row">
+            <label><input type="checkbox" id="os-force"> before thermal settle (recorded)</label>
+            <button class="btn btn-primary" type="button" id="os-capture">Capture point</button>
+          </div>
+          <div id="os-selected"></div>`;
+        document.getElementById("os-fill").addEventListener("click", () => {
+          const spec = _t3Val("os-all-spec"), dil = _t3Val("os-all-dil") || "1";
+          live.forEach(v => {
+            document.getElementById(`os-spec-${v}`).value = spec;
+            document.getElementById(`os-dil-${v}`).value = dil;
+          });
+        });
+        document.getElementById("os-capture").addEventListener("click", odSeriesCapture);
+        body.querySelectorAll("[data-os-vial]").forEach(tr => tr.addEventListener("click", (ev) => {
+          if (ev.target.tagName === "INPUT") return;
+          o.selected = Number(tr.dataset.osVial);
+          renderOdSeriesSelected();
+        }));
+        if (o.selected === null || !live.includes(o.selected)) o.selected = live[0] ?? null;
+        renderOdSeriesSelected();
+        next.textContent = "Next: review the fits";
+        return;
+      }
+      if (o.step === 3 || o.step === 4) {
+        renderOdSeriesReview(body, o.step === 4);
+        next.textContent = o.step === 3 ? "Next: install" : "Install calibration";
+      }
+    }
+
+    function renderOdSeriesSelected() {
+      const o = calState.odseries;
+      const el = document.getElementById("os-selected");
+      destroyChart(o.chart);
+      o.chart = null;
+      if (!el || o.selected === null) return;
+      const pv = o.session.per_vial[String(o.selected)];
+      const rows = (pv.points || []).map(p => `<tr class="${p.discarded ? "warn" : ""}">
+        <td>#${p.id}</td><td>${_fmt(p.true_od600, 3)}</td><td>${_fmt(p.signal, 0)}</td>
+        <td>${_fmt(p.lit_sd, 0)}</td><td>${_fmt(p.dark_median, 0)}</td>
+        <td>${p.discarded ? "discarded" : (p.flags || []).length ? '<span class="warn">⚠</span>' : ""}</td>
+        <td>${p.discarded ? "" : `<button class="btn" type="button" data-os-discard="${p.id}">Discard</button>`}</td>
+      </tr>`).join("");
+      el.innerHTML = `
+        <h3 style="font-size:13px;margin:12px 0 4px">Vial ${o.selected}</h3>
+        <table class="cal-table"><thead><tr><th>point</th><th>true OD600</th><th>signal (lit − dark)</th>
+          <th>SD</th><th>dark</th><th></th><th></th></tr></thead><tbody>${rows}</tbody></table>
+        <div class="t3-chart" id="os-chart"></div>`;
+      el.querySelectorAll("[data-os-discard]").forEach(b => b.addEventListener("click", async () => {
+        const d = await _t3Post("/api/calibration/od/series/discard",
+          { point_id: Number(b.dataset.osDiscard) }, "Point discarded");
+        if (d) { await odSeriesRefresh(); renderOdSeries(); }
+      }));
+      const pts = (pv.points || []).filter(p => !p.discarded);
+      if (!pts.length) return;
+      const prev = pv.preview;
+      const maxOd = Math.max(...pts.map(p => p.true_od600), 0.1) * 1.05;
+      o.chart = _t3XyChart(document.getElementById("os-chart"),
+        [{ label: "measured", color: vialColor(o.selected), pts: pts.map(p => [p.true_od600, p.signal]) }],
+        prev ? [{ label: "preview fit", color: "#64748b",
+                  fn: x => prev.a + (prev.b - prev.a) / (1 + Math.pow(10, prev.d * (prev.c - x))) }] : [],
+        { xRange: [0, maxOd], xLabel: "true OD600" });
+    }
+
+    function renderOdSeriesReview(body, final) {
+      const o = calState.odseries;
+      const r = o.review;
+      if (!r) { body.innerHTML = "<p class='cal-hint'>Computing…</p>"; return; }
+      const mark = (ok, warnOnly) => ok ? '<span class="ok">✓</span>'
+        : (warnOnly ? '<span class="warn">⚠</span>' : '<span class="bad">✗</span>');
+      const rows = (r.fit.measured_vials || []).map(v => {
+        const e = r.fit.review[String(v)];
+        const c = e.criteria;
+        return `<tr data-os-rvial="${v}" style="cursor:pointer">
+          <td style="border-left:4px solid ${vialColor(v)}">Vial ${v}</td>
+          <td>${_fmt(e.a, 0)}</td><td>${_fmt(e.b, 0)}${e.b_at_bound ? " (cap)" : ""}</td>
+          <td>${_fmt(e.c, 2)}</td><td>${_fmt(e.d, 3)}</td>
+          <td>${_fmt(e.r2, 5)} ${mark(c.r2)}</td>
+          <td>${_fmt(e.max_abs_residual, 3)} ${mark(c.residuals)}</td>
+          <td>${e.n_levels} ${mark(c.n_levels)}</td>
+          <td>${mark(c.monotone)} ${mark(c.lower_asymptote_margin)} ${mark(c.inflection_in_range, true)} ${mark(c.upper_asymptote_measured, true)}</td>
+          <td>${e.previous_od_at_blank === undefined ? "—" : _fmt(e.previous_od_at_blank, 3)}</td>
+          <td><input type="checkbox" data-os-exclude="${v}" ${o.exclude && o.exclude.has(v) ? "checked" : ""}></td></tr>`;
+      }).join("");
+      body.innerHTML = `
+        <p class="cal-hint">Nothing is installed yet. Criteria per vial: R², residual (≤ 0.02 OD or
+        5 %), ≥ 8 levels, then monotone · lower-asymptote margin · inflection in range (warning) ·
+        upper asymptote measured (warning). "Old OD at blank" is what the previous curve reported
+        for this series' blank — the offset every run carried. ${
+          (r.fit.converted_vials || []).length ? `Vials ${escapeHtml(r.fit.converted_vials.join(", "))} keep their previous curve, converted exactly to dark-subtracted signal.` : ""}
+        Click a row to plot it; tick to exclude.</p>
+        <table class="cal-table"><thead><tr><th>Vial</th><th>a</th><th>b</th><th>c</th><th>d</th>
+          <th>R²</th><th>max |res|</th><th>levels</th><th>checks</th><th>old OD at blank</th><th>excl.</th>
+        </tr></thead><tbody>${rows}</tbody></table>
+        ${_t3QcLists(r.qc)}
+        <div class="t3-chart" id="os-rchart"></div>
+        ${final && (o.needOverride || (r.qc.failures || []).length) ? `
+          <div class="cal-form-grid">
+            <label for="os-override">Override reason</label>
+            <input id="os-override" type="text" placeholder="recorded in the calibration's qc">
+          </div>` : ""}`;
+      o.exclude = o.exclude || new Set();
+      body.querySelectorAll("[data-os-exclude]").forEach(cb => cb.addEventListener("change", async () => {
+        const v = Number(cb.dataset.osExclude);
+        if (cb.checked) o.exclude.add(v); else o.exclude.delete(v);
+        const d = await _t3Post("/api/calibration/od/series/fit", { exclude_vials: [...o.exclude] });
+        if (d) { o.review = d; renderOdSeries(); }
+      }));
+      body.querySelectorAll("[data-os-rvial]").forEach(tr => tr.addEventListener("click", (ev) => {
+        if (ev.target.tagName === "INPUT") return;
+        o.selected = Number(tr.dataset.osRvial);
+        renderOdSeriesReviewChart();
+      }));
+      renderOdSeriesReviewChart();
+    }
+
+    function renderOdSeriesReviewChart() {
+      const o = calState.odseries;
+      destroyChart(o.chart);
+      o.chart = null;
+      const el = document.getElementById("os-rchart");
+      const measured = (o.review && o.review.fit.measured_vials) || [];
+      if (!el || !measured.length) return;
+      if (!measured.includes(o.selected)) o.selected = measured[0];
+      const v = o.selected;
+      const e = o.review.fit.review[String(v)];
+      const logistic = (a, b, c, d) => x => a + (b - a) / (1 + Math.pow(10, d * (c - x)));
+      const [pa, pb, pc, pd] = e.previous;
+      const maxOd = Math.max(...e.points.map(p => p.true_od600), 0.1) * 1.05;
+      o.chart = _t3XyChart(el,
+        [{ label: `vial ${v} measured`, color: vialColor(v), pts: e.points.map(p => [p.true_od600, p.signal]) }],
+        [
+          { label: "new fit", color: vialColor(v), fn: logistic(e.a, e.b, e.c, e.d) },
+          { label: "previous (dark-subtracted)", color: "#94a3b8", dash: [6, 4], fn: logistic(pa, pb, pc, pd) },
+        ],
+        { xRange: [0, maxOd], xLabel: "true OD600" });
+    }
+
+    async function odSeriesCapture() {
+      const o = calState.odseries;
+      const entries = [];
+      for (const v of _osLive()) {
+        const spec = _t3Num(`os-spec-${v}`);
+        if (spec === null) continue;
+        entries.push({ vial: v, spec_reading: spec, dilution_factor: _t3Num(`os-dil-${v}`) ?? 1 });
+      }
+      if (!entries.length) { showToast("Enter a spectrophotometer reading for at least one vial", "warn"); return; }
+      const d = await _t3Post("/api/calibration/od/series/point", {
+        entries, settle_check: !document.getElementById("os-force").checked,
+      });
+      if (!d) return;
+      showToast(`Captured ${d.captured.length} point(s)` +
+        (d.rejected.length ? `; rejected ${d.rejected.map(r => r.vial).join(", ")}` : ""),
+        d.rejected.length ? "warn" : "ok");
+      d.rejected.forEach(r => showToast(`Vial ${r.vial}: ${r.reason}`, "warn"));
+      await odSeriesRefresh();
+      renderOdSeries();
+    }
+
+    async function odSeriesNext() {
+      const o = calState.odseries;
+      if (o.installed) { closeOdSeriesModal(); return; }
+      if (o.step === 1) {
+        const body = {
+          operator: _t3Val("os-operator") || "gui",
+          standard: _t3Val("os-standard"),
+          medium: _t3Val("os-medium"),
+          spectrophotometer: _t3Val("os-spectro"),
+          led_power: _t3Num("os-led") ?? 2125,
+          stir_pwm: _t3Num("os-stir") ?? 8,
+          target_temp_c: _t3Num("os-temp"),
+        };
+        const vials = _t3Vials(_t3Val("os-vials"));
+        if (vials) body.vials = vials;
+        const started = await _t3Post("/api/calibration/od/series/start", body);
+        if (!started) return;
+        (started.warnings || []).forEach(w => showToast(w, "warn"));
+        if (!(await _t3Post("/api/calibration/od/series/apply", {}, "Conditions applied"))) return;
+        await odSeriesRefresh();
+        o.step = 2;
+      } else if (o.step === 2) {
+        const d = await _t3Post("/api/calibration/od/series/fit", { exclude_vials: [...(o.exclude || [])] });
+        if (!d) return;
+        o.review = d; o.step = 3;
+      } else if (o.step === 3) {
+        o.step = 4;
+      } else if (o.step === 4) {
+        const payload = { operator: "gui", exclude_vials: [...(o.exclude || [])] };
+        const reason = _t3Val("os-override");
+        if (reason) payload.override_reason = reason;
+        try {
+          o.installed = await postJson("/api/calibration/od/series/finish", payload);
+          o.session = { active: false };
+          showToast(`OD calibration installed (${o.installed.version}) — dark-subtracted`, "ok");
+          refreshCalibration();
+        } catch (err) {
+          if (err.code === "qc_refused") {
+            o.needOverride = true;
+            if (o.review && err.data && err.data.qc) o.review.qc = err.data.qc;
+            showToast("Acceptance criteria failed — re-capture, exclude, or record an override", "warn");
+          } else {
+            showToast(err.message, err.status === 409 ? "warn" : "error");
+          }
+        }
+      }
+      renderOdSeries();
+    }
+
+    function odSeriesBack() {
+      const o = calState.odseries;
+      if (o.step > 2) o.step -= 1;
+      renderOdSeries();
+    }
+
+    async function odSeriesReapply() {
+      if (await _t3Post("/api/calibration/od/series/apply", {}, "Conditions re-applied")) {
+        await odSeriesRefresh();
+        renderOdSeries();
+      }
+    }
+
+    async function odSeriesAbort() {
+      if (!confirm("Abort the OD dilution series? Captured points are discarded and nothing is installed.")) return;
+      if (await _t3Post("/api/calibration/od/series/abort", {}, "OD dilution series aborted")) {
+        closeOdSeriesModal();
+      }
+    }
+
     (function initCalibrationUI() {
       document.getElementById("cal-banner-open")
         .addEventListener("click", () => showView("cal"));
@@ -6876,6 +7945,45 @@
         .addEventListener("click", closeReconModal);
       document.getElementById("recon-submit")
         .addEventListener("click", submitReconciliation);
+
+      // Tier 3 (Session AA)
+      document.getElementById("cal-open-temp")
+        .addEventListener("click", openTempCalModal);
+      document.getElementById("cal-open-odseries")
+        .addEventListener("click", openOdSeriesModal);
+      document.getElementById("tempcal-modal-close")
+        .addEventListener("click", closeTempCalModal);
+      document.getElementById("tempcal-close")
+        .addEventListener("click", closeTempCalModal);
+      document.getElementById("tempcal-next")
+        .addEventListener("click", tempCalNext);
+      document.getElementById("tempcal-back")
+        .addEventListener("click", tempCalBack);
+      document.getElementById("tempcal-abort")
+        .addEventListener("click", tempCalAbort);
+      tempCalModal.addEventListener("click", (e) => {
+        if (e.target.closest("[data-t3-reapply]")) tempCalReapply();
+      });
+      document.getElementById("odseries-modal-close")
+        .addEventListener("click", closeOdSeriesModal);
+      document.getElementById("odseries-close")
+        .addEventListener("click", closeOdSeriesModal);
+      document.getElementById("odseries-next")
+        .addEventListener("click", odSeriesNext);
+      document.getElementById("odseries-back")
+        .addEventListener("click", odSeriesBack);
+      document.getElementById("odseries-abort")
+        .addEventListener("click", odSeriesAbort);
+      odSeriesModal.addEventListener("click", (e) => {
+        if (e.target.closest("[data-t3-reapply]")) odSeriesReapply();
+      });
+      // The open-session card's "Open wizard" button.
+      document.getElementById("cal-cards").addEventListener("click", (e) => {
+        const b = e.target.closest("[data-open-t3]");
+        if (!b) return;
+        if (b.dataset.openT3 === "temperature") openTempCalModal();
+        else openOdSeriesModal();
+      });
     })();
 
     // --- Socket.IO ---
@@ -6899,6 +8007,12 @@
       drawerIngest(msg);
     });
     socket.on("experiment_event", (msg) => {
+      if (msg && msg.type === "calibration_installed") {
+        // A new curve is live server-side: the heater sliders' °C<->raw
+        // conversion and the calibration cards must follow, in every tab.
+        fetchActuatorState();
+        refreshCalibration();
+      }
       if (msg && msg.type === "pump" && typeof msg.vial === "number") {
         // Pump fired — count it (one PumpAction = two physical pumps,
         // influx + efflux; count the dilution event, i.e. the influx).
