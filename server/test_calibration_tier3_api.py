@@ -169,3 +169,130 @@ def test_calibration_heater_alerts_go_through_the_funnel():
             assert int(state.manager.temp_setpoint_raw[4]) == 4095
         finally:
             _stop(flask_app)
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: the thermistor wizard over HTTP, against the mock's ground truth
+# ---------------------------------------------------------------------------
+
+from test_calibration_api import _experiment_body  # noqa: E402
+
+PACK_SLOPE, PACK_INTERCEPT = -0.11130, 81.897
+
+
+def _settle(manager, n=80):
+    """Advance the mock until the vials sit at their setpoints."""
+    for _ in range(n):
+        manager.read_temperature()
+
+
+def _post(client, url, body=None, code=200):
+    r = client.post(url, json=body or {})
+    assert r.status_code == code, (url, r.status_code, r.get_json())
+    return r.get_json()
+
+
+def test_tier3_start_refuses_a_machine_that_is_not_idle():
+    with tempfile.TemporaryDirectory() as tmp:
+        flask_app = _make_app(Path(tmp))
+        try:
+            client = flask_app.test_client()
+            _post(client, "/api/experiments/create", _experiment_body("busy"))
+            r = client.post("/api/calibration/temperature/start", json={})
+            assert r.status_code == 409
+            assert r.get_json()["code"] == "machine_not_idle"
+            assert "busy" in r.get_json()["error"]
+        finally:
+            _stop(flask_app)
+
+
+def test_thermistor_wizard_over_http_installs_the_truth_and_goes_live():
+    with tempfile.TemporaryDirectory() as tmp:
+        flask_app = _make_app(Path(tmp))
+        try:
+            state = _state(flask_app)
+            mgr = state.manager
+            mgr.time_multiplier = 10.0            # quiet, still fast to settle
+            mgr.set_true_temp_cal(PACK_SLOPE, PACK_INTERCEPT)
+            client = flask_app.test_client()
+            _post(client, "/api/calibration/temperature/start",
+                  {"operator": "t", "reference_thermometer": "ref-1"})
+            # The raw path is reserved while the session is open.
+            assert client.post("/api/calibration/raw/temperature",
+                               json={"setpoints": [4095] * N_VIALS}).status_code == 409
+
+            _post(client, "/api/calibration/temperature/apply", {"phase": "cold"})
+            _settle(mgr)
+            # Real clock: no 10-min window in a unit test -- record the override.
+            _post(client, "/api/calibration/temperature/point",
+                  {"label": "cold", "reference_c": float(mgr.temp_C[2]),
+                   "reference_vial": 2, "settle_check": False})
+
+            _post(client, "/api/calibration/temperature/apply", {"phase": "hot"})
+            _settle(mgr)
+            for v in range(N_VIALS):
+                _post(client, "/api/calibration/temperature/point",
+                      {"label": "hot", "vials": [v], "reference_c": float(mgr.temp_C[v]),
+                       "settle_check": False})
+            sess = client.get("/api/calibration/temperature/session").get_json()
+            suggested = [int(v) for v, d in sess["per_vial"].items()
+                         if d["retarget_suggested"]]
+            assert 0 in suggested, suggested
+            _post(client, "/api/calibration/temperature/retarget", {"vials": suggested})
+            _settle(mgr)
+            for v in suggested:
+                _post(client, "/api/calibration/temperature/point",
+                      {"label": "hot", "vials": [v], "reference_c": float(mgr.temp_C[v]),
+                       "settle_check": False})
+
+            review = _post(client, "/api/calibration/temperature/fit")
+            assert review["fit"]["review"]["0"]["previous_delivered_at_37_c"] < 30.0
+
+            _post(client, "/api/calibration/temperature/apply", {"phase": "verify"})
+            _settle(mgr)
+            for v in (0, 3, 8, 11):
+                _post(client, "/api/calibration/temperature/point",
+                      {"label": "verify", "vials": [v], "reference_c": float(mgr.temp_C[v]),
+                       "settle_check": False})
+            out = _post(client, "/api/calibration/temperature/finish")
+            assert out["qc"]["passed"], out["qc"]
+
+            # Live without a restart: manager, AppState, the sliders' curve.
+            want = np.vstack([np.full(N_VIALS, PACK_SLOPE), np.full(N_VIALS, PACK_INTERCEPT)])
+            assert np.allclose(mgr.temp_cal, want, rtol=0.02, atol=0.3)
+            assert np.allclose(state.temp_cal, mgr.temp_cal)
+            cal = client.get("/api/actuators/state").get_json()["temp_calibration"]
+            assert np.allclose(cal["slope"], mgr.temp_cal[0])
+            idx = client.get("/api/calibration/").get_json()
+            assert idx["tier3_session"] is None
+            assert idx["subsystems"]["temperature"]["version"] == out["version"]
+            assert not any("never verified" in r
+                           for r in idx["staleness"]["temperature"]["reasons"])
+            # The machine is released.
+            assert client.post("/api/calibration/raw/temperature",
+                               json={"setpoints": [4095] * N_VIALS}).status_code == 200
+        finally:
+            _stop(flask_app)
+
+
+def test_thermistor_finish_refusal_is_422_with_the_qc_block():
+    with tempfile.TemporaryDirectory() as tmp:
+        flask_app = _make_app(Path(tmp))
+        try:
+            mgr = _state(flask_app).manager
+            mgr.time_multiplier = 10.0
+            client = flask_app.test_client()
+            _post(client, "/api/calibration/temperature/start", {"operator": "t"})
+            _post(client, "/api/calibration/temperature/apply", {"phase": "cold"})
+            _settle(mgr)
+            _post(client, "/api/calibration/temperature/point",
+                  {"label": "cold", "reference_c": 22.0, "reference_vial": 0,
+                   "settle_check": False})
+            r = client.post("/api/calibration/temperature/finish", json={})
+            assert r.status_code == 422
+            body = r.get_json()
+            assert body["code"] == "qc_refused" and body["qc"]["failures"]
+            _post(client, "/api/calibration/temperature/abort")
+            assert client.get("/api/calibration/temperature/session").get_json() == {"active": False}
+        finally:
+            _stop(flask_app)

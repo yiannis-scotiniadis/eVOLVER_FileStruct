@@ -454,3 +454,374 @@ def test_mock_true_od_freeze_and_curve():
     assert m.od_abs[0] == 2.0
     m.set_true_od([0], None)
     assert 0 not in m._frozen_od
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: two-point thermistor calibration (CALIBRATION_PROTOCOL §8.1)
+# ---------------------------------------------------------------------------
+
+from calibration_service import (  # noqa: E402
+    QCRefusal,
+    TEMP_CAL_SOURCE,
+    TempCalSession,
+)
+from serial_manager import MAX_SAFE_TEMP_C, apply_floor_override  # noqa: E402
+
+LEGACY_TEMP = np.genfromtxt(REPO_CAL / "temp_calibration.txt", delimiter=",")
+# The pack excluding vial 0 (CALIBRATION_PROTOCOL Appendix A.2): the audit's
+# hypothesis is that vial 0's sleeve really behaves like this.
+PACK_SLOPE, PACK_INTERCEPT = -0.11130, 81.897
+
+
+class ThermalRig:
+    """Deterministic stand-in for 16 sleeves under the firmware's loop.
+
+    Each vial's thermistor truly reads ``raw = (T - i_true) / s_true``. The
+    firmware drives that raw reading to the ``xr`` setpoint, so a vial
+    settles at ``T = s_true * xr + i_true`` -- never below ambient (there is
+    no cooling). The INSTALLED curve (``temp_cal``) only converts counts to
+    reported °C and sets the safety floor, as on the real manager."""
+
+    def __init__(self, true_slope=PACK_SLOPE, true_intercept=PACK_INTERCEPT,
+                 installed=LEGACY_TEMP, ambient=22.0):
+        self.true = np.vstack([np.broadcast_to(true_slope, (N_VIALS,)),
+                               np.broadcast_to(true_intercept, (N_VIALS,))]).astype(float)
+        self.temp_cal = np.array(installed, dtype=float)
+        self.ambient = float(ambient)
+        self.temp_setpoint_raw = np.full(N_VIALS, HEATER_OFF_SETPOINT, dtype=int)
+        self.stir_speed = np.zeros(N_VIALS, dtype=int)
+        self.stuck_heating_c_per_read: dict[int, float] = {}
+        self._stuck_extra = np.zeros(N_VIALS)
+        # Optional curvature: T_true(raw) gains quad * (raw - raw0)^2.
+        self.quad = np.zeros(N_VIALS)
+        self.stir_calls = 0
+
+    def _floor(self):
+        floor = np.rint((MAX_SAFE_TEMP_C - self.temp_cal[1]) / self.temp_cal[0]).astype(int)
+        return floor
+
+    def set_temperature_raw(self, setpoints, floor_override=None):
+        floor = apply_floor_override(self._floor(), floor_override)
+        raw = np.clip(np.maximum(np.asarray(setpoints, dtype=int), floor), None,
+                      HEATER_OFF_SETPOINT)
+        self.temp_setpoint_raw = raw
+        return self.reported()
+
+    def set_stir(self, values):
+        self.stir_calls += 1
+        self.stir_speed = np.asarray(values, dtype=int)
+
+    def true_temps(self) -> np.ndarray:
+        target = self.true[0] * self.temp_setpoint_raw + self.true[1]
+        return np.maximum(target, self.ambient) + self._stuck_extra
+
+    def raw(self) -> np.ndarray:
+        T = self.true_temps()
+        raw = (T - self.true[1]) / self.true[0]
+        # Curvature in the thermistor itself: the same T reads differently.
+        return raw + self.quad * (T - 30.0) ** 2
+
+    def reported(self) -> list:
+        return (self.raw() * self.temp_cal[0] + self.temp_cal[1]).tolist()
+
+    def step(self):
+        for v, rate in self.stuck_heating_c_per_read.items():
+            self._stuck_extra[v] += rate
+
+    def read_temperature_with_raw(self):
+        self.step()
+        return self.reported(), self.raw().tolist()
+
+    def collect_temp_raw(self, n_samples=5):
+        raw = self.raw()
+        return {"median": raw.tolist(), "sd": [0.5] * N_VIALS,
+                "n_valid": [n_samples] * N_VIALS}
+
+
+def _temp_service(tmp: Path, rig: ThermalRig, clock=None) -> CalibrationService:
+    """A bootstrapped (legacy-import) store + service driving ``rig``."""
+    _legacy_store(tmp)          # writes the 2016 files and imports them
+    svc = CalibrationService(tmp / "calibration", tmp / "experiments", rig,
+                             clock=clock or _Clock())
+    return svc
+
+
+def _ticks(svc, rig, clock, minutes: float):
+    for _ in range(int(minutes * 6)):
+        clock.t += 10.0
+        c, raw = rig.read_temperature_with_raw()
+        svc.tick(c, raw)
+
+
+def _probe(rig: ThermalRig, vial: int) -> float:
+    """The reference thermometer: the vial's TRUE temperature."""
+    return float(rig.true_temps()[vial])
+
+
+def _cold_point(svc, rig, clock, reference_vial=3):
+    svc.temp_apply("cold")
+    _ticks(svc, rig, clock, 11)
+    return svc.temp_point("cold", _probe(rig, reference_vial),
+                          reference_vial=reference_vial)
+
+
+def _hot_points(svc, rig, clock, vials=None):
+    svc.temp_apply("hot")
+    _ticks(svc, rig, clock, 6)
+    for v in (vials if vials is not None else range(N_VIALS)):
+        svc.temp_point("hot", _probe(rig, v), vials=[v])
+
+
+def test_thermistor_wizard_recovers_vial_0_and_reports_what_it_delivered():
+    """The headline scenario the session exists for. Vial 0's installed curve
+    is the 5-sigma outlier; its sleeve truly behaves like the pack. The
+    wizard must land it at 40 °C (retarget), recover the true line, and say
+    what the old curve actually delivered when the UI said 37 °C (~28 °C)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        clock = _Clock()
+        rig = ThermalRig()
+        svc = _temp_service(Path(tmp), rig, clock)
+        started = svc.temp_start({"operator": "t", "reference_thermometer": "Fluke 51",
+                                  "bench_temp_c": 21.0})
+        assert started["state"] == "suspended"      # drives nothing until apply
+        _cold_point(svc, rig, clock)
+        status = svc.temp_session()
+        assert all(status["per_vial"][str(v)]["p2"]["status"] == "ok" for v in range(N_VIALS))
+        # Vial 0 reads ~9 °C hot at ambient on its installed curve: advisory.
+        assert status["per_vial"]["0"]["advisory"]
+        assert not status["per_vial"]["1"]["advisory"]
+
+        _hot_points(svc, rig, clock)
+        v0 = svc.temp_session()["per_vial"]["0"]
+        assert v0["span_c"] < 15.0 and v0["retarget_suggested"], v0
+        assert not svc.temp_session()["per_vial"]["5"]["retarget_suggested"]
+
+        # Retarget vial 0 through its own provisional line. Its xr lands
+        # BELOW the installed curve's 45 °C floor -- the override is needed.
+        installed_floor = int(rig._floor()[0])
+        svc.temp_retarget([0])
+        assert rig.temp_setpoint_raw[0] < installed_floor
+        _ticks(svc, rig, clock, 6)
+        # The installed curve now reads vial 0 near 48 °C; the watchdog must
+        # judge it by its own line and leave it alone.
+        assert svc.tier3_status()["vial_faults"] == {}
+        assert abs(_probe(rig, 0) - 40.0) < 0.3
+        svc.temp_point("hot", _probe(rig, 0), vials=[0])
+        assert svc.temp_session()["per_vial"]["0"]["span_c"] > 15.0
+
+        review = svc.temp_fit()
+        # Unverified: the review says so, the finish would refuse.
+        assert any("verification incomplete" in f for f in review["qc"]["failures"])
+        r0 = review["fit"]["review"]["0"]
+        assert abs(r0["slope"] - PACK_SLOPE) < 1e-9
+        assert abs(r0["intercept"] - PACK_INTERCEPT) < 1e-6
+        assert r0["xr_37_previous"] == 482
+        assert abs(r0["previous_delivered_at_37_c"] - 28.25) < 0.05, r0
+
+        svc.temp_apply("verify")
+        _ticks(svc, rig, clock, 6)
+        for v in (0, 1, 7, 12):
+            svc.temp_point("verify", _probe(rig, v), vials=[v])
+        result = svc.temp_finish()
+        assert result["status"] == "installed" and result["qc"]["passed"], result["qc"]
+        env = svc.store.get_current("temperature")
+        assert np.allclose(env["data"]["slope"], PACK_SLOPE)
+        assert np.allclose(env["data"]["intercept"], PACK_INTERCEPT)
+        assert env["fit"]["per_vial_source"] == [TEMP_CAL_SOURCE] * N_VIALS
+        assert env["fit"]["flagged_vials"] == {}
+        assert env["conditions"]["reference_thermometer"] == "Fluke 51"
+        assert env["qc"]["verification"]["passed_vials"] == [0, 1, 7, 12]
+        # Session closed: heaters parked, file gone, staleness clean.
+        assert svc.tier3_status() is None
+        assert list(rig.temp_setpoint_raw) == [HEATER_OFF_SETPOINT] * N_VIALS
+        stale = svc.store.staleness()["temperature"]
+        assert stale["stale"] is False, stale
+
+
+def test_cold_point_waits_for_equilibrium_unless_overridden():
+    with tempfile.TemporaryDirectory() as tmp:
+        clock = _Clock()
+        rig = ThermalRig()
+        svc = _temp_service(Path(tmp), rig, clock)
+        svc.temp_start({"operator": "t"})
+        svc.temp_apply("cold")
+        _ticks(svc, rig, clock, 4)
+        try:
+            svc.temp_point("cold", 22.0, reference_vial=0)
+        except CalibrationConflict as exc:
+            assert "equilibrated" in str(exc)
+        else:
+            raise AssertionError("captured before a full window of stability")
+        out = svc.temp_point("cold", 22.0, reference_vial=0, settle_check=False)
+        assert all(p["settle_checked"] is False for p in out["captured"])
+        assert svc.temp_session()["per_vial"]["0"]["points"][0]["reference_vial"] == 0
+
+
+def test_p2_heater_fault_excludes_a_vial_heating_while_off():
+    with tempfile.TemporaryDirectory() as tmp:
+        clock = _Clock()
+        rig = ThermalRig()
+        rig.stuck_heating_c_per_read[6] = 0.05     # ~27 counts / 10 min
+        svc = _temp_service(Path(tmp), rig, clock)
+        svc.temp_start({"operator": "t"})
+        svc.temp_apply("cold")
+        alerts = []
+        for _ in range(11 * 6):
+            clock.t += 10.0
+            c, raw = rig.read_temperature_with_raw()
+            alerts += svc.tick(c, raw)
+        assert [a["vial"] for a in alerts] == [6], alerts
+        assert alerts[0]["dedup_key"] == ("cal_p2_heater_fault", 6)
+        status = svc.temp_session()
+        assert status["per_vial"]["6"]["p2"]["status"] == "heater_fault"
+        assert "P2" in status["vial_faults"]["6"]
+        # The cold point proceeds without it.
+        out = svc.temp_point("cold", 22.0, reference_vial=0)
+        assert 6 not in [p["vial"] for p in out["captured"]]
+
+
+def test_room_warming_is_not_a_p2_fault():
+    """Every vial drifts warmer together: absolute heating, no relative."""
+    with tempfile.TemporaryDirectory() as tmp:
+        clock = _Clock()
+        rig = ThermalRig()
+        for v in range(N_VIALS):
+            rig.stuck_heating_c_per_read[v] = 0.05
+        svc = _temp_service(Path(tmp), rig, clock)
+        svc.temp_start({"operator": "t"})
+        svc.temp_apply("cold")
+        alerts = []
+        for _ in range(11 * 6):
+            clock.t += 10.0
+            c, raw = rig.read_temperature_with_raw()
+            alerts += svc.tick(c, raw)
+        assert alerts == []
+        assert svc.tier3_status()["vial_faults"] == {}
+        # And the pack-relative cold gate is satisfied despite the drift.
+        assert svc.temp_session()["cold_ready"] is True
+
+
+def test_nonlinear_thermistor_fails_verification_and_override_is_recorded():
+    with tempfile.TemporaryDirectory() as tmp:
+        clock = _Clock()
+        rig = ThermalRig(installed=np.vstack([np.full(N_VIALS, PACK_SLOPE),
+                                              np.full(N_VIALS, PACK_INTERCEPT)]))
+        rig.quad[2] = 0.08                          # a curved response
+        svc = _temp_service(Path(tmp), rig, clock)
+        svc.temp_start({"operator": "t"})
+        _cold_point(svc, rig, clock)
+        _hot_points(svc, rig, clock)
+        svc.temp_apply("verify")
+        _ticks(svc, rig, clock, 6)
+        for v in (1, 2, 3, 4):
+            svc.temp_point("verify", _probe(rig, v), vials=[v])
+        try:
+            svc.temp_finish()
+        except QCRefusal as exc:
+            assert any("vial 2" in f and "not linear" in f for f in exc.qc["failures"])
+        else:
+            raise AssertionError("a curved thermistor passed verification")
+        out = svc.temp_finish(override_reason="bench: accept, re-run with a third point")
+        assert out["qc"]["overridden_by"].startswith("bench")
+
+
+def test_outlier_sleeve_is_flagged_not_refused():
+    with tempfile.TemporaryDirectory() as tmp:
+        clock = _Clock()
+        intercepts = np.full(N_VIALS, PACK_INTERCEPT)
+        intercepts[9] += 4.0                         # genuinely different sleeve
+        rig = ThermalRig(true_intercept=intercepts,
+                         installed=np.vstack([np.full(N_VIALS, PACK_SLOPE), intercepts]))
+        svc = _temp_service(Path(tmp), rig, clock)
+        svc.temp_start({"operator": "t"})
+        _cold_point(svc, rig, clock)
+        _hot_points(svc, rig, clock)
+        svc.temp_apply("verify")
+        _ticks(svc, rig, clock, 6)
+        for v in (0, 1, 2, 3):                        # vial 9 NOT verified
+            svc.temp_point("verify", _probe(rig, v), vials=[v])
+        out = svc.temp_finish()
+        assert out["qc"]["passed"]
+        env = svc.store.get_current("temperature")
+        assert "9" in env["fit"]["flagged_vials"]
+        reasons = svc.store.staleness()["temperature"]["reasons"]
+        assert any("[9]" in r and "not independently verified" in r for r in reasons)
+
+
+def test_partial_session_merges_and_needs_every_measured_vial_verified():
+    with tempfile.TemporaryDirectory() as tmp:
+        clock = _Clock()
+        rig = ThermalRig()
+        svc = _temp_service(Path(tmp), rig, clock)
+        svc.temp_start({"operator": "t", "vials": [0]})
+        svc.temp_apply("cold")
+        _ticks(svc, rig, clock, 11)
+        svc.temp_point("cold", _probe(rig, 0), reference_vial=0)
+        _hot_points(svc, rig, clock, vials=[0])
+        svc.temp_retarget([0])
+        _ticks(svc, rig, clock, 6)
+        svc.temp_point("hot", _probe(rig, 0), vials=[0])
+        fit = svc.temp_fit()
+        assert fit["qc"]["verification"]["required"] == 1
+        svc.temp_apply("verify")
+        _ticks(svc, rig, clock, 6)
+        svc.temp_point("verify", _probe(rig, 0), vials=[0])
+        out = svc.temp_finish()
+        env = svc.store.get_current("temperature")
+        assert out["measured_vials"] == [0]
+        assert env["data"]["slope"][5] == LEGACY_TEMP[0][5]      # carried
+        assert env["fit"]["per_vial_source"][0] == TEMP_CAL_SOURCE
+        assert env["fit"]["per_vial_source"][5] == "legacy-import-2016"
+        assert any("keep their 2016 constants" in w for w in env["qc"]["warnings"])
+        reasons = svc.store.staleness()["temperature"]["reasons"]
+        assert any("[1, 2, 3" in r and "2016" in r for r in reasons), reasons
+
+
+def test_thermistor_session_survives_a_restart_suspended():
+    with tempfile.TemporaryDirectory() as tmp:
+        clock = _Clock()
+        rig = ThermalRig()
+        svc = _temp_service(Path(tmp), rig, clock)
+        svc.temp_start({"operator": "t"})
+        _cold_point(svc, rig, clock)
+        rig2 = ThermalRig()
+        svc2 = CalibrationService(Path(tmp) / "calibration", Path(tmp) / "experiments",
+                                  rig2, clock=clock)
+        svc2.bootstrap()
+        st = svc2.temp_session()
+        assert st["state"] == "suspended"
+        assert len([p for p in st["per_vial"]["4"]["points"] if p["label"] == "cold"]) == 1
+        try:
+            svc2.temp_point("cold", 22.0, reference_vial=0)
+        except CalibrationConflict as exc:
+            assert "re-apply" in str(exc)
+        else:
+            raise AssertionError("captured on a suspended session")
+        _hot_points(svc2, rig2, clock)          # apply re-arms and carries on
+        assert svc2.temp_session()["per_vial"]["4"]["span_c"] > 15
+
+
+def test_thermistor_abort_parks_heaters_and_writes_nothing():
+    with tempfile.TemporaryDirectory() as tmp:
+        clock = _Clock()
+        rig = ThermalRig()
+        svc = _temp_service(Path(tmp), rig, clock)
+        before = svc.store.current_versions()["temperature"]
+        svc.temp_start({"operator": "t"})
+        svc.temp_apply("cold")
+        _ticks(svc, rig, clock, 11)
+        svc.temp_point("cold", 22.0, reference_vial=0)
+        svc.temp_apply("hot")
+        svc.temp_abort()
+        assert list(rig.temp_setpoint_raw) == [HEATER_OFF_SETPOINT] * N_VIALS
+        assert svc.store.current_versions()["temperature"] == before
+        assert not (svc.store.sessions_dir / "temperature.json").exists()
+        assert len(list((svc.store.root / "temperature").glob("*.json"))) == 1
+
+
+def test_thermistor_start_warns_when_the_span_is_unreachable():
+    with tempfile.TemporaryDirectory() as tmp:
+        svc = _temp_service(Path(tmp), ThermalRig())
+        out = svc.temp_start({"operator": "t", "bench_temp_c": 27.0})
+        assert any("cannot reach" in w for w in out["warnings"])
+        assert any("vial_map" in w for w in out["warnings"])

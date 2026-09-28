@@ -34,7 +34,7 @@ import threading
 import time
 import uuid
 import warnings
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -89,6 +89,34 @@ TIER3_KINDS = ("temperature", "od_series")
 CAL_HEATER_CRITICAL_C = MAX_SAFE_TEMP_C + 1.0
 CAL_HEATER_DEBOUNCE_READS = 3
 RAW_TRACKER_WINDOW_MINUTES = 30.0
+
+# --- Two-point thermistor calibration (CALIBRATION_PROTOCOL §8.1).
+TEMP_CAL_DEFAULT_HOT_C = 40.0        # "40 °C, not higher" (§8.1 step 4)
+TEMP_CAL_DEFAULT_VERIFY_C = 30.0     # the independent middle point
+TEMP_CAL_MAX_TARGET_C = MAX_SAFE_TEMP_C - 3.0
+TEMP_CAL_MIN_SPAN_C = 15.0
+TEMP_CAL_SLOPE_TOL_FRACTION = 0.10   # vs the leave-one-out pack median
+TEMP_CAL_INTERCEPT_TOL_C = 2.0
+TEMP_CAL_VERIFY_TOL_C = 0.5
+TEMP_CAL_VERIFY_MIN_VIALS = 4        # or every measured vial, if fewer
+TEMP_CAL_RETARGET_TOL_C = 2.0        # hot reference this far off target -> retarget
+# Equilibrium gates. PROVISIONAL, like the blank SD limits: the protocol's
+# "stable to ±2 counts over 10 min", read as a fitted drift of per-minute
+# medians. Replace with measured behaviour after the first bench session.
+TEMP_CAL_COLD_WINDOW_MIN = 10.0
+TEMP_CAL_HOT_WINDOW_MIN = 5.0
+TEMP_CAL_STABLE_DRIFT_COUNTS = 2.0
+# Prerequisite P2 built into the cold phase: a vial whose raw counts FALL
+# (it is heating -- the slope is negative) by more than this per 10 min
+# while commanded off, both absolutely AND relative to the pack, has a
+# heater that is not off. Absolute alone would flag every vial when the
+# room warms; relative alone would flag a vial that merely cools slower.
+TEMP_CAL_P2_HEATING_COUNTS = 5.0
+# A vial whose INSTALLED-calibration reading sits this far above the pack at
+# ambient gets a "probe this vial" advisory (stuck-on heater, or -- vial 0 --
+# a bad installed curve). Advisory only: it never excludes a vial.
+TEMP_CAL_PROBE_ADVISORY_C = 5.0
+TEMP_CAL_SOURCE = "two-point-reference"
 
 # --- Staleness thresholds (CALIBRATION_PROTOCOL §13).
 PUMP_STALE_DAYS = 30.0
@@ -480,6 +508,20 @@ class CalibrationStore:
         tmp = path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(envelope, indent=4), encoding="utf-8")
         os.replace(tmp, path)
+
+    def fresh_version(self, subsystem: str) -> str:
+        """A version stamp for a NEW ``subsystem`` version: now, bumped a
+        second at a time past any existing file and past the current
+        version, so versions stay unique AND sort in install order even when
+        two installs land in the same second."""
+        with self._lock:
+            dt = _utc_now().replace(microsecond=0)
+            current = _parse_version(self._read_current().get(subsystem) or "")
+            if current is not None and dt <= current:
+                dt = current + timedelta(seconds=1)
+            while self._version_path(subsystem, _version_stamp(dt)).exists():
+                dt += timedelta(seconds=1)
+            return _version_stamp(dt)
 
     def save_version(self, subsystem: str, envelope: dict) -> str:
         """Install ``envelope`` as the new current version for ``subsystem``.
@@ -1343,6 +1385,31 @@ class RawTempTracker:
                 rows.append(np.nanmedian(stack, axis=0))
         return np.vstack(rows), coverage
 
+    def drift(
+        self, minutes: float, *, relative_to: Optional[list[int]] = None,
+    ) -> tuple[np.ndarray, float, int]:
+        """``(drift, coverage_minutes, n_minutes)``: per vial, the change in
+        counts across the window implied by a least-squares line through the
+        per-minute medians (NaN where fewer than 3 minutes are valid).
+
+        The equilibrium gates use this rather than max-min: a range grows
+        with read noise however long you wait, a fitted drift does not --
+        "stable to ±2 counts over 10 min" is a statement about drift."""
+        med, coverage = self.minute_medians(minutes, relative_to=relative_to)
+        out = np.full(N_VIALS, np.nan)
+        n_minutes = int(med.shape[0])
+        if n_minutes < 3:
+            return out, coverage, n_minutes
+        t = np.arange(n_minutes, dtype=float)
+        for v in range(N_VIALS):
+            y = med[:, v]
+            ok = np.isfinite(y)
+            if ok.sum() < 3:
+                continue
+            slope = np.polyfit(t[ok], y[ok], 1)[0]
+            out[v] = slope * (n_minutes - 1)
+        return out, coverage, n_minutes
+
 
 class Tier3Session:
     """Common state of a Tier 3 wizard session (thermistor two-point, OD
@@ -1400,6 +1467,13 @@ class Tier3Session:
         them (the installed curve is what it is there to replace)."""
         return [float(x) if x is not None else float("nan") for x in installed_c]
 
+    def floor_overrides(self) -> dict:
+        """``{vial: raw floor}`` to pass with EVERY heater write this session
+        makes -- including the watchdog's park. Without it a write for one
+        vial would clamp another, retargeted vial back up to the installed
+        curve's floor mid-measurement."""
+        return {}
+
     # -- persistence ------------------------------------------------------
 
     def _base_dict(self) -> dict:
@@ -1453,6 +1527,176 @@ class Tier3Session:
 # kind -> session class, for reloading a persisted session at boot. The
 # concrete wizards register themselves below their definitions.
 TIER3_SESSION_CLASSES: dict[str, type] = {}
+
+
+def _linear_temp_fit(points: list[tuple[float, float]]) -> Optional[tuple[float, float]]:
+    """Least-squares ``(slope, intercept)`` of reference °C on raw counts --
+    exactly the two-point line when there are two points. None without two
+    distinct raw values."""
+    if len(points) < 2:
+        return None
+    raw = np.array([p[0] for p in points], dtype=float)
+    ref = np.array([p[1] for p in points], dtype=float)
+    if np.ptp(raw) <= 0:
+        return None
+    slope, intercept = np.polyfit(raw, ref, 1)
+    return float(slope), float(intercept)
+
+
+class TempCalSession(Tier3Session):
+    """Two-point thermistor calibration (CALIBRATION_PROTOCOL §8.1).
+
+    Cold point: heaters off, all vials at room temperature, ONE reference
+    reading serves every vial (the free 16-way ambient point). Hot point:
+    each vial commanded to ~40 °C and probed in turn. A vial whose installed
+    curve is wrong -- vial 0's, the reason this exists -- lands well short
+    of 40 °C; ``retarget`` re-commands it through a provisional line fitted
+    from its own two reference readings. Verification at ~30 °C runs
+    through the CANDIDATE fit before anything is installed.
+
+    ``points`` holds every capture ever made, superseded ones included, so
+    the envelope records what was measured and not just what was used."""
+
+    kind = "temperature"
+
+    def __init__(
+        self,
+        *,
+        operator: str,
+        vials: list[int],
+        stir_pwm: int,
+        target_hot_c: float = TEMP_CAL_DEFAULT_HOT_C,
+        target_verify_c: float = TEMP_CAL_DEFAULT_VERIFY_C,
+        reference_thermometer: str = "",
+        bench_temp_c: Optional[float] = None,
+        n_samples: int = 5,
+    ) -> None:
+        super().__init__(operator=operator, vials=vials, stir_pwm=stir_pwm)
+        target_hot_c = float(target_hot_c)
+        target_verify_c = float(target_verify_c)
+        if not (25.0 <= target_hot_c <= TEMP_CAL_MAX_TARGET_C):
+            raise ValueError(
+                f"target_hot_c must be in 25..{TEMP_CAL_MAX_TARGET_C:.0f} °C "
+                f"(MAX_SAFE_TEMP_C is {MAX_SAFE_TEMP_C:.0f}), got {target_hot_c}"
+            )
+        if not (22.0 < target_verify_c < target_hot_c):
+            raise ValueError(
+                "target_verify_c must lie between ambient and the hot point, "
+                f"got {target_verify_c}"
+            )
+        if not (1 <= int(n_samples) <= 25):
+            raise ValueError(f"n_samples must be in 1..25, got {n_samples}")
+        self.target_hot_c = target_hot_c
+        self.target_verify_c = target_verify_c
+        self.reference_thermometer = str(reference_thermometer or "")
+        self.bench_temp_c = None if bench_temp_c is None else float(bench_temp_c)
+        self.n_samples = int(n_samples)
+        self.points: list[dict] = []
+        # vial -> {"status": "pending"|"ok"|"heater_fault", ...}
+        self.p2: dict[int, dict] = {}
+        # vial -> {"slope", "intercept", "xr", "floor", "at"}
+        self.retargets: dict[int, dict] = {}
+        # vial -> raw floor the verify phase commanded under (candidate fit)
+        self.verify_floors: dict[int, int] = {}
+        # vial -> clock time of the last heater command (settle timing)
+        self.commanded_at: dict[int, float] = {}
+        self.phase_started_at: Optional[float] = None
+        self._next_point = 1
+
+    # -- points -------------------------------------------------------------
+
+    def add_point(self, **fields) -> dict:
+        point = {"id": self._next_point, "superseded": False, **fields}
+        self._next_point += 1
+        self.points.append(point)
+        return point
+
+    def active_points(self, vial: int, labels=("cold", "hot")) -> list[dict]:
+        return [p for p in self.points
+                if p["vial"] == vial and p["label"] in labels and not p["superseded"]]
+
+    def supersede(self, vial: int, label: str) -> None:
+        for p in self.points:
+            if p["vial"] == vial and p["label"] == label:
+                p["superseded"] = True
+
+    def fit_for(self, vial: int) -> Optional[tuple[float, float]]:
+        return _linear_temp_fit([
+            (p["raw_median"], p["reference_c"]) for p in self.active_points(vial)
+        ])
+
+    def span_c(self, vial: int) -> Optional[float]:
+        refs = [p["reference_c"] for p in self.active_points(vial)]
+        return (max(refs) - min(refs)) if len(refs) >= 2 else None
+
+    # -- actuator safety ----------------------------------------------------
+
+    def estimate_temps(self, installed_c: list, raw: list) -> list[float]:
+        """Once a vial has its own two reference readings, the watchdog
+        trusts those over the installed curve -- that curve is the thing on
+        trial (vial 0's reads ~8 °C hot at 40 °C, which would trip the
+        watchdog on a correctly retargeted vial)."""
+        out = super().estimate_temps(installed_c, raw)
+        for v in range(N_VIALS):
+            fit = self.fit_for(v)
+            if fit is None and v in self.retargets:
+                # A retarget supersedes the hot point it was fitted from;
+                # until a new one is captured, judge the vial by that line.
+                fit = (self.retargets[v]["slope"], self.retargets[v]["intercept"])
+            r = raw[v] if raw is not None and v < len(raw) else None
+            if fit is not None and r is not None and math.isfinite(float(r)):
+                out[v] = fit[0] * float(r) + fit[1]
+        return out
+
+    def floor_overrides(self) -> dict:
+        floors = {int(v): int(r["floor"]) for v, r in self.retargets.items()}
+        if self.phase == "verify":
+            floors.update({int(v): int(f) for v, f in self.verify_floors.items()})
+        return floors
+
+    # -- persistence --------------------------------------------------------
+
+    def to_dict(self) -> dict:
+        d = self._base_dict()
+        d.update({
+            "target_hot_c": self.target_hot_c,
+            "target_verify_c": self.target_verify_c,
+            "reference_thermometer": self.reference_thermometer,
+            "bench_temp_c": self.bench_temp_c,
+            "n_samples": self.n_samples,
+            "points": self.points,
+            "p2": {str(k): v for k, v in self.p2.items()},
+            "retargets": {str(k): v for k, v in self.retargets.items()},
+            "verify_floors": {str(k): v for k, v in self.verify_floors.items()},
+            "commanded_at": {str(k): v for k, v in self.commanded_at.items()},
+            "phase_started_at": self.phase_started_at,
+            "next_point": self._next_point,
+        })
+        return d
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "TempCalSession":
+        s = cls(
+            operator=d.get("operator", "unknown"), vials=d["vials"],
+            stir_pwm=d.get("stir_pwm", 8),
+            target_hot_c=d.get("target_hot_c", TEMP_CAL_DEFAULT_HOT_C),
+            target_verify_c=d.get("target_verify_c", TEMP_CAL_DEFAULT_VERIFY_C),
+            reference_thermometer=d.get("reference_thermometer", ""),
+            bench_temp_c=d.get("bench_temp_c"),
+            n_samples=d.get("n_samples", 5),
+        )
+        s._restore_base(d)
+        s.points = list(d.get("points") or [])
+        s.p2 = {int(k): v for k, v in (d.get("p2") or {}).items()}
+        s.retargets = {int(k): v for k, v in (d.get("retargets") or {}).items()}
+        s.verify_floors = {int(k): int(v) for k, v in (d.get("verify_floors") or {}).items()}
+        s.commanded_at = {int(k): float(v) for k, v in (d.get("commanded_at") or {}).items()}
+        s.phase_started_at = d.get("phase_started_at")
+        s._next_point = int(d.get("next_point", len(s.points) + 1))
+        return s
+
+
+TIER3_SESSION_CLASSES["temperature"] = TempCalSession
 
 
 # ---------------------------------------------------------------------------
@@ -1724,31 +1968,721 @@ class CalibrationService:
                         parked.append(v)
                 else:
                     self._overtemp_streak[v] = 0
-            if not parked:
-                return []
-            setpoints = [int(x) for x in np.asarray(self.manager.temp_setpoint_raw)]
-            for v in parked:
-                setpoints[v] = HEATER_OFF_SETPOINT
-                s.commanded_raw[v] = HEATER_OFF_SETPOINT
-                s.vial_faults[v] = "overtemp"
-            self.manager.set_temperature_raw(setpoints)
-            self._persist_tier3()
-            return [
-                {
+            alerts: list[dict] = []
+            if parked:
+                alerts.extend(self._park_overtemp_locked(s, parked, estimates))
+            if isinstance(s, TempCalSession):
+                alerts.extend(self._temp_p2_check_locked(s))
+            return alerts
+
+    def _park_overtemp_locked(
+        self, s: Tier3Session, parked: list[int], estimates: list[float],
+    ) -> list[dict]:
+        setpoints = [int(x) for x in np.asarray(self.manager.temp_setpoint_raw)]
+        for v in parked:
+            setpoints[v] = HEATER_OFF_SETPOINT
+            s.commanded_raw[v] = HEATER_OFF_SETPOINT
+            s.vial_faults[v] = "overtemp"
+        self.manager.set_temperature_raw(
+            setpoints, floor_override=s.floor_overrides(),
+        )
+        self._persist_tier3()
+        return [
+            {
+                "level": "critical",
+                "message": (
+                    f"Calibration heater watchdog: vial {v} read "
+                    f"{estimates[v]:.1f} °C (> {CAL_HEATER_CRITICAL_C:.0f} °C) "
+                    f"on {CAL_HEATER_DEBOUNCE_READS} consecutive reads — "
+                    "heater parked OFF and the vial excluded from this "
+                    f"{s.kind} calibration"
+                ),
+                "category": "heater",
+                "vial": v,
+                "dedup_key": ("cal_heater_critical", v),
+            }
+            for v in parked
+        ]
+
+    # -- Tier 3: two-point thermistor calibration (§8.1) ------------------
+
+    def _installed_temp_cal(self) -> np.ndarray:
+        """The live (2, 16) slope/intercept the heaters are commanded
+        through -- the manager's, which a reload keeps equal to the store's."""
+        cal = getattr(self.manager, "temp_cal", None)
+        if cal is None:
+            env = self.store.get_current("temperature")
+            if env is None:
+                raise CalibrationConflict(
+                    "no temperature calibration is installed — the hot point "
+                    "is commanded through one"
+                )
+            cal = [env["data"]["slope"], env["data"]["intercept"]]
+        return np.asarray(cal, dtype=float)
+
+    def temp_start(self, body: dict) -> dict:
+        """Open a thermistor calibration session. It drives nothing until
+        ``temp_apply("cold")``."""
+        with self._lock:
+            self._installed_temp_cal()
+            s = TempCalSession(
+                operator=body.get("operator", "unknown"),
+                vials=body.get("vials") or list(range(N_VIALS)),
+                stir_pwm=body.get("stir_pwm", 8),
+                target_hot_c=body.get("target_hot_c", TEMP_CAL_DEFAULT_HOT_C),
+                target_verify_c=body.get("target_verify_c", TEMP_CAL_DEFAULT_VERIFY_C),
+                reference_thermometer=body.get("reference_thermometer", ""),
+                bench_temp_c=body.get("bench_temp_c"),
+                n_samples=body.get("n_samples", 5),
+            )
+            self._begin_tier3(s)
+            warnings_: list[str] = []
+            if s.bench_temp_c is not None and s.bench_temp_c + TEMP_CAL_MIN_SPAN_C > s.target_hot_c:
+                warnings_.append(
+                    f"at a bench temperature of {s.bench_temp_c:.1f} °C a "
+                    f"{s.target_hot_c:.0f} °C hot point cannot reach the "
+                    f"{TEMP_CAL_MIN_SPAN_C:.0f} °C span §8.1 requires"
+                )
+            if not s.reference_thermometer:
+                warnings_.append(
+                    "no reference thermometer recorded — say which one, so the "
+                    "calibration can be traced to it"
+                )
+            self._vial_map_version({"warnings": warnings_})
+            return {"status": "started", "warnings": warnings_, **self.temp_session()}
+
+    def temp_apply(self, phase: str) -> dict:
+        """(Re-)command the heaters and stir for ``phase`` and ARM the session
+        (the app checks the machine is idle first). Also how a suspended or
+        faulted session resumes.
+
+        - ``cold``: every heater off (xr = 4095); the P2 check runs.
+        - ``hot``: each live vial to ``target_hot_c`` through the INSTALLED
+          curve, or through its provisional line if it has been retargeted.
+        - ``verify``: each vial with a candidate fit to ``target_verify_c``
+          through that CANDIDATE, via raw setpoints -- equivalent to
+          installing then verifying, without installing something that may
+          fail."""
+        with self._lock:
+            s = self._require_tier3("temperature")
+            if phase not in ("cold", "hot", "verify"):
+                raise ValueError("phase must be 'cold', 'hot' or 'verify'")
+            cal = self._installed_temp_cal()
+            live = [v for v in s.vials if v not in s.vial_faults]
+            setpoints = [HEATER_OFF_SETPOINT] * N_VIALS
+            if phase == "hot":
+                if not any(p["label"] == "cold" and not p["superseded"] for p in s.points):
+                    raise CalibrationConflict(
+                        "capture the cold point first — heaters off, every vial "
+                        "at room temperature (§8.1 step 3)"
+                    )
+                for v in live:
+                    if v in s.retargets:
+                        setpoints[v] = int(s.retargets[v]["xr"])
+                    else:
+                        setpoints[v] = int(np.rint((s.target_hot_c - cal[1][v]) / cal[0][v]))
+            elif phase == "verify":
+                s.verify_floors = {}
+                for v in live:
+                    fit = s.fit_for(v)
+                    if fit is None:
+                        continue
+                    slope, intercept = fit
+                    setpoints[v] = int(np.rint((s.target_verify_c - intercept) / slope))
+                    s.verify_floors[v] = max(
+                        DEFAULT_RAW_FLOOR, int(np.rint((MAX_SAFE_TEMP_C - intercept) / slope))
+                    )
+                if not s.verify_floors:
+                    raise CalibrationConflict(
+                        "no vial has both a cold and a hot point yet — there is "
+                        "no candidate fit to verify"
+                    )
+            now = self._clock()
+            before = [int(x) for x in np.asarray(self.manager.temp_setpoint_raw)]
+            s.phase = phase
+            self.manager.set_temperature_raw(setpoints, floor_override=s.floor_overrides())
+            self.manager.set_stir(s.stir_vector())
+            sent = [int(x) for x in np.asarray(self.manager.temp_setpoint_raw)]
+            for v in range(N_VIALS):
+                # Settle timing restarts only where the hardware actually
+                # changed (a re-apply after a restart DOES: boot parks all).
+                if sent[v] != before[v]:
+                    s.commanded_at[v] = now
+                s.commanded_raw[v] = sent[v]
+            s.phase_started_at = now
+            self._arm_tier3(s, phase)
+            return self.temp_session()
+
+    def _temp_stability_locked(self, s: TempCalSession, live: list[int]) -> dict:
+        """Per-vial equilibrium verdict for the current phase (see the
+        TEMP_CAL_* gate constants)."""
+        now = self._clock()
+        out: dict = {}
+        phase_age = ((now - s.phase_started_at) / 60.0
+                     if s.phase_started_at is not None else 0.0)
+        if s.phase == "cold":
+            window = TEMP_CAL_COLD_WINDOW_MIN
+            gate, coverage, _n = self.raw_tracker.drift(window, relative_to=live or None)
+            absolute, _c, _n = self.raw_tracker.drift(window)
+        else:
+            window = TEMP_CAL_HOT_WINDOW_MIN
+            gate, coverage, _n = self.raw_tracker.drift(window)
+            absolute = gate
+        for v in range(N_VIALS):
+            if s.phase == "cold":
+                waited = phase_age
+            else:
+                at = s.commanded_at.get(v, s.phase_started_at)
+                waited = (now - at) / 60.0 if at is not None else 0.0
+            drift = gate[v]
+            reason = None
+            if waited < window:
+                reason = f"{window - waited:.1f} min until a full {window:.0f}-min window"
+            elif coverage < window - 0.5:
+                reason = "not enough readings in the window yet"
+            elif not math.isfinite(drift):
+                reason = "no valid readings"
+            elif abs(drift) > TEMP_CAL_STABLE_DRIFT_COUNTS:
+                reason = (f"drifting {drift:+.1f} counts over {window:.0f} min "
+                          f"(limit ±{TEMP_CAL_STABLE_DRIFT_COUNTS:.0f})")
+            out[v] = {
+                "settled": reason is None,
+                "reason": reason,
+                "window_minutes": window,
+                "drift_counts": None if not math.isfinite(drift) else round(float(drift), 2),
+                "absolute_drift_counts": (None if not math.isfinite(absolute[v])
+                                          else round(float(absolute[v]), 2)),
+                "pack_relative": s.phase == "cold",
+            }
+        return out
+
+    def temp_session(self) -> dict:
+        """Progress for the wizard: per-vial live counts, equilibrium, P2,
+        points, span and provisional fit. Polled by the GUI."""
+        with self._lock:
+            s = self._tier3
+            if not isinstance(s, TempCalSession):
+                return {"active": False}
+            live = [v for v in s.vials if v not in s.vial_faults]
+            latest = self.raw_tracker.latest()
+            try:
+                cal = self._installed_temp_cal()
+            except CalibrationConflict:
+                cal = None
+            installed_c = [
+                (float(cal[0][v] * latest[v] + cal[1][v])
+                 if cal is not None and math.isfinite(latest[v]) else None)
+                for v in range(N_VIALS)
+            ]
+            pack = [installed_c[v] for v in live if installed_c[v] is not None]
+            pack_median = float(np.median(pack)) if pack else None
+            stability = self._temp_stability_locked(s, live)
+            per_vial: dict = {}
+            for v in range(N_VIALS):
+                fit = s.fit_for(v)
+                span = s.span_c(v)
+                hot = s.active_points(v, ("hot",))
+                ref_hot = hot[-1]["reference_c"] if hot else None
+                verify = s.active_points(v, ("verify",))
+                verification = None
+                if verify and fit is not None:
+                    p = verify[-1]
+                    verification = round(fit[0] * p["raw_median"] + fit[1] - p["reference_c"], 3)
+                live_v = v in live
+                advisory = None
+                if (s.phase == "cold" and live_v and pack_median is not None
+                        and installed_c[v] is not None
+                        and installed_c[v] - pack_median > TEMP_CAL_PROBE_ADVISORY_C):
+                    advisory = (
+                        f"reads {installed_c[v] - pack_median:+.1f} °C vs the pack "
+                        "on the installed curve at ambient — probe this vial: a "
+                        "heater stuck on, or a bad installed curve (vial 0's is)"
+                    )
+                per_vial[str(v)] = {
+                    "in_session": v in s.vials,
+                    "fault": s.vial_faults.get(v),
+                    "latest_raw": None if not math.isfinite(latest[v]) else round(latest[v], 2),
+                    "installed_c": None if installed_c[v] is None else round(installed_c[v], 2),
+                    "provisional_c": (None if fit is None or not math.isfinite(latest[v])
+                                      else round(fit[0] * latest[v] + fit[1], 2)),
+                    "stability": stability[v],
+                    "p2": s.p2.get(v),
+                    "advisory": advisory,
+                    "commanded_raw": s.commanded_raw.get(v),
+                    "provisional_fit": (None if fit is None
+                                        else {"slope": fit[0], "intercept": fit[1]}),
+                    "span_c": None if span is None else round(span, 2),
+                    "retargeted": s.retargets.get(v),
+                    "retarget_suggested": bool(
+                        live_v and fit is not None and (
+                            (span is not None and span < TEMP_CAL_MIN_SPAN_C)
+                            or (ref_hot is not None and abs(ref_hot - s.target_hot_c)
+                                > TEMP_CAL_RETARGET_TOL_C)
+                        )
+                    ),
+                    "verification_delta_c": verification,
+                    "points": [p for p in s.points if p["vial"] == v],
+                }
+            cold_blockers = [
+                v for v in live if not stability[v]["settled"]
+            ] if s.phase == "cold" else []
+            return {
+                "active": True,
+                **s.summary(),
+                "config": {
+                    "target_hot_c": s.target_hot_c,
+                    "target_verify_c": s.target_verify_c,
+                    "reference_thermometer": s.reference_thermometer,
+                    "bench_temp_c": s.bench_temp_c,
+                    "n_samples": s.n_samples,
+                    "stir_pwm": s.stir_pwm,
+                },
+                "phase_age_minutes": (
+                    None if s.phase_started_at is None
+                    else round((self._clock() - s.phase_started_at) / 60.0, 2)
+                ),
+                "cold_ready": s.phase == "cold" and not cold_blockers,
+                "cold_blockers": cold_blockers,
+                "per_vial": per_vial,
+            }
+
+    def _temp_p2_check_locked(self, s: "TempCalSession") -> list[dict]:
+        """Prerequisite P2, enforced rather than trusted: during the cold
+        phase every heater is commanded off, so a vial that keeps HEATING
+        has a heater that is not off. Latched per vial; the vial is excluded
+        and the operator alerted (it is a hardware fault)."""
+        if s.phase != "cold" or s.phase_started_at is None:
+            return []
+        if (self._clock() - s.phase_started_at) / 60.0 < TEMP_CAL_COLD_WINDOW_MIN:
+            for v in s.vials:
+                s.p2.setdefault(v, {"status": "pending"})
+            return []
+        live = [v for v in s.vials if v not in s.vial_faults]
+        absolute, _c, _n = self.raw_tracker.drift(TEMP_CAL_COLD_WINDOW_MIN)
+        relative, _c, _n = self.raw_tracker.drift(TEMP_CAL_COLD_WINDOW_MIN,
+                                                  relative_to=live or None)
+        alerts: list[dict] = []
+        changed = False
+        for v in s.vials:
+            if v in s.vial_faults:
+                continue
+            a, r = float(absolute[v]), float(relative[v])
+            if not (math.isfinite(a) and math.isfinite(r)):
+                continue
+            detail = {"abs_drift_counts": round(a, 2), "rel_drift_counts": round(r, 2),
+                      "at": _iso_now()}
+            if a < -TEMP_CAL_P2_HEATING_COUNTS and r < -TEMP_CAL_P2_HEATING_COUNTS:
+                s.p2[v] = {"status": "heater_fault", **detail}
+                s.vial_faults[v] = "heater not off (P2): heating while commanded xr=4095"
+                s.supersede(v, "cold")
+                changed = True
+                alerts.append({
                     "level": "critical",
                     "message": (
-                        f"Calibration heater watchdog: vial {v} read "
-                        f"{estimates[v]:.1f} °C (> {CAL_HEATER_CRITICAL_C:.0f} °C) "
-                        f"on {CAL_HEATER_DEBOUNCE_READS} consecutive reads — "
-                        "heater parked OFF and the vial excluded from this "
-                        f"{s.kind} calibration"
+                        f"Vial {v} is HEATING with its heater commanded off "
+                        f"(raw counts {a:+.1f} over {TEMP_CAL_COLD_WINDOW_MIN:.0f} "
+                        f"min, {r:+.1f} relative to the pack) — prerequisite P2 "
+                        "fails for this sleeve. Excluded from the calibration; "
+                        "treat it as a hardware fault and run no temperature-"
+                        "controlled experiment on it"
                     ),
                     "category": "heater",
                     "vial": v,
-                    "dedup_key": ("cal_heater_critical", v),
+                    "dedup_key": ("cal_p2_heater_fault", v),
+                })
+            elif s.p2.get(v, {}).get("status") != "ok":
+                s.p2[v] = {"status": "ok", **detail}
+                changed = True
+        if changed:
+            self._persist_tier3()
+        return alerts
+
+    def temp_point(
+        self,
+        label: str,
+        reference_c,
+        *,
+        vials: Optional[list] = None,
+        reference_vial: Optional[int] = None,
+        settle_check: bool = True,
+    ) -> dict:
+        """Capture raw thermistor counts against one reference reading.
+
+        ``cold``: every live vial at once, ``reference_vial`` naming where
+        the probe sits. ``hot`` / ``verify``: the listed vial(s), as the
+        probe moves. Refused until the vials have equilibrated unless
+        ``settle_check`` is False, which the point records."""
+        with self._lock:
+            s = self._require_tier3("temperature")
+            self._require_armed(s)
+            if label not in ("cold", "hot", "verify"):
+                raise ValueError("label must be 'cold', 'hot' or 'verify'")
+            if label != s.phase:
+                raise CalibrationConflict(
+                    f"the session is in the {s.phase} phase — apply '{label}' first"
+                )
+            if (not isinstance(reference_c, (int, float)) or isinstance(reference_c, bool)
+                    or not math.isfinite(float(reference_c))
+                    or not (5.0 <= float(reference_c) <= 60.0)):
+                raise ValueError("'reference_c' must be the reference thermometer's reading in °C")
+            ref = float(reference_c)
+            live = [v for v in s.vials if v not in s.vial_faults]
+            if label == "cold":
+                targets = live
+                if reference_vial is None or int(reference_vial) not in live:
+                    raise ValueError(
+                        "'reference_vial' must name the live vial the probe sits "
+                        "in — the reference is read in a vial, not in air"
+                    )
+            else:
+                targets = sorted({int(v) for v in (vials or [])})
+                if not targets:
+                    raise ValueError(f"name the vial(s) the probe is in for the {label} point")
+                bad = [v for v in targets if v not in live]
+                if bad:
+                    raise ValueError(f"vials {bad} are not live in this session")
+            stability = self._temp_stability_locked(s, live)
+            unsettled = [v for v in targets if not stability[v]["settled"]]
+            if unsettled and settle_check:
+                raise CalibrationConflict(
+                    f"vials {unsettled} have not equilibrated: "
+                    + "; ".join(f"{v}: {stability[v]['reason']}" for v in unsettled)
+                    + " — wait, or capture with settle_check=false (recorded)"
+                )
+            stats = self.manager.collect_temp_raw(s.n_samples)
+            captured: list[dict] = []
+            skipped: list[int] = []
+            when = _iso_now()
+            for v in targets:
+                med = stats["median"][v]
+                if med is None or not math.isfinite(float(med)):
+                    skipped.append(v)
+                    continue
+                if label in ("cold", "hot"):
+                    s.supersede(v, label)
+                captured.append(s.add_point(
+                    label=label, vial=v, reference_c=ref,
+                    raw_median=float(med), raw_sd=float(stats["sd"][v]),
+                    n_valid=int(stats["n_valid"][v]), captured_at=when,
+                    settle_checked=v not in unsettled,
+                    commanded_raw=s.commanded_raw.get(v),
+                    reference_vial=(int(reference_vial) if label == "cold" else v),
+                    p2=(dict(s.p2.get(v) or {}) if label == "cold" else None),
+                ))
+            if not captured:
+                raise ValueError("no vial returned a valid reading — check the bus and repeat")
+            self._persist_tier3()
+            return {
+                "label": label,
+                "captured": captured,
+                "skipped": skipped,
+                "session": self.temp_session(),
+            }
+
+    def temp_retarget(self, vials: list) -> dict:
+        """Re-command vials whose hot point landed off target through their
+        own provisional line (cold + hot reference readings). The safety
+        floor for these vials comes from that line too -- the installed
+        curve's floor would stop vial 0 short of 40 °C, which is exactly the
+        miscalibration being corrected. The heater watchdog judges them by
+        the same line; the superseded hot point stays in the record."""
+        with self._lock:
+            s = self._require_tier3("temperature")
+            self._require_armed(s)
+            if s.phase != "hot":
+                raise CalibrationConflict("retargeting is part of the hot phase")
+            targets = sorted({int(v) for v in (vials or [])})
+            live = [v for v in s.vials if v not in s.vial_faults]
+            if not targets or any(v not in live for v in targets):
+                raise ValueError(f"'vials' must be live session vials, got {vials}")
+            out: dict = {}
+            for v in targets:
+                fit = s.fit_for(v)
+                if fit is None:
+                    raise ValueError(
+                        f"vial {v} needs its cold point and one hot reading "
+                        "before it can be retargeted"
+                    )
+                slope, intercept = fit
+                if not slope < 0:
+                    raise ValueError(
+                        f"vial {v}: provisional slope {slope:+.5f} is not negative "
+                        "— a reading is wrong (or the probe was in another "
+                        "vial); re-capture before retargeting"
+                    )
+                hot = s.active_points(v, ("hot",))
+                s.retargets[v] = {
+                    "slope": slope,
+                    "intercept": intercept,
+                    "xr": int(np.rint((s.target_hot_c - intercept) / slope)),
+                    "floor": max(DEFAULT_RAW_FLOOR,
+                                 int(np.rint((MAX_SAFE_TEMP_C - intercept) / slope))),
+                    "from_hot_reference_c": hot[-1]["reference_c"] if hot else None,
+                    "at": _iso_now(),
                 }
-                for v in parked
-            ]
+                s.supersede(v, "hot")
+                out[str(v)] = s.retargets[v]
+            setpoints = [int(x) for x in np.asarray(self.manager.temp_setpoint_raw)]
+            for v in targets:
+                setpoints[v] = int(s.retargets[v]["xr"])
+            self.manager.set_temperature_raw(setpoints, floor_override=s.floor_overrides())
+            sent = [int(x) for x in np.asarray(self.manager.temp_setpoint_raw)]
+            now = self._clock()
+            for v in targets:
+                s.commanded_raw[v] = sent[v]
+                s.commanded_at[v] = now
+            self._persist_tier3()
+            return {"retargeted": out, "session": self.temp_session()}
+
+    def _temp_fit_and_qc_locked(
+        self, s: "TempCalSession", exclude_vials, version: str,
+    ) -> tuple[np.ndarray, np.ndarray, dict, dict, Optional[str]]:
+        prev_env = self.store.get_current("temperature")
+        if prev_env is None:
+            raise CalibrationConflict(
+                "no previous temperature calibration to carry the unmeasured "
+                "vials forward from"
+            )
+        prev_slope = np.asarray(prev_env["data"]["slope"], dtype=float)
+        prev_int = np.asarray(prev_env["data"]["intercept"], dtype=float)
+        per_vial_source = per_vial_sources(prev_env)
+        per_vial_version = list(
+            (prev_env.get("fit") or {}).get("per_vial_version")
+            or [prev_env.get("version")] * N_VIALS
+        )
+        exclude = {int(v) for v in (exclude_vials or [])}
+        failures: list[str] = []
+        warnings_: list[str] = []
+        new_slope, new_int = prev_slope.copy(), prev_int.copy()
+        measured: list[int] = []
+        for v in s.vials:
+            if v in s.vial_faults:
+                warnings_.append(
+                    f"vial {v} excluded ({s.vial_faults[v]}) — keeps its previous constants"
+                )
+                continue
+            if v in exclude:
+                warnings_.append(
+                    f"vial {v} excluded by the operator — keeps its previous constants"
+                )
+                continue
+            fit = s.fit_for(v)
+            if fit is None:
+                failures.append(
+                    f"vial {v}: needs a cold and a hot reference point (or exclude it)"
+                )
+                continue
+            measured.append(v)
+            new_slope[v], new_int[v] = fit
+            per_vial_source[v] = TEMP_CAL_SOURCE
+            per_vial_version[v] = version
+        if not measured and not failures:
+            raise ValueError("no vial was measured — nothing to install")
+
+        for v in measured:
+            span = s.span_c(v)
+            if span is None or span < TEMP_CAL_MIN_SPAN_C:
+                failures.append(
+                    f"vial {v}: reference span {span or 0:.1f} °C < "
+                    f"{TEMP_CAL_MIN_SPAN_C:.0f} °C — the slope is badly "
+                    "conditioned; retarget its hot point"
+                )
+            if not new_slope[v] < 0:
+                failures.append(
+                    f"vial {v}: fitted slope {new_slope[v]:+.5f} is not negative "
+                    "— the thermistor reads backwards or a point is wrong"
+                )
+
+        # Pack comparison, leave-one-out over the MERGED sixteen so an
+        # outlier cannot hide by moving the median it is compared with.
+        flagged: dict = {}
+        for v in measured:
+            others = [u for u in range(N_VIALS) if u != v]
+            med_s = float(np.median(new_slope[others]))
+            med_i = float(np.median(new_int[others]))
+            reasons = []
+            if med_s != 0 and abs(new_slope[v] / med_s - 1.0) > TEMP_CAL_SLOPE_TOL_FRACTION:
+                reasons.append(
+                    f"slope {new_slope[v]:.5f} is {100 * (new_slope[v] / med_s - 1):+.1f}% "
+                    f"from the pack median {med_s:.5f}"
+                )
+            if abs(new_int[v] - med_i) > TEMP_CAL_INTERCEPT_TOL_C:
+                reasons.append(
+                    f"intercept {new_int[v]:.3f} is {new_int[v] - med_i:+.2f} °C "
+                    f"from the pack median {med_i:.3f}"
+                )
+            if reasons:
+                flagged[str(v)] = "; ".join(reasons)
+                warnings_.append(
+                    f"vial {v} fits outside the pack ({flagged[str(v)]}) — "
+                    "flagged in the calibration, not refused; its verification "
+                    "point decides whether the sleeve is genuinely different"
+                )
+
+        verified: dict = {}
+        for v in measured:
+            pts = s.active_points(v, ("verify",))
+            if pts:
+                p = pts[-1]
+                verified[str(v)] = round(
+                    float(new_slope[v] * p["raw_median"] + new_int[v] - p["reference_c"]), 3
+                )
+        required = min(TEMP_CAL_VERIFY_MIN_VIALS, len(measured))
+        passed_vials = sorted(int(v) for v, d in verified.items()
+                              if abs(d) <= TEMP_CAL_VERIFY_TOL_C)
+        for v, d in verified.items():
+            if abs(d) > TEMP_CAL_VERIFY_TOL_C:
+                failures.append(
+                    f"vial {v}: at the verification point the new fit reads "
+                    f"{d:+.2f} °C off the reference (> ±{TEMP_CAL_VERIFY_TOL_C} °C) "
+                    "— the response is not linear over the range; a third point "
+                    "is needed"
+                )
+        if len(verified) < required:
+            failures.append(
+                f"independent verification incomplete: {len(verified)} of the "
+                f"{required} required vial(s) checked at ~{s.target_verify_c:.0f} °C "
+                "(§8.1) — a two-point fit reproduces its own two points "
+                "trivially; only the middle tests it"
+            )
+        carried_legacy = [v for v in range(N_VIALS)
+                          if v not in measured and _is_legacy_source(per_vial_source[v])]
+        if carried_legacy:
+            warnings_.append(
+                f"vials {carried_legacy} keep their 2016 constants (not measured "
+                "in this session)"
+            )
+
+        qc = {
+            "passed": not failures,
+            "warnings": warnings_,
+            "failures": failures,
+            "overridden_by": None,
+            "verification": {
+                "target_c": s.target_verify_c,
+                "tolerance_c": TEMP_CAL_VERIFY_TOL_C,
+                "required": required,
+                "verified": verified,
+                "passed_vials": passed_vials,
+            },
+            "excluded_vials": sorted(exclude),
+        }
+        vial_map_version = self._vial_map_version(qc)
+
+        review: dict = {}
+        for v in range(N_VIALS):
+            xr37_prev = int(np.rint((37.0 - prev_int[v]) / prev_slope[v]))
+            xr37_new = int(np.rint((37.0 - new_int[v]) / new_slope[v])) if new_slope[v] else None
+            entry = {
+                "measured": v in measured,
+                "fault": s.vial_faults.get(v),
+                "slope": float(new_slope[v]),
+                "intercept": float(new_int[v]),
+                "previous_slope": float(prev_slope[v]),
+                "previous_intercept": float(prev_int[v]),
+                "delta_slope_pct": (round(100.0 * (new_slope[v] / prev_slope[v] - 1.0), 2)
+                                    if prev_slope[v] else None),
+                "delta_intercept_c": round(float(new_int[v] - prev_int[v]), 3),
+                "xr_37_previous": xr37_prev,
+                "xr_37_new": xr37_new,
+                "span_c": None if s.span_c(v) is None else round(s.span_c(v), 2),
+                "flag": flagged.get(str(v)),
+                "verification_delta_c": verified.get(str(v)),
+                "source": per_vial_source[v],
+            }
+            if v in measured:
+                # THE number the audit could only guess at: what the old
+                # curve actually delivered when the UI said 37 °C.
+                entry["previous_delivered_at_37_c"] = round(
+                    float(new_slope[v] * xr37_prev + new_int[v]), 2
+                )
+            review[str(v)] = entry
+        fit = {
+            "measured_vials": measured,
+            "per_vial_source": per_vial_source,
+            "per_vial_version": per_vial_version,
+            "flagged_vials": flagged,
+            "review": review,
+        }
+        return new_slope, new_int, fit, qc, vial_map_version
+
+    def temp_fit(self, exclude_vials: Optional[list] = None) -> dict:
+        """The review screen: fit + QC + per-vial review, written nowhere."""
+        with self._lock:
+            s = self._require_tier3("temperature")
+            _slope, _int, fit, qc, _vm = self._temp_fit_and_qc_locked(
+                s, exclude_vials, self.store.fresh_version("temperature"),
+            )
+            return {"fit": fit, "qc": qc}
+
+    def temp_finish(
+        self,
+        *,
+        exclude_vials: Optional[list] = None,
+        override_reason: Optional[str] = None,
+        operator: Optional[str] = None,
+    ) -> dict:
+        """Fit, QC, install a new temperature version, close the session.
+        Refuses a failing fit unless ``override_reason`` is recorded. The
+        caller (app.py) makes the new curve live."""
+        with self._lock:
+            s = self._require_tier3("temperature")
+            version = self.store.fresh_version("temperature")
+            slope, intercept, fit, qc, vial_map_version = self._temp_fit_and_qc_locked(
+                s, exclude_vials, version,
+            )
+            if not qc["passed"]:
+                if not override_reason:
+                    raise QCRefusal(
+                        "thermistor calibration failed its acceptance criteria "
+                        "(§8.1) — fix and re-capture, exclude the failing vials, "
+                        "or finish with an explicit override_reason",
+                        qc,
+                    )
+                qc["overridden_by"] = str(override_reason)
+            envelope = make_envelope(
+                "temperature",
+                operator=operator or s.operator,
+                source=TEMP_CAL_SOURCE,
+                conditions={
+                    "fluid": "water, working volume (§8.1)",
+                    "stir_pwm": s.stir_pwm,
+                    "reference_thermometer": s.reference_thermometer or None,
+                    "bench_temp_c": s.bench_temp_c,
+                    "target_hot_c": s.target_hot_c,
+                    "target_verify_c": s.target_verify_c,
+                    "n_samples": s.n_samples,
+                    "vial_map_version": vial_map_version,
+                    "settle_overridden_points": [
+                        p["id"] for p in s.points if not p.get("settle_checked", True)
+                    ],
+                },
+                data={
+                    "slope": [float(x) for x in slope],
+                    "intercept": [float(x) for x in intercept],
+                    "points": s.points,
+                    "p2": {str(k): v for k, v in s.p2.items()},
+                    "retargets": {str(k): v for k, v in s.retargets.items()},
+                },
+                fit=fit,
+                qc=qc,
+                version=version,
+            )
+            installed = self.store.save_version("temperature", envelope)
+            self._end_tier3()
+            return {
+                "status": "installed",
+                "version": installed,
+                "measured_vials": fit["measured_vials"],
+                "review": fit["review"],
+                "qc": qc,
+            }
+
+    def temp_abort(self) -> dict:
+        with self._lock:
+            self._require_tier3("temperature")
+            self._end_tier3()
+            return {"status": "aborted"}
 
     # -- per-run OD blank (O2) -------------------------------------------
 

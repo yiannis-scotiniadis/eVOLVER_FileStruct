@@ -2282,6 +2282,68 @@ def create_app(use_mock: bool):
     def api_pump_cal_abort():
         return jsonify(cal_service.pump_abort())
 
+    # --- Tier 3: two-point thermistor calibration (§19.5 / PROTOCOL §8.1) ---
+    # A Tier 3 session reserves the whole machine: start, apply (which arms
+    # it) and finish (which reloads the calibration live) need it idle.
+
+    @flask_app.route("/api/calibration/temperature/start", methods=["POST"])
+    @_cal_route(idle=True)
+    def api_temp_cal_start():
+        body = request.get_json(silent=True) or {}
+        return jsonify(cal_service.temp_start(body))
+
+    @flask_app.route("/api/calibration/temperature/apply", methods=["POST"])
+    @_cal_route(idle=True)
+    def api_temp_cal_apply():
+        body = request.get_json(silent=True) or {}
+        return jsonify(cal_service.temp_apply(str(body.get("phase", ""))))
+
+    @flask_app.route("/api/calibration/temperature/session", methods=["GET"])
+    @_cal_route(mutating=False)
+    def api_temp_cal_session():
+        return jsonify(cal_service.temp_session())
+
+    @flask_app.route("/api/calibration/temperature/point", methods=["POST"])
+    @_cal_route()
+    def api_temp_cal_point():
+        body = request.get_json(silent=True) or {}
+        return jsonify(cal_service.temp_point(
+            str(body.get("label", "")),
+            body.get("reference_c"),
+            vials=body.get("vials"),
+            reference_vial=body.get("reference_vial"),
+            settle_check=body.get("settle_check", True) is not False,
+        ))
+
+    @flask_app.route("/api/calibration/temperature/retarget", methods=["POST"])
+    @_cal_route()
+    def api_temp_cal_retarget():
+        body = request.get_json(silent=True) or {}
+        return jsonify(cal_service.temp_retarget(body.get("vials") or []))
+
+    @flask_app.route("/api/calibration/temperature/fit", methods=["POST"])
+    @_cal_route()
+    def api_temp_cal_fit():
+        body = request.get_json(silent=True) or {}
+        return jsonify(cal_service.temp_fit(body.get("exclude_vials")))
+
+    @flask_app.route("/api/calibration/temperature/finish", methods=["POST"])
+    @_cal_route(idle=True)
+    def api_temp_cal_finish():
+        body = request.get_json(silent=True) or {}
+        result = cal_service.temp_finish(
+            exclude_vials=body.get("exclude_vials"),
+            override_reason=body.get("override_reason"),
+            operator=body.get("operator"),
+        )
+        _reload_calibration("temperature", result["version"])
+        return jsonify(result)
+
+    @flask_app.route("/api/calibration/temperature/abort", methods=["POST"])
+    @_cal_route()
+    def api_temp_cal_abort():
+        return jsonify(cal_service.temp_abort())
+
     # --- raw escape hatches, calibration-only (§19.6) ------------------------
 
     @flask_app.route("/api/calibration/raw/temperature", methods=["POST"])
