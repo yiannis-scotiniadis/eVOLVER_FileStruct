@@ -249,6 +249,14 @@ class ExperimentSupervisor:
         with self._lock:
             return list(self._runs)
 
+    def set_temp_cal(self, temp_cal) -> None:
+        """A newly installed temperature calibration, for every engine built
+        from now on. Engines already loaded keep theirs: a Tier 3 install
+        requires an idle machine (nothing CREATED, RUNNING or ERROR), and
+        stopped engines are never ticked."""
+        with self._lock:
+            self._engine_kwargs["temp_cal"] = temp_cal
+
     def _resolve_locked(self, name: Optional[str]) -> str:
         if name is not None:
             if name not in self._runs:

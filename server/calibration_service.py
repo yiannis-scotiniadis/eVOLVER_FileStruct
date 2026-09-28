@@ -124,6 +124,35 @@ def _parse_version(version: str) -> Optional[datetime]:
         return None
 
 
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write via a sibling tmp file + ``os.replace`` so a crash mid-write
+    never leaves a half-written file where a reader expects a whole one."""
+    path = Path(path)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def per_vial_sources(env: Optional[dict]) -> list[Optional[str]]:
+    """Where each vial's constants in ``env`` were originally measured.
+
+    Tier 3 envelopes record ``fit.per_vial_source`` (a vial carried forward
+    from an earlier version keeps that version's origin, so a 2016 constant
+    stays "legacy-import-2016" however many partial calibrations it rides
+    through). Older envelopes -- the legacy import, the pump wizard -- carry
+    no per-vial record, so every vial takes the envelope's own ``source``."""
+    if env is None:
+        return [None] * N_VIALS
+    per_vial = (env.get("fit") or {}).get("per_vial_source")
+    if isinstance(per_vial, list) and len(per_vial) == N_VIALS:
+        return [None if s is None else str(s) for s in per_vial]
+    return [str(env.get("source", ""))] * N_VIALS
+
+
+def _is_legacy_source(source: Optional[str]) -> bool:
+    return str(source or "").startswith("legacy-import")
+
+
 def make_envelope(
     subsystem: str,
     *,
@@ -473,8 +502,10 @@ class CalibrationStore:
                         ",".join(format(float(v), ".10g") for v in row)
                         for row in rows
                     ]
-                    (self.root / "OD_cal.txt").write_text(
-                        "\n".join(lines) + "\n", encoding="utf-8"
+                    # Atomic: the manager parses these at boot, and a
+                    # half-written view must never be what it finds.
+                    _atomic_write_text(
+                        self.root / "OD_cal.txt", "\n".join(lines) + "\n",
                     )
                     meta = {
                         "dark_subtracted": bool(
@@ -482,8 +513,9 @@ class CalibrationStore:
                         ),
                         "version": od.get("version"),
                     }
-                    (self.root / "OD_cal.meta.json").write_text(
-                        json.dumps(meta, indent=4), encoding="utf-8"
+                    _atomic_write_text(
+                        self.root / "OD_cal.meta.json",
+                        json.dumps(meta, indent=4),
                     )
             temp = self.get_current("temperature")
             if temp is not None:
@@ -494,9 +526,67 @@ class CalibrationStore:
                         ",".join(format(float(v), ".10g") for v in slope),
                         ",".join(format(float(v), ".10g") for v in intercept),
                     ]
-                    (self.root / "temp_calibration.txt").write_text(
-                        "\n".join(lines) + "\n", encoding="utf-8"
+                    _atomic_write_text(
+                        self.root / "temp_calibration.txt",
+                        "\n".join(lines) + "\n",
                     )
+
+    def ensure_legacy_views(self) -> list[str]:
+        """Boot-time integrity check of the derived ``.txt`` views.
+
+        ``save_version`` points ``current.json`` at the new version before it
+        regenerates the views, so a crash between the two -- or a hand-edit,
+        or a truncated write from before the views were atomic -- leaves the
+        manager loading numbers that are not the recorded calibration.
+        Returns the subsystems whose view disagreed with ``current.json``
+        and was regenerated.
+
+        Verify first, rewrite only on a real mismatch: the views are tracked
+        in git, and rewriting them on every boot would reformat the 2016
+        files and leave the Pi's checkout dirty for the next update-by-tag."""
+        with self._lock:
+            if not self.current_path.is_file():
+                return []
+            stale: list[str] = []
+            od = self.get_current("od")
+            if od is not None:
+                rows = (od.get("data") or {}).get("rows")
+                want_ds = bool((od.get("data") or {}).get("dark_subtracted", False))
+                if not self._view_matches(self.root / "OD_cal.txt", rows) \
+                        or self._view_dark_subtracted() != want_ds:
+                    stale.append("od")
+            temp = self.get_current("temperature")
+            if temp is not None:
+                data = temp.get("data") or {}
+                rows = [data.get("slope"), data.get("intercept")]
+                if not self._view_matches(self.root / "temp_calibration.txt", rows):
+                    stale.append("temperature")
+            if stale:
+                self.regenerate_legacy_views()
+            return stale
+
+    @staticmethod
+    def _view_matches(path: Path, rows) -> bool:
+        try:
+            want = np.asarray(rows, dtype=float)
+            have = np.genfromtxt(path, delimiter=",")
+        except Exception:
+            return False
+        return (
+            have.shape == want.shape
+            and bool(np.all(np.isfinite(have)))
+            and bool(np.allclose(have, want, rtol=1e-9, atol=0.0))
+        )
+
+    def _view_dark_subtracted(self) -> bool:
+        """The sidecar flag as the manager will read it: absent -> False."""
+        try:
+            meta = json.loads(
+                (self.root / "OD_cal.meta.json").read_text(encoding="utf-8")
+            )
+            return bool(meta.get("dark_subtracted", False))
+        except Exception:
+            return False
 
     # -- reconciliation log (O4 -> staleness input) ----------------------
 
@@ -724,6 +814,30 @@ class CalibrationStore:
             "experiment": loaded_experiment, "present": blank_present,
         }
 
+        def _curve_age_days(env: Optional[dict], version: str) -> Optional[float]:
+            """Age of the OLDEST constant in the curve. A partial Tier 3
+            calibration carries the other vials forward, so the version
+            stamp alone would make a year-old vial look fresh."""
+            stamps = (env or {}).get("fit", {}).get("per_vial_version")
+            ages = []
+            if isinstance(stamps, list):
+                ages = [a for a in (_age_days(s) for s in stamps) if a is not None]
+            return max(ages) if ages else _age_days(version)
+
+        def _legacy_reason(env: Optional[dict], instrument: str) -> Optional[str]:
+            # Keyed off the structured per-vial record, never off warning
+            # text: a new version carries a vial-map warning until P1 is
+            # done, and that alone must not read as "stale".
+            legacy = [v for v, s in enumerate(per_vial_sources(env))
+                      if _is_legacy_source(s)]
+            if len(legacy) == N_VIALS:
+                return (f"never verified against a {instrument} "
+                        "(2016 inherited constants)")
+            if legacy:
+                return (f"vials {legacy} are still on 2016 constants never "
+                        f"verified against a {instrument}")
+            return None
+
         # OD curve
         od_version = current.get("od")
         od_env = self.get_current("od") if od_version else None
@@ -731,14 +845,10 @@ class CalibrationStore:
         if od_version is None:
             reasons.append("no OD calibration installed")
         else:
-            if od_env is not None and str(od_env.get("source", "")).startswith(
-                "legacy-import"
-            ):
-                reasons.append(
-                    "never verified against a spectrophotometer "
-                    "(2016 inherited constants)"
-                )
-            age = _age_days(od_version)
+            legacy = _legacy_reason(od_env, "spectrophotometer")
+            if legacy:
+                reasons.append(legacy)
+            age = _curve_age_days(od_env, od_version)
             if age is not None and age > CURVE_STALE_DAYS:
                 reasons.append(f"calibration is {age:.0f} days old (> {CURVE_STALE_DAYS:.0f})")
         out["od"] = {"stale": bool(reasons), "reasons": reasons,
@@ -751,19 +861,31 @@ class CalibrationStore:
         if temp_version is None:
             reasons.append("no temperature calibration installed")
         else:
-            if temp_env is not None and str(temp_env.get("source", "")).startswith(
-                "legacy-import"
-            ):
-                reasons.append(
-                    "never verified against a reference thermometer "
-                    "(2016 inherited constants)"
-                )
-            if temp_env is not None and temp_env.get("qc", {}).get("warnings"):
-                reasons.append(
-                    "outlier vial flagged in the fit "
-                    "(see the calibration's qc warnings — vial 0 is the prime suspect)"
-                )
-            age = _age_days(temp_version)
+            legacy = _legacy_reason(temp_env, "reference thermometer")
+            if legacy:
+                reasons.append(legacy)
+            fit = (temp_env or {}).get("fit") or {}
+            if temp_env is not None and "per_vial_source" not in fit:
+                # Legacy-format envelope: its qc warnings are the audit's
+                # leave-one-out outlier findings (bootstrap_from_legacy).
+                if temp_env.get("qc", {}).get("warnings"):
+                    reasons.append(
+                        "outlier vial flagged in the fit "
+                        "(see the calibration's qc warnings — vial 0 is the "
+                        "prime suspect)"
+                    )
+            else:
+                flagged = sorted(int(v) for v in (fit.get("flagged_vials") or {}))
+                verification = (temp_env or {}).get("qc", {}).get("verification") or {}
+                verified = {int(v) for v in verification.get("passed_vials", [])}
+                unverified = [v for v in flagged if v not in verified]
+                if unverified:
+                    reasons.append(
+                        f"vials {unverified} fit outside the pack "
+                        "(slope/intercept) and were not independently verified "
+                        "against the reference thermometer"
+                    )
+            age = _curve_age_days(temp_env, temp_version)
             if age is not None and age > CURVE_STALE_DAYS:
                 reasons.append(f"calibration is {age:.0f} days old (> {CURVE_STALE_DAYS:.0f})")
         out["temperature"] = {"stale": bool(reasons), "reasons": reasons,
@@ -811,6 +933,14 @@ class TempStabilityTracker:
             cutoff = now - self._window_seconds
             while self._samples and self._samples[0][0] < cutoff:
                 self._samples.pop(0)
+
+    def reset(self) -> None:
+        """Forget the window. Called when a new temperature calibration is
+        installed: the history is °C on the OLD scale, and the blank's
+        settle guard must not certify a vial against numbers the current
+        calibration would not have produced."""
+        with self._lock:
+            self._samples.clear()
 
     def settled(
         self,

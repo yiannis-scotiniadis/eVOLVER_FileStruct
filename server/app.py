@@ -288,6 +288,8 @@ class AppState:
         self.watchdog: Watchdog | None = None  # set after socketio is created
         self.engine: ExperimentEngine | None = None  # set after socketio is created
         self.cal_service: CalibrationService | None = None  # set in create_app
+        # create_app's _reload_calibration(subsystem, version).
+        self.reload_calibration = None
         self.sensor_thread_stop = threading.Event()
         self.shutdown_done = threading.Event()
         # Low-disk monitor state (sensor loop): throttle counter + edge latches.
@@ -587,6 +589,45 @@ def _resolve_export_request(parameters, vials, hours, exp_vials: list[int]):
     return params, sorted(set(sel)), h
 
 
+def _load_calibration_files(manager, cal_root: Path, *, strict: bool = False):
+    """Load the derived ``.txt`` views under ``cal_root`` into ``manager`` and
+    return ``(temp_cal, od_cal)`` copies of what it now holds -- or
+    ``(None, None)`` when the views are absent.
+
+    At boot a broken view must not stop the server (``strict=False``: log and
+    run uncalibrated, as a missing file always has); a live reload after an
+    install raises instead, so the caller can say the install did not take.
+    Paths come from the calibration store's root, never the module globals,
+    so the view loaded is always the one the store just wrote."""
+    temp_path = Path(cal_root) / "temp_calibration.txt"
+    od_path = Path(cal_root) / "OD_cal.txt"
+    if not (temp_path.exists() and od_path.exists()):
+        if strict:
+            raise FileNotFoundError(f"calibration views missing under {cal_root}")
+        log.warning(
+            "calibration files not found in %s; sensor reads will return raw ADC",
+            cal_root,
+        )
+        return None, None
+    try:
+        manager.load_calibration(str(temp_path), str(od_path))
+    except Exception:
+        if strict:
+            raise
+        log.exception(
+            "failed to load calibration from %s; sensor reads will return raw "
+            "ADC until it is repaired", cal_root,
+        )
+        return None, None
+    log.info("loaded calibration from %s", cal_root)
+    temp_cal = getattr(manager, "temp_cal", None)
+    od_cal = getattr(manager, "od_cal", None)
+    return (
+        None if temp_cal is None else np.array(temp_cal, dtype=float),
+        None if od_cal is None else np.array(od_cal, dtype=float),
+    )
+
+
 def create_app(use_mock: bool):
     if use_mock:
         manager = MockSerialManager()
@@ -596,17 +637,32 @@ def create_app(use_mock: bool):
         manager = SerialManager()
         log.info("using SerialManager (real RS485 hardware)")
 
-    temp_cal = od_cal = None
-    if TEMP_CAL_PATH.exists() and OD_CAL_PATH.exists():
-        manager.load_calibration(str(TEMP_CAL_PATH), str(OD_CAL_PATH))
-        temp_cal = np.genfromtxt(str(TEMP_CAL_PATH), delimiter=",")
-        od_cal = np.genfromtxt(str(OD_CAL_PATH), delimiter=",")
-        log.info("loaded calibration from %s", CAL_DIR)
-    else:
-        log.warning(
-            "calibration files not found in %s; sensor reads will return raw ADC",
-            CAL_DIR,
-        )
+    # ------------------- Calibration service (SPEC §19) ----------------------
+    # Built BEFORE the manager loads anything: the store owns the derived
+    # .txt views the manager reads. Bootstrap imports the inherited 2016 .txt
+    # files as versioned envelopes on first run (a no-op once
+    # calibration/current.json exists), resumes an in-flight pump session,
+    # and reloads any Tier 3 session SUSPENDED (it must not drive actuators
+    # until an operator re-applies it on an idle machine). Then the views are
+    # checked against current.json and repaired only if they disagree.
+    cal_service = CalibrationService(CAL_DIR, EXPERIMENTS_DIR, manager)
+    try:
+        imported = cal_service.bootstrap()
+        if imported:
+            log.info("calibration store: imported legacy files for %s", imported)
+    except Exception:
+        log.exception("calibration store bootstrap failed")
+    try:
+        repaired = cal_service.store.ensure_legacy_views()
+        if repaired:
+            log.warning(
+                "calibration views disagreed with current.json and were "
+                "regenerated: %s", repaired,
+            )
+    except Exception:
+        log.exception("calibration view integrity check failed")
+
+    temp_cal, od_cal = _load_calibration_files(manager, cal_service.store.root)
 
     data_logger = DataLogger(EXPERIMENTS_DIR)
     EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -778,20 +834,8 @@ def create_app(use_mock: bool):
     )
     state.engine = engine
 
-    # ------------------- Calibration service (SPEC §19) ----------------------
-    # Versioned provenance store + the O2/O3/O4 wizard sessions. Bootstrap
-    # imports the inherited 2016 .txt files as versioned envelopes on first
-    # run (a no-op once calibration/current.json exists) and resumes any
-    # in-flight pump calibration session from _sessions/pump.json.
-
-    cal_service = CalibrationService(CAL_DIR, EXPERIMENTS_DIR, manager)
+    # The calibration service was built before the manager loaded (above).
     state.cal_service = cal_service
-    try:
-        imported = cal_service.bootstrap()
-        if imported:
-            log.info("calibration store: imported legacy files for %s", imported)
-    except Exception:
-        log.exception("calibration store bootstrap failed")
 
     def _sync_od_cal_from_manager() -> None:
         """Keep AppState's od_cal copy (used to invert calibrated OD back to
@@ -799,6 +843,52 @@ def create_app(use_mock: bool):
         per-run blank re-anchors."""
         if getattr(state.manager, "od_cal", None) is not None:
             state.od_cal = np.asarray(state.manager.od_cal)
+
+    def _reload_calibration(subsystem: str, version: str) -> None:
+        """Make a just-installed od/temperature version live WITHOUT a
+        restart. Before Session AA nothing did: a new calibration took effect
+        only at the next boot.
+
+        The temperature calibration is cached in several places, and every
+        one must move together or the dashboard, the heater sliders and the
+        safety floor disagree about what a raw reading means:
+        ``manager.temp_cal`` (reads, the MAX_SAFE_TEMP_C floor),
+        ``state.temp_cal`` (API raw reconstruction, /api/actuators/state),
+        the supervisor's kwargs for new engines, and the thermal-settling
+        tracker's °C history. Loaded engines and their persisted
+        ``_setpoint_raw`` are NOT touched -- callers guarantee the machine
+        is idle (``_cal_route(idle=True)``), so there are none.
+
+        ``load_calibration`` also resets every per-run blank re-anchor; with
+        nothing loaded there is none to lose."""
+        try:
+            temp_cal, _od_cal = _load_calibration_files(
+                state.manager, cal_service.store.root, strict=True,
+            )
+        except Exception as exc:
+            log.exception("reloading calibration after install failed")
+            _emit_alert(
+                "critical",
+                f"Calibration {subsystem} {version} was installed but could "
+                f"not be loaded ({exc}) — restart the server before running "
+                "anything",
+                category=evlog.CATEGORY_CALIBRATION,
+                dedup_key=("calibration_reload_failed", subsystem),
+            )
+            raise
+        state.temp_cal = temp_cal
+        _sync_od_cal_from_manager()
+        state.engine.set_temp_cal(temp_cal)
+        if subsystem == "temperature":
+            cal_service.tracker.reset()
+        _emit_event({
+            "type": "calibration_installed",
+            "subsystem": subsystem,
+            "version": version,
+        })
+
+    # Exposed for the API tests, which drive installs white-box.
+    state.reload_calibration = _reload_calibration
 
     def _apply_experiment_blank(name: str) -> None:
         """Re-apply a committed per-run blank to the live manager (used on
