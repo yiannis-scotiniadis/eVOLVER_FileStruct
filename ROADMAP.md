@@ -46,12 +46,12 @@ Reading the tree rather than the plan, the following is **built and in `main`**:
 | Calibration provenance, per-run OD blank, pump gravimetric wizard, reconciliation, staleness | Built (Session O) | `server/calibration_service.py`, `app.py` `/api/calibration/*`, `index.html` Calibration tab |
 | Vial groups within one experiment (per-group mode, parameters, temperature, stir), preconditioning for the blank, `CONTROL_MODES` registry | Built (Session Y, 2026-09-24) | `server/run_config.py`, `experiment_engine.py`, `/api/experiments/{name}/precondition`, wizard step 5 |
 | Parallel experiments: several independent experiments (own vials, modes, lifecycles, operators), shared bottles/carboys, machine hold | Built (2026-09-24) | `server/supervisor.py`, `server/vessels.py`, `/api/machine*`, `/api/vessels`, dashboard run chips |
+| Tier 3 calibration wizards: two-point thermistor (P2 in the cold phase, retarget, verify-before-install) and OD dilution series (all four parameters, dark-subtracted); live calibration reload; machine-reserving sessions with their own heater watchdog | Built (2026-09-28, software — bench not run) | `server/calibration_service.py`, `server/od_curve_fit.py`, `/api/calibration/temperature/*`, `/api/calibration/od/series/*`, Calibration tab |
 
 **Sessions K, L, M, M2 and O shipped on 2026-08-20** and are folded into the table above;
 their per-session sections below carry the completion notes and verification results.
 
-**Not built** (relevant to this roadmap): the Tier 3 calibration wizards (thermistor
-two-point, OD dilution series, stir RPM — Session AA, gated on bench prerequisite P2),
+**Not built** (relevant to this roadmap): stir RPM calibration (Session AC),
 growth-rate estimation outside the morbidostat controller, anomaly/contamination
 detection, multi-phase protocols, experiment templates, authentication, PID/cascade
 temperature control, notifications, off-box backup, and parallel experiments (the engine
@@ -711,7 +711,8 @@ the 2016 curve was fit on non-dark-subtracted signal and there is no `OD_cal.met
 sidecar saying otherwise, so `dark_subtract=True` against it is silently wrong. The blank
 re-anchoring absorbs a constant dark offset anyway. Dark subtraction switches on only when
 Session AA produces a dark-subtracted curve and its sidecar — and the blank must switch with
-it. Make this a hard error rather than the current log warning.
+it. Make this a hard error rather than the current log warning. *(Both done: a hard error
+since Session O, and the switch automatic since Session AA.)*
 
 Also correct in `SPEC.md` §6: the blank response should report `"updated_rows": [2]`, and
 return the per-vial OD offset removed — that number is what the operator actually needs to
@@ -1190,6 +1191,32 @@ generalisation nobody has asked for. With Session Y's groups in place, phases sh
 per-group. **Effort: DEEP (2–3 h).**
 
 ### Session AA — Full temperature and OD sigmoid recalibration
+
+> **DONE (2026-09-28) — software; the bench work has not been run.** Both wizards are on
+> the Calibration tab: thermistor two-point (`/api/calibration/temperature/*`) and OD
+> dilution series (`/api/calibration/od/series/*`), specified in `SPEC.md` §19.5 and
+> `CALIBRATION_PROTOCOL.md` §8.1–§8.2 / §12–§15. What the build found and decided:
+>
+> - **Nothing reloaded an installed calibration** — a new curve took effect at the next
+>   boot. `app._reload_calibration` now makes it live, which is only safe on an idle
+>   machine, so a Tier 3 session **reserves the machine** (idle to start, apply and install;
+>   everything else that drives it answers 409 while it is open) and carries **its own
+>   heater watchdog**, because with no experiment loaded nothing else watches the heaters.
+> - **Prerequisite P2 is built into the thermistor wizard's cold phase**, so the wizard is
+>   no longer blocked on it — it is the test. Run no temperature-controlled OD series before
+>   it passes.
+> - **Vial 0 cannot reach 40 °C through its own bad curve** (its 45 °C safety floor sits
+>   below it); the hot point is *retargeted* through the vial's own reference readings.
+> - **§8.2's "inflection inside the measured range" was demoted to a warning** after checking
+>   it against the committed curves: `c` < 0 on all sixteen once blank-anchored.
+> - **Every OD series installs dark-subtracted**, a five-vial priority series included:
+>   unmeasured vials convert exactly (`a − D`, `b − D`), and blanks, idle reads and new
+>   experiments switch with the curve.
+> - Found in passing and fixed: `growth_context` raised on every real committed blank (a
+>   list where it expected a dict), so no run had ever received per-vial OD floors.
+>
+> Still open: running both on the rig; replacing the provisional equilibrium gates with
+> measured behaviour; the vial map (P1). The text below is the original framing.
 
 The remainder of meeting items 6/7 that Session O deliberately deferred: a 2-point
 thermistor calibration against a reference thermometer, and a proper OD dilution series

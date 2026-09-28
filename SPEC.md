@@ -478,11 +478,12 @@ GET /api/experiments/{name}/status
   }
 ```
 
-### Calibration endpoints (§19 — IMPLEMENTED 2026-08-20 except the Tier 3 block)
+### Calibration endpoints (§19 — IMPLEMENTED; Tier 3 thermistor + OD series 2026-09-28)
 
 Everything below exists as listed (`server/calibration_service.py` + `app.py`), with one
-exception: the thermistor two-point / OD dilution series / stir routes are **not built**
-(ROADMAP Session AA, Phase 4). The blank-session routes operate on the currently loaded
+exception: the stir routes are **not built** (ROADMAP Session AC). The thermistor two-point
+and OD dilution-series routes shipped in Session AA; their full request shapes are in
+`CALIBRATION_PROTOCOL.md` §12. The blank-session routes operate on the currently loaded
 CREATED experiment rather than taking an experiment name; QC refusals return **422** with
 the qc block, overridable by re-posting with an `override_reason`.
 
@@ -527,9 +528,15 @@ GET  /api/calibration/pump/session    # progress; which pumps remain (resumabili
 POST /api/calibration/pump/finish     # fit, QC, write versioned file
 POST /api/calibration/pump/abort
 
---- thermistor two-point / OD dilution series / stir (§19.5) — NOT BUILT (Session AA) ---
-POST /api/calibration/temperature/start | /point | /finish | /abort
-POST /api/calibration/od/series/start   | /point | /finish | /abort
+--- thermistor two-point / OD dilution series (§19.5) — Session AA ---
+POST /api/calibration/temperature/start | /apply | /point | /retarget | /fit | /finish | /abort
+GET  /api/calibration/temperature/session
+POST /api/calibration/od/series/start   | /apply | /point | /discard  | /fit | /finish | /abort
+GET  /api/calibration/od/series/session[?preview=1]
+  # start / apply / finish need an IDLE machine (409 machine_not_idle); while a session is
+  # open, anything else that drives the machine is 409 calibration_in_progress.
+
+--- stir (§25) — NOT BUILT (Session AC) ---
 POST /api/calibration/stir/record       | /finish
 
 --- raw escape hatches, calibration-only ---
@@ -2153,10 +2160,12 @@ writing a hygiene record on completion.
 `calibration/` (with the legacy `.txt` files regenerated as a derived view), the OD-blank
 and pump wizard sessions, the thermal-settling tracker, staleness, and reconciliation;
 `app.py` exposes them under `/api/calibration/*` and `index.html` carries the Calibration
-tab with the OD-blank, pump and reconciliation wizards. §19.5 (full thermistor and OD
-sigmoid recalibration) remains **Phase 4 / Session AA**, gated on bench prerequisite P2.
-The software is bench-ready; **Tier 2 gravimetric calibration and the first real blank
-have not yet been run**, so the numeric caveats below still stand until they are.
+tab with the OD-blank, pump and reconciliation wizards. **§19.5's software shipped
+2026-09-28 (`ROADMAP.md` Session AA)** — the thermistor and OD dilution-series wizards, the
+live calibration reload, and the dark-subtraction switch; see §19.5. The software is
+bench-ready; **Tier 2 gravimetric calibration, the first real blank and both Tier 3
+procedures have not yet been run**, so the numeric caveats below still stand until they
+are.
 
 > **The bench protocol is `CALIBRATION_PROTOCOL.md`.** Part I is the tiered SOP the lab
 > actually follows (Tier 0 pre-flight → Tier 1 per-run → Tier 2 per-campaign pumps → Tier 3
@@ -2266,11 +2275,13 @@ tripwire; §19.5 is the fix.
 
 **The dark read is a diagnostic, not a correction.** The 2016 curve was fit on
 non-dark-subtracted signal and carries no `OD_cal.meta.json` sidecar saying otherwise, so
-`dark_subtract=True` against it is silently wrong — `serial_manager` logs a warning today
-and this should become a hard error. The blank re-anchoring absorbs a constant dark offset
-anyway. Dark subtraction switches on only when §19.5 produces a dark-subtracted curve and
-its sidecar, and the blank must switch with it; a dark-subtracted curve with a
-non-dark-subtracted blank is as wrong as the reverse.
+`dark_subtract=True` against it is silently wrong — a hard error, in both directions. The
+blank re-anchoring absorbs a constant dark offset anyway. Dark subtraction switches on only
+when §19.5 produces a dark-subtracted curve and its sidecar, and the blank must switch with
+it; a dark-subtracted curve with a non-dark-subtracted blank is as wrong as the reverse.
+**Since Session AA the switch is automatic** (§19.5): the blank re-anchors on blank − dark,
+new experiments default to `dark_subtract` (written into `config.json`), idle reads subtract
+the dark, and a blank taken on a replaced curve is refused at start (`stale_od_blank`).
 
 Per-run blanks are written to the **experiment directory**
 (`experiments/{name}/od_blank.json`), not the global calibration directory, because they
@@ -2324,10 +2335,32 @@ Needs one endpoint (`POST /api/experiments/{name}/reconcile`), two number fields
 and a stored record. It also gives §15's `uncalibrated` label an evidence-based exit
 condition.
 
-### 19.5 Full temperature and OD recalibration — Phase 4
+### 19.5 Full temperature and OD recalibration — software IMPLEMENTED (Session AA)
 
 Two-point thermistor calibration against a reference thermometer, and an OD dilution series
 fitting all four sigmoid parameters. Procedures: `CALIBRATION_PROTOCOL.md` §8.1 and §8.2.
+
+**As built (2026-09-28).** `TempCalSession` / `OdSeriesSession` in
+`server/calibration_service.py`, the fit in `server/od_curve_fit.py` (numpy only), the
+routes under `/api/calibration/temperature/*` and `od/series/*`, two wizards on the
+Calibration tab. What the implementation had to add around the procedures:
+
+- **Live reload.** Before this nothing reloaded an installed od/temperature calibration —
+  it took effect at the next boot. `app._reload_calibration` moves every cache together
+  (manager, AppState, supervisor kwargs for new engines, the settle tracker). Boot checks the
+  derived `.txt` views against `current.json` and regenerates them only on a real mismatch.
+- **A Tier 3 session reserves the machine.** At most one; persisted under
+  `calibration/_sessions/`, reloaded *suspended* after a restart; `start`/`apply`/`finish`
+  need an idle machine (nothing loaded, no pump session); everything else that drives the
+  machine answers 409 while it is open. E-stop and the watchdog fault it.
+- **A calibration heater watchdog** on the fast lane (46 °C, 3 reads, all 16 vials) — with no
+  experiment loaded the engine's heater safety never runs.
+- **Thermistor:** the cold phase is the P2 test; the hot point may be *retargeted* through a
+  vial's own provisional line (with a safety floor from that line — the installed curve's
+  floor would stop vial 0 short of 40 °C); verification runs through the candidate before
+  install; pack outliers are flagged, and stay stale until verified.
+- **OD:** every capture reads all 16 lit and dark; every series installs dark-subtracted,
+  unmeasured vials converted exactly (`a − D`, `b − D`).
 Prerequisites for publishable absolute OD values. Blocked in practice by §14 open question 4
 (heater electrical health) — though note that historical "stuck-on" behaviour may have been
 the inverted-`xr` command bug rather than failed MOSFETs, which is 30 minutes of testing to
@@ -2350,8 +2383,11 @@ own two points trivially; only the middle reveals whether the response is linear
 
 **Acceptance — OD:** R² ≥ 0.99 per vial against true OD600 from a benchtop
 spectrophotometer; residual < 0.02 OD or 5 %, whichever is larger; fitted lower asymptote
-clearly below the lowest measured signal; inflection point inside the measured range;
-monotonic across the working range. Fit on **dark-subtracted** signal and write
+at least 5 SD below the lowest measured signal; monotonic across the working range; ≥ 8
+levels. The inflection point is **reported, not required inside the measured range**
+(amended in Session AA: `c` < 0 on every blank-anchored 2016 curve — transmitted light falls
+off convexly from OD 0 — so the requirement would have refused every ordinary fit;
+`CALIBRATION_PROTOCOL.md` §8.2). Fit on **dark-subtracted** signal and write
 `calibration/OD_cal.meta.json` with `{"dark_subtracted": true}` — that sidecar is what lets
 §19.2's dark read graduate from diagnostic to correction. Use a non-growing turbidity source
 (killed cells, heat-fixed cells, or beads) so the series does not drift over the two hours

@@ -274,6 +274,13 @@ Each function:
 > unchanged. Additionally, each run takes a **per-run OD blank**
 > (`experiments/{name}/od_blank.json`) that re-anchors row 2 of the OD calibration
 > in memory for that run only — see `CALIBRATION_PROTOCOL.md` §5.4/§10.1.
+>
+> **Since Session AA (2026-09-28):** the Tier 3 wizards install new versions and
+> `app._reload_calibration` makes them live without a restart. An OD dilution series always
+> installs a **dark-subtracted** curve (`OD_cal.meta.json` → `true`), and from then on the
+> blank, idle reads and new experiments all use LED-on minus LED-off signal; a mismatch in
+> either direction is refused at create, and a blank taken on the previous curve is refused
+> at start (`stale_od_blank`).
 
 ### Temperature calibration (`temp_calibration.txt`)
 - 2 rows x 16 columns (slope and intercept per vial)
@@ -408,6 +415,8 @@ processes, owns `/dev/ttyAMA0` directly, and serves the dashboard at
 | Per-vial growth-rate service (μ, doubling time, R², gated dilution diagnostic) | Built | `server/growth_rate.py`, `/api/growth_rate`, `vialNN_growth.csv` |
 | Vial groups within one experiment (per-group mode/params/temp/stir, one lifecycle), preconditioning for the blank, `CONTROL_MODES` registry | Built | `server/run_config.py`, `experiment_engine.py`, SPEC §9.1 |
 | Parallel experiments (independent experiments, vial ownership, shared bottles/carboys, machine hold, N-way resume) | Built | `server/supervisor.py`, `server/vessels.py`, SPEC §9.2 |
+| Tier 3 calibration wizards: thermistor two-point (P2 built into the cold phase, retarget, verify before install) and OD dilution series (four-parameter fit, dark-subtracted install) | Built (software) | `server/calibration_service.py`, `server/od_curve_fit.py`, `/api/calibration/temperature/*`, `od/series/*`, SPEC §19.5 |
+| Live calibration reload; machine-reserving Tier 3 sessions with their own heater watchdog | Built | `app.py:_reload_calibration`, `_calibration_tick`, `_cal_route(idle=…)` |
 
 **Session N shipped 2026-08-23** — the per-vial growth-rate service: the estimator, the
 engine-owned OD history and dilution boundaries, `status()` / WebSocket / API / CSV
@@ -419,10 +428,12 @@ gravimetric wizard, reconciliation, and the 32-flow-rate engine plumbing. The so
 bench-ready but **no Tier 1/Tier 2 procedure has yet been run on the bench**, so the
 inherited-constant caveats below still stand.
 
+**Session AA shipped 2026-09-28** — the Tier 3 thermistor and OD dilution-series wizards,
+software only: neither has been run on the rig, and prerequisite P2 stays unresolved until
+the thermistor wizard's cold phase is.
+
 **Not yet built** (in rough priority order — see `ROADMAP.md`):
-the Tier 3 calibration wizards (thermistor
-two-point, OD dilution series, stir RPM — `/api/calibration/temperature/*`, `od/series/*`
-and `stir/*` do not exist; Session AA), hygiene/sterilisation records, experiment
+stir RPM calibration (`/api/calibration/stir/*`, Session AC), hygiene/sterilisation records, experiment
 templates, supervised per-vial override, anomaly detection, notifications, off-box
 backup, multi-phase protocols, and authentication.
 
@@ -455,7 +466,7 @@ backup, multi-phase protocols, and authentication.
   and how to verify `/dev/ttyAMA0` is the PL011, restoring the state git does not carry,
   Tailscale identity, and which parts of `DEPLOY.md` Phase 4 a rebuild may skip.
 
-### Ten facts worth carrying into any new work
+### Eleven facts worth carrying into any new work
 
 1. **`xr` is a closed-loop setpoint, not a PWM, and the slope is negative.** The Arduino
    already closes the temperature loop. `xr=0` requests ~82 °C. See the Testing warning
@@ -607,6 +618,20 @@ backup, multi-phase protocols, and authentication.
       experiment; the machine hold holds every experiment's pumps; pump calibration and
       raw actuator routes need the whole machine. The per-run OD blank does not.
 
+11. **A Tier 3 calibration session reserves the whole machine, and installs go live.**
+    `calibration_service.TempCalSession` / `OdSeriesSession` (Session AA) drive every heater
+    and stir for hours, so: at most one exists; `start`, `apply` and `finish` need an idle
+    machine (nothing loaded in any state, no pump session — `_cal_route(idle=True)`); while
+    one is open, anything else that drives the machine answers 409
+    `calibration_in_progress` (never the emergency stop). With no experiment loaded the
+    engine's heater safety never runs, so the session carries its own watchdog in
+    `app._calibration_tick` on the fast lane (46 °C, 3 reads, all 16 vials). E-stop and the
+    watchdog *fault* it — its stir re-send would otherwise undo an E-stop — and a restart
+    reloads it *suspended*. `finish` reloads the calibration live through
+    `_reload_calibration`, which is why it needs the machine idle: loaded engines cache the
+    temperature curve and their persisted raw setpoints. Any new route that drives
+    actuators must check `_tier3_in_progress()`.
+
 
 ## Technical constraints
 
@@ -675,8 +700,10 @@ eVOLVER_FileStruct/
     temp_calibration.txt     # DERIVED VIEW of current temperature version (2 x 16)
     OD_cal.meta.json         # {"dark_subtracted": bool} sidecar, regenerated with the view
     _sessions/pump.json      # in-progress resumable wizard session (gitignored)
+    _sessions/temperature.json | od_series.json
+                             # an open Tier 3 session (gitignored; reloaded SUSPENDED)
     reconciliation_log.json  # per-run mass-reconciliation trend (gitignored)
-    # stir/ — planned, SPEC §25 / Session AA
+    # stir/ — planned, SPEC §25 / Session AC
 
   logs/                      # rotating server logs (gitignored)
     evolver.log  errors.log
@@ -699,7 +726,8 @@ eVOLVER_FileStruct/
     data_logger.py           # Per-vial CSV writers
     data_export.py           # ZIP bundles, filtering
     event_log.py             # rotating logs, event ring, error classification (SPEC §20)
-    calibration_service.py   # versioned store, blank/pump wizard sessions, staleness (SPEC §19)
+    calibration_service.py   # versioned store, blank/pump/Tier 3 wizard sessions, staleness (SPEC §19)
+    od_curve_fit.py          # four-parameter logistic fit for the OD dilution series — pure, numpy only
     watchdog.py              # Heartbeat -> emergency shutdown
     control_modes/
       turbidostat.py  chemostat.py  morbidostat.py
@@ -708,6 +736,11 @@ eVOLVER_FileStruct/
                              #   simulated culture and checks the OD band / delivered D
     test_vial_groups.py      #   vial groups: run_config, engine, API (SPEC §9.1)
     test_parallel_runs.py    #   parallel experiments: supervisor + API (SPEC §9.2)
+    test_calibration_tier3*.py, test_od_curve_fit.py
+                             #   Tier 3 wizards against a mock whose TRUE thermistor/OD
+                             #   response differs from the installed curve (SPEC §19.5)
+    conftest.py              #   stops test apps' sensor threads; isolates each test from
+                             #   the repo's runtime calibration/_sessions
     verify_control_modes.py  #   same checks as a readable report (CONTROL_MODE_AUDIT.md)
 
   frontend/

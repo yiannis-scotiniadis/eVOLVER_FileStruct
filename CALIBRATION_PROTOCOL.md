@@ -3,8 +3,9 @@
 **Status:** bench procedures ready to run. **Part II is IMPLEMENTED (2026-08-20,
 `ROADMAP.md` Session O)** — the provenance store, per-run OD blank, pump gravimetric
 wizard, reconciliation, guards and staleness all exist in `server/calibration_service.py`
-+ `/api/calibration/*` + the GUI's Calibration tab; only the Tier 3 wizards (§8) and the
-dedicated Tier 0 / §5.1–§5.3 screens are still pending (Session AA; run sheet meanwhile).
++ `/api/calibration/*` + the GUI's Calibration tab. **The Tier 3 thermistor and OD-series
+wizards (§8.1, §8.2) shipped 2026-09-28 (`ROADMAP.md` Session AA)**; only stir RPM (§8.3,
+Session AC) and the dedicated Tier 0 / §5.1–§5.3 screens remain (run sheet meanwhile).
 No Tier 1 or Tier 2 procedure has yet been **run on the bench** — the audit findings in §1
 remain live until one is.
 **Applies to:** the 2016 BU/EDF eVOLVER, 16 sleeves, driven by the Flask server in `server/`.
@@ -314,11 +315,17 @@ conditions the run will use, immediately before inoculation.
 **On dark subtraction.** `serial_manager` supports subtracting the dark read from the signal
 before applying the calibration (`dark_subtract=True`). **Leave it off.** The 2016 curve was
 fit on non-dark-subtracted signal, there is no `OD_cal.meta.json` sidecar asserting otherwise,
-and mixing the two produces silently wrong OD — the code logs a warning to that effect. The
+and mixing the two produces silently wrong OD — the software refuses it (a hard error). The
 blank re-anchoring in step 3 absorbs any constant dark offset anyway. Use the dark read as a
 **diagnostic**, not as a correction, until Tier 3.2 produces a dark-subtracted curve and its
 sidecar. When that happens, dark subtraction and the per-run blank must both switch over
 together; a dark-subtracted curve with a non-dark-subtracted blank is as wrong as the reverse.
+
+**Since Session AA that switch is automatic.** Installing a Tier 3.2 series writes the
+sidecar, and from then on: the blank re-anchors on *blank − dark*; new experiments read
+dark-subtracted by default (written into their `config.json`), and a mismatch in either
+direction is refused at create; idle reads subtract the dark too; and a blank taken against
+the previous curve is never applied — start answers 409 `stale_od_blank`. Retake it.
 
 ### 5.5 Record and start
 
@@ -444,6 +451,32 @@ vial to vial.
 A vial failing the slope or intercept criterion should be flagged in the calibration file
 rather than silently accepted — that is how §1.3's vial 0 problem survived since 2016.
 
+**In the wizard (Session AA, Calibration tab → Thermistor).** What the software adds to the
+steps above:
+
+- **The cold phase is prerequisite P2.** With every heater commanded off, a vial whose raw
+  counts *fall* (it is heating — the slope is negative) by more than 5 counts per 10 min,
+  both absolutely *and* relative to the pack, is latched as a heater fault, excluded, and
+  alerted as hardware. Absolute alone would flag every vial when the room warms; relative
+  alone would flag a vial that merely cools more slowly.
+- **Equilibrium is judged on raw counts**, as the drift of per-minute medians: the cold point
+  relative to the pack (±2 counts over 10 min — room drift the whole pack shares cannot block
+  it), hot and verify points per vial (±2 counts over 5 min). A capture before that is
+  possible only with a recorded override. *These gates are provisional.*
+- **Retarget.** The hot point is commanded through the *installed* curve, so a vial whose
+  curve is wrong — vial 0's — lands short of 40 °C and fails the 15 °C span. Retarget
+  re-commands it through a provisional line fitted from its own two reference readings, with
+  the safety floor taken from that line (never below raw 300); the superseded reading stays
+  in the record.
+- **A calibration heater watchdog runs for the whole session** (nothing else watches the
+  heaters with no experiment loaded): any vial above 46 °C on three consecutive reads is
+  parked and excluded — judged by its own reference line once it has one.
+- **Verification runs before install**, through the *candidate* fit via raw setpoints —
+  equivalent to "install, then command 30 °C", without installing something that may fail.
+  At least min(4, vials measured) must agree within 0.5 °C.
+- The review shows, per vial, **what the previous curve actually delivered when the UI said
+  37 °C** — the number §1.3 could only estimate.
+
 ### 8.2 OD dilution series — all four sigmoid parameters
 
 **Equipment:** benchtop spectrophotometer (the reference for true OD600), the run's medium,
@@ -468,15 +501,35 @@ a dense culture or a turbidity standard.
 
 - **R² ≥ 0.99** per vial against true OD600.
 - Residual **< 0.02 OD** or 5 % of the value, whichever is larger, at every point.
-- Fitted lower asymptote `a` **below the lowest measured signal** by a clear margin. Vial 1's
-  current fit violates this (§1.4) and that is precisely why it misbehaves.
+- Fitted lower asymptote `a` **below the lowest measured signal** by a clear margin — at least
+  5 SD of that point's signal. Vial 1's current fit violates this (§1.4) and that is precisely
+  why it misbehaves.
 - Fitted upper asymptote `b` reported honestly as an extrapolation if it exceeds 65 535, and
-  flagged in the file. The domain guard depends on it.
-- Inflection point `c` **inside the measured range**. A `c` of −3.58 (vial 0 today) means the
-  fit is extrapolating its own centre.
-- Curve **monotonic** across the working range.
+  flagged in the file. The domain guard depends on it. When the data never show the curve
+  flattening, `b` is unidentifiable (the error keeps falling as `b → ∞`): the fit caps it at
+  10× the highest signal and records `b_at_bound`. OD inside the measured range is unaffected.
+- ~~Inflection point `c` inside the measured range.~~ **Amended in Session AA: reported and
+  warned, not refused.** Transmitted light falls off convexly from OD 0, so `c` sits below
+  OD 0 unless the detector saturates near the blank: anchored to a blank, **`c` < 0 on all
+  sixteen 2016 curves**, and a refusal here would reject every physically ordinary fit. What
+  this criterion was guarding against — a fit extrapolating its own shape — is caught by the
+  lower-asymptote margin above and the cap on `b`.
+- Curve **monotonic** across the working range, and the data themselves: the median signal
+  must fall between consecutive OD levels by more than the noise.
+- **≥ 8 distinct OD levels** per vial.
 
-Refuse to install a fit that fails R² or monotonicity without an explicit, recorded override.
+Refuse to install a fit that fails R², the residual criterion, monotonicity, the
+lower-asymptote margin or the level count without an explicit, recorded override.
+
+**In the wizard (Session AA, Calibration tab → OD series).** The true OD600 of a point is
+`spectrophotometer reading × dilution factor` (benchtop instruments are linear only to about
+OD 1, so dense standards are read diluted). Every capture reads all sixteen vials lit *and*
+dark, so any subset may be measured — a vial may carry its own OD (a rotated design) — and
+**every series installs dark-subtracted**: a vial the series did not measure keeps its curve,
+converted exactly (`a − D`, `b − D`, with `c` and `d` unchanged, `D` its dark median this
+session). That makes the five-vial priority series of SPEC §19.5 a full migration. The fit is
+`server/od_curve_fit.py` (numpy only): exact least squares in OD for fixed asymptotes, a
+2-D search over them; it recovers noiseless 2016-shaped curves to machine precision.
 
 ### 8.3 Stir PWM → RPM
 
@@ -688,8 +741,9 @@ the hardware binary address, so the software index and the wire address cannot d
 All under `/api/calibration/*`. All reject with **409** while an experiment is RUNNING, except
 the read-only ones. These are the **only** routes permitted to reach raw actuator paths.
 
-> **Implementation status (2026-08-20):** everything below is built except the Tier 3
-> blocks (`temperature/*`, `od/series/*`, `stir/*` — Session AA). As built: the blank
+> **Implementation status (2026-09-28):** everything below is built except `stir/*`
+> (Session AC); the thermistor and OD-series blocks shipped in Session AA as listed. Every
+> Tier 3 session reserves the whole machine (§13). As built: the blank
 > routes operate on the loaded CREATED experiment (no experiment name in the body); QC
 > refusals return **422** carrying the qc block and are overridable by re-posting with an
 > `override_reason`; `GET /api/calibration/pump/session` reports `{"active": false}`
@@ -724,17 +778,32 @@ GET  /api/calibration/pump/session          → progress; which pumps remain  (r
 POST /api/calibration/pump/finish           → fit, QC, write versioned file
 POST /api/calibration/pump/abort
 
---- thermistor two-point (Tier 3 §8.1) ---
-POST /api/calibration/temperature/start     {points: ["cold","hot"], target_hot_c: 40}
-POST /api/calibration/temperature/point     {label, reference_c, vials: [...]}
-                                            → captures raw ADC for the listed vials now
-POST /api/calibration/temperature/finish    → per-vial linear fit + residuals + outlier flags
-POST /api/calibration/temperature/abort
+--- thermistor two-point (Tier 3 §8.1) — Session AA ---
+POST /api/calibration/temperature/start     {operator, vials?, stir_pwm, target_hot_c: 40,
+                                             target_verify_c: 30, reference_thermometer,
+                                             bench_temp_c, n_samples}          (idle machine)
+POST /api/calibration/temperature/apply     {phase: cold | hot | verify} → commands, ARMS (idle)
+GET  /api/calibration/temperature/session   → per-vial raw, drift, P2, points, span, fits
+POST /api/calibration/temperature/point     {label, reference_c, vials | reference_vial,
+                                             settle_check} → raw thermistor counts now
+POST /api/calibration/temperature/retarget  {vials} → re-command through each vial's own line
+POST /api/calibration/temperature/fit       {exclude_vials} → review; writes nothing
+POST /api/calibration/temperature/finish    {exclude_vials, override_reason} → install, live (idle)
+POST /api/calibration/temperature/abort     → heaters parked; nothing written
 
---- OD dilution series (Tier 3 §8.2) ---
-POST /api/calibration/od/series/start       {points_expected, dark_subtracted: true}
-POST /api/calibration/od/series/point       {true_od600, vials: [...]} → captures raw + dark
-POST /api/calibration/od/series/finish      → 4-param logistic fit per vial, R², residuals
+--- OD dilution series (Tier 3 §8.2) — Session AA ---
+POST /api/calibration/od/series/start       {operator, vials?, led_power, stir_pwm,
+                                             target_temp_c | null, n_samples, standard,
+                                             medium, spectrophotometer}        (idle machine)
+POST /api/calibration/od/series/apply       → stir + heaters, ARMS                  (idle)
+GET  /api/calibration/od/series/session     [?preview=1] → per-vial points, preview fits
+POST /api/calibration/od/series/point       {entries: [{vial, spec_reading, dilution_factor}]}
+                                            or {spec_reading, dilution_factor, vials}
+                                            → lit AND dark reads of all 16
+POST /api/calibration/od/series/discard     {point_id}
+POST /api/calibration/od/series/fit         {exclude_vials} → review; writes nothing
+POST /api/calibration/od/series/finish      {exclude_vials, override_reason} → install
+                                            dark-subtracted, live                   (idle)
 POST /api/calibration/od/series/abort
 
 --- stir (Tier 3 §8.3) ---
@@ -743,7 +812,7 @@ POST /api/calibration/stir/finish           → interpolation table per vial
 
 --- raw escape hatches, calibration-only ---
 POST /api/calibration/raw/temperature       {setpoints: [...16]}   (wraps set_temperature_raw)
-POST /api/calibration/raw/od_led            {power: 0..2200}       (needs building)
+POST /api/calibration/raw/od_led            {power: 0..2200}
 ```
 
 `POST /api/actuators/temperature/raw` used to sit on the normal actuator surface; it has
@@ -761,9 +830,13 @@ Each of these corresponds to a way the protocol can be silently violated.
 | Condition match | Blank commit rejected if `led_power` or `stir_pwm` differ from the values the experiment will run with | Principle 1. A blank at a different LED power is not a blank. |
 | Thermal settling | Blank commit rejected unless the temperature has been within ±0.3 °C of setpoint for ≥ 10 min | §5.4 preconditions, enforced rather than trusted |
 | Domain | Blank commit rejected if any `B[v] ≤ a[v]` or `≥ b[v]` | The re-anchor formula is undefined outside the domain |
-| Dark-subtraction coherence | Reject enabling `dark_subtract` unless the installed curve's sidecar says `dark_subtracted: true`; reject a blank taken dark-subtracted against a curve that is not | §5.4. Currently a log warning; should be a hard error. |
+| Dark-subtraction coherence | Reject enabling `dark_subtract` unless the installed curve's sidecar says `dark_subtracted: true`, and reject disabling it when it does; the blank follows the curve | §5.4. Hard errors in both directions since Session AA |
 | Fit quality | Refuse to save a pump fit that is non-monotonic or has replicate CV > 5 %; refuse an OD fit with R² below 0.99; refuse a thermistor fit spanning < 15 °C — each overridable only with an explicit `override_reason` recorded in `qc.overridden_by` | `SPEC.md` §19.4 |
 | Immutability | Writing a calibration never overwrites an existing version file | Principle 3 |
+| Tier 3 needs an idle machine | Thermistor / OD-series `start`, `apply` and `finish` → 409 `machine_not_idle` while any experiment is loaded (CREATED, RUNNING or ERROR) or a pump session is open | The session drives every heater and stir; `finish` reloads the calibration live, safe only with no engine holding a cached copy |
+| Tier 3 in progress | While a Tier 3 session exists, in any state: experiment create/start/precondition, manual actuators, raw routes, the pump wizard and the OD blank → 409 `calibration_in_progress`. Never the emergency stop | A second driver would fight the session for the heaters and stir |
+| Tier 3 safety | E-stop and the watchdog *fault* the session; shutdown *suspends* it; a restart reloads it suspended. It drives nothing until an idle-checked `apply` | Its stir re-send would otherwise undo an E-stop within 10 s |
+| Stale blank | A blank taken against a since-replaced OD curve is never applied; start → 409 `stale_od_blank` | Its `c_run` belongs to another curve |
 | Provenance | An experiment cannot start unless `config.json` names a version for every subsystem it uses | Principle 3 |
 | Vial map | Any calibration write records `vial_map` version; warn loudly if it is null | Prerequisite P1 |
 
@@ -791,7 +864,8 @@ worth something a database row is not.
 > staleness banner are built in the GUI's Calibration tab. The dedicated Tier 0
 > checklist, §5.1 prime, §5.2 rotation state, and §5.3 temperature-verification screens
 > were deliberately deferred — those steps stay on the printed run sheet, driven by the
-> existing manual controls. Tier 3 screens are Session AA.
+> existing manual controls. The §8.1 and §8.2 Tier 3 screens shipped in Session AA;
+> §8.3 is Session AC.
 
 | SOP step | Screen | Endpoint(s) | Writes |
 |---|---|---|---|
@@ -803,8 +877,8 @@ worth something a database row is not.
 | §5.5 | Provenance summary shown in the experiment wizard's Review step | — | `config.json` |
 | §6 Post-run | Reconciliation — enter end masses, shows inferred vs measured and the ratio | new: `POST /api/experiments/{name}/reconcile` | reconciliation record; staleness input |
 | §7 Tier 2 | Pump grid: 32 tiles, each showing state (pending / firing / awaiting mass / done / failed) and the replicate values. Resumable across sessions. | `pump/*` | `calibration/pump/…json` |
-| §8.1 Tier 3 temp | Cold point (all 16 at once) → hot point (vial-by-vial, probe prompt) → fit review with residuals and outlier flags | `temperature/*` | `calibration/temperature/…json` |
-| §8.2 Tier 3 OD | Dilution series: per point, enter spectrophotometer OD600 → capture → repeat; fit review with per-vial R² and residual plot | `od/series/*` | `calibration/od/…json` + `OD_cal.meta.json` |
+| §8.1 Tier 3 temp | Setup → cold point (live 16-vial raw strip: drift, P2, probe advisory; one reference for all) → hot point (vial by vial; span; retarget) → review (old vs new, "delivered at 37 °C", flags, plot) → verify (through the candidate) → install | `temperature/*` | `calibration/temperature/…json` |
+| §8.2 Tier 3 OD | Setup → points (per vial: spectrophotometer reading × dilution; lit + dark capture; discard; preview fit) → review (a, b, c, d, R², residuals, criteria, old OD at blank, plot vs the previous curve) → install | `od/series/*` | `calibration/od/…json` + `OD_cal.meta.json` |
 | §8.3 Tier 3 stir | Per-vial PWM 4/7/10/13, enter measured RPM | `stir/*` | `calibration/stir/…json` |
 
 **Review screens are the point.** For each calibration the operator must see, before
@@ -844,6 +918,21 @@ are bench work or Tier 3 software.
 - [x] Pump-seconds accumulate per line and drive the staleness warning
 - [x] A stale calibration produces a visible dashboard banner, not just an API field
 
+**Tier 3 (Session AA) — software, verified by `test_calibration_tier3.py`,
+`test_calibration_tier3_api.py` and `test_od_curve_fit.py` against a mock whose true
+thermistor response and OD curve differ from the installed ones**
+
+- [x] Vial 0 retargeted to 40 °C through its own line; the true line recovered exactly; the
+      review reports ~28 °C delivered at a commanded 37 °C
+- [x] A heater heating while commanded off fails P2 and is excluded; room warming does not
+- [x] Verification refuses a curved thermistor (> 0.5 °C at the middle) unless overridden
+- [x] The OD fit recovers every 2016-shaped curve to machine precision, noiselessly
+- [x] A five-vial series installs dark-subtracted; the other eleven read identical OD
+- [x] A new curve goes live without a restart (manager, heater sliders, new engines)
+- [x] E-stop faults the session and its stir stays off; a restart reloads it suspended
+- [ ] The thermistor wizard run on the rig (P2 and the first reference-traced curve) *(bench)*
+- [ ] An OD dilution series run on the rig against a spectrophotometer *(bench)*
+
 **Resumability**
 
 - [x] Pump session survives a server restart mid-calibration and resumes with the right pumps pending
@@ -851,7 +940,8 @@ are bench work or Tier 3 software.
 
 ## 16. Suggested build order
 
-Items 1–5 shipped 2026-08-20 (ROADMAP Session O); item 6 remains (Session AA).
+Items 1–5 shipped 2026-08-20 (ROADMAP Session O); item 6's software shipped 2026-09-28
+(Session AA) — the bench runs remain.
 
 1. ✅ **Envelope, versioning, `current.json`, legacy `.txt` regeneration, provenance in `config.json`.**
    Nothing else is safe to build first — it is the part that makes every later calibration
@@ -863,7 +953,9 @@ Items 1–5 shipped 2026-08-20 (ROADMAP Session O); item 6 remains (Session AA).
 4. ✅ **Post-run reconciliation** (§6). Small, and it is the only thing that will tell you when
    step 3 has gone stale.
 5. ✅ **Staleness surfacing** (§13).
-6. **Tier 3 wizards** — after prerequisite P2 is resolved.
+6. ✅ **Tier 3 wizards** (software, Session AA) — thermistor and OD series. The thermistor
+   wizard's cold phase *is* the P2 test, so it can run before P2 is otherwise resolved; run
+   no temperature-controlled OD series until it has passed. Stir RPM (§8.3) is Session AC.
 
 ---
 
@@ -1056,7 +1148,8 @@ resolvable — a threshold separation of 0.02 OD is meaningful on vial 9 and is 
 
 1. **Provisional thresholds** in §5.4 need replacing with measured repeatability after ~5 runs.
 2. **Prerequisite P2** (heater controllability) gates Tier 3.1 and all temperature-controlled
-   experiments. Unresolved since `SPEC.md` §14 Q4.
+   experiments. Unresolved since `SPEC.md` §14 Q4 — the thermistor wizard's cold phase now
+   performs and records the test.
 3. **Prerequisite P1** (vial map) gates the meaning of every per-vial number here.
 4. **Stir tachometry equipment** — one inexpensive purchase, or a 240 fps phone, unblocks
    Tier 3.3.
@@ -1069,6 +1162,10 @@ resolvable — a threshold separation of 0.02 OD is meaningful on vial 9 and is 
    `CLAUDE.md` (~58 000), not documented. Check by reading an empty sleeve at LED 2200 and
    seeing where the value clips. It does not change any conclusion here, but it sets the real
    ceiling on the Tier 3.2 fit's upper asymptote.
+8. **The Tier 3 equilibrium gates are provisional** — ±2 counts of drift over 10 min (cold,
+   pack-relative) and 5 min (hot, per vial), and 5 counts per 10 min for the P2 heating test.
+   Replace them with the rig's measured behaviour after the first thermistor session, as the
+   blank SD limits are to be replaced after five runs.
 
 ---
 
