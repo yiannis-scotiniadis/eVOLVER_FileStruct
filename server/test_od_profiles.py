@@ -323,11 +323,13 @@ def test_readers_and_bundles_handle_schema_v2():
 def test_the_live_sensor_loop_logs_the_raw_counts():
     """End to end through app.py's loop: a new experiment's config asks for
     the dark read, and every OD row carries lit/dark counts."""
+    import threading
     import time
     import app as A
     from test_calibration_api import _experiment_body, _make_app, _state
     saved = (A.SENSOR_LOOP_INTERVAL_SECONDS, A.OD_INTERVAL_SECONDS)
     A.SENSOR_LOOP_INTERVAL_SECONDS = A.OD_INTERVAL_SECONDS = 0.05
+    threads_before = set(threading.enumerate())
     with tempfile.TemporaryDirectory() as tmp:
         try:
             flask_app = _make_app(Path(tmp))
@@ -349,5 +351,10 @@ def test_the_live_sensor_loop_logs_the_raw_counts():
             assert row["dark_adc"] != "" and row["dark_n_valid"] != "0"
             assert int(row["raw_adc"]) == round(float(row["lit_adc"]))
         finally:
-            A.SENSOR_LOOP_INTERVAL_SECONDS, A.OD_INTERVAL_SECONDS = saved
+            # Stop AND join this app's loop before the temp dir goes: at a
+            # 50 ms tick it is usually mid-write when the test ends.
             _state(flask_app).sensor_thread_stop.set()
+            for t in set(threading.enumerate()) - threads_before:
+                if t.name == "sensor-loop":
+                    t.join(timeout=5)
+            A.SENSOR_LOOP_INTERVAL_SECONDS, A.OD_INTERVAL_SECONDS = saved
