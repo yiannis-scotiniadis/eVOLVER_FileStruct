@@ -2257,6 +2257,9 @@ def create_app(use_mock: bool):
         offsets = [abs(v) for v in result["od_offset_removed"].values()]
         _emit_event({
             "type": "od_blank_committed",
+            # Routes the event to THIS run's events.csv (it is not logging
+            # yet: the blank is taken on a CREATED experiment).
+            "experiment": name,
             "name": name,
             "n_vials": len(result["c_run"]),
             "max_offset_removed": round(max(offsets), 3) if offsets else None,

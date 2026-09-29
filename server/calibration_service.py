@@ -560,9 +560,16 @@ class CalibrationStore:
         two installs land in the same second."""
         with self._lock:
             dt = _utc_now().replace(microsecond=0)
-            current = _parse_version(self._read_current().get(subsystem) or "")
-            if current is not None and dt <= current:
-                dt = current + timedelta(seconds=1)
+            # Past the newest stamp ON DISK, not just the current pointer:
+            # with per-organism OD profiles the current pointer is only one
+            # of several chains, and the Pi has no real-time clock, so a
+            # clock set back after a reboot must not interleave versions.
+            stamps = [_parse_version(p.stem)
+                      for p in self._subsystem_dir(subsystem).glob("*.json")]
+            stamps.append(_parse_version(self._read_current().get(subsystem) or ""))
+            newest = max((s for s in stamps if s is not None), default=None)
+            if newest is not None and dt <= newest:
+                dt = newest + timedelta(seconds=1)
             while self._version_path(subsystem, _version_stamp(dt)).exists():
                 dt += timedelta(seconds=1)
             return _version_stamp(dt)
@@ -577,7 +584,10 @@ class CalibrationStore:
         with self._lock:
             current = self._read_current()
             envelope = dict(envelope)
-            envelope.setdefault("supersedes", current.get(subsystem))
+            # make_envelope always writes the key (None), so setdefault never
+            # took effect and every version claimed to supersede nothing.
+            if envelope.get("supersedes") is None:
+                envelope["supersedes"] = current.get(subsystem)
             self._write_version_locked(subsystem, envelope)
             current[subsystem] = envelope["version"]
             self._write_current(current)

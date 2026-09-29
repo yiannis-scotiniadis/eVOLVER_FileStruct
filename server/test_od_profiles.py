@@ -1,0 +1,91 @@
+"""Tests for per-organism OD calibration profiles, the raw-ADC OD log, and
+the fixes that came with them.
+
+Organised by the build phases in the plan: store/log fixes (phase 0), the
+per-vial live curve (1), the OD CSV v2 schema (2), profiles in the store and
+the series (3), and the wiring through create/start/stop/resume (4). The
+post-hoc recalibration module has its own file, test_od_recalibrate.py.
+
+Run from the project root:
+    python -m pytest server/test_od_profiles.py
+"""
+
+from __future__ import annotations
+
+import csv
+import sys
+import tempfile
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from calibration_service import CalibrationStore, N_VIALS, make_envelope  # noqa: E402
+from data_logger import DataLogger  # noqa: E402
+
+REPO_CAL = Path(__file__).resolve().parent.parent / "calibration"
+
+
+def _rows(path: Path) -> list[list[str]]:
+    with path.open(newline="", encoding="utf-8") as f:
+        return list(csv.reader(f))
+
+
+# ---------------------------------------------------------------------------
+# Phase 0: existing bugs fixed in passing
+# ---------------------------------------------------------------------------
+
+def _od_env(version: str, c: float = 0.5) -> dict:
+    rows = np.vstack([np.full(N_VIALS, 10_000.0), np.full(N_VIALS, 100_000.0),
+                      np.full(N_VIALS, c), np.full(N_VIALS, -0.7)])
+    return make_envelope("od", operator="t", source="test", conditions={"n": 1},
+                         data={"rows": rows.tolist(), "dark_subtracted": False},
+                         version=version)
+
+
+def test_save_version_records_what_it_supersedes():
+    """make_envelope writes supersedes=None, so save_version's setdefault
+    never took effect: every version claimed to supersede nothing."""
+    with tempfile.TemporaryDirectory() as tmp:
+        store = CalibrationStore(Path(tmp) / "calibration")
+        store.save_version("od", _od_env("2026-01-01T000000Z"))
+        store.save_version("od", _od_env("2026-02-01T000000Z", c=0.4))
+        second = store.get_version("od", "2026-02-01T000000Z")
+        assert second["supersedes"] == "2026-01-01T000000Z"
+        assert store.get_version("od", "2026-01-01T000000Z")["supersedes"] is None
+
+
+def test_fresh_version_bumps_past_every_stamp_on_disk():
+    """Not just the current pointer: another chain's newer file, or a clock
+    set back after a reboot (the Pi has no RTC), must not interleave."""
+    with tempfile.TemporaryDirectory() as tmp:
+        store = CalibrationStore(Path(tmp) / "calibration")
+        store.save_version("od", _od_env("2026-01-01T000000Z"))
+        # A newer file that is NOT the current pointer.
+        store._write_version_locked("od", _od_env("2099-01-01T000000Z"))
+        assert store.fresh_version("od") == "2099-01-01T000001Z"
+
+
+def test_an_event_for_a_run_that_is_not_logging_goes_to_its_own_file_only():
+    """Before: an event naming a CREATED (not yet logging) experiment fell
+    through to 'every active run' and landed in OTHER runs' events.csv."""
+    with tempfile.TemporaryDirectory() as tmp:
+        dl = DataLogger(Path(tmp) / "experiments")
+        dl.create_experiment(name="running", mode="turbidostat", vials=[0])
+        dl.create_experiment(name="waiting", mode="turbidostat", vials=[1])
+        dl.activate_experiment("running")
+        ts = "2026-09-29T12:00:00+00:00"
+        assert dl.log_event(ts, "info", "lifecycle", "created", experiment="waiting",
+                            data={"experiment": "waiting", "organism": "E. coli"})
+        waiting = _rows(Path(tmp) / "experiments" / "waiting" / "events.csv")
+        running = _rows(Path(tmp) / "experiments" / "running" / "events.csv")
+        assert len(waiting) == 2 and waiting[1][1] == ""     # no clock before start
+        assert "E. coli" in waiting[1][6]
+        assert len(running) == 1                              # header only
+        # An experiment that does not exist is skipped, not broadcast.
+        assert dl.log_event(ts, "info", "x", "ghost", experiment="nope") is False
+        assert len(_rows(Path(tmp) / "experiments" / "running" / "events.csv")) == 1
+        # Machine-wide events still reach every active run.
+        assert dl.log_event(ts, "warning", "serial", "bus down")
+        assert len(_rows(Path(tmp) / "experiments" / "running" / "events.csv")) == 2

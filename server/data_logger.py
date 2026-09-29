@@ -727,27 +727,46 @@ class DataLogger:
 
         Routing (PARALLEL_EXPERIMENTS.md T6), first match wins:
 
-        1. ``experiment`` names an active experiment -> that one only. Every
-           engine alert and event carries its experiment's name.
+        1. ``experiment`` names an experiment -> that one only, whether or
+           not it is logging: a CREATED run (not started yet) or a just
+           stopped one still owns its ``events.csv``, and its events -- the
+           ``created`` event with its organism, a blank commit -- are part of
+           ITS record. They are never broadcast to other runs (before this,
+           an event naming a not-yet-logging run fell through to rule 3 and
+           landed in every other running experiment's file). An experiment
+           with no directory is skipped.
         2. ``vial`` belongs to an active experiment -> its owner.
         3. Otherwise -- a machine-wide event (bus, disk, watchdog, emergency
            stop, calibration install) or one about a vial no run owns (a
            manual pump on a free sleeve) -- every active experiment, because
            it is part of each run's story.
 
-        Returns True if any row was written, False if skipped (nothing active).
+        Returns True if any row was written, False if skipped.
 
         ``data`` is serialised to the ``data_json`` column; an unserialisable
         value degrades to its ``repr`` rather than losing the whole row.
+        ``elapsed_hours`` is blank for a run that has not started.
         """
         with self._lock:
-            if not self._active:
-                return False
-            if experiment is not None and experiment in self._active:
-                targets = [self._active[experiment]]
+            # (directory, run-or-None): None = not logging, no elapsed clock.
+            targets: list[tuple[Path, Optional[_ActiveRun]]]
+            if experiment is not None:
+                run = self._active.get(experiment)
+                if run is not None:
+                    targets = [(run.dir, run)]
+                else:
+                    name = str(experiment)
+                    exp_dir = self.experiments_root / name
+                    if (Path(name).name != name
+                            or not (exp_dir / "config.json").is_file()):
+                        return False
+                    targets = [(exp_dir, None)]
             else:
+                if not self._active:
+                    return False
                 owner = self._owner_locked(int(vial)) if vial is not None else None
-                targets = [owner] if owner is not None else list(self._active.values())
+                runs = [owner] if owner is not None else list(self._active.values())
+                targets = [(r.dir, r) for r in runs]
             if data:
                 try:
                     data_json = json.dumps(data, sort_keys=True, default=str)
@@ -755,15 +774,16 @@ class DataLogger:
                     data_json = json.dumps({"repr": repr(data)})
             else:
                 data_json = ""
-            for run in targets:
-                path = run.dir / "events.csv"
+            for run_dir, run in targets:
+                path = run_dir / "events.csv"
                 if not path.exists():
                     self._init_csv(path, EVENT_HEADER)
                 self._append_row(
                     path,
                     [
                         timestamp_iso,
-                        f"{self._elapsed_hours(run, timestamp_iso):.4f}",
+                        (f"{self._elapsed_hours(run, timestamp_iso):.4f}"
+                         if run is not None else ""),
                         str(level),
                         str(category),
                         "" if vial is None else int(vial),
