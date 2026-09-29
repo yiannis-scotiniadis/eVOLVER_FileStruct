@@ -89,3 +89,136 @@ def test_an_event_for_a_run_that_is_not_logging_goes_to_its_own_file_only():
         # Machine-wide events still reach every active run.
         assert dl.log_event(ts, "warning", "serial", "bus down")
         assert len(_rows(Path(tmp) / "experiments" / "running" / "events.csv")) == 2
+
+
+# ---------------------------------------------------------------------------
+# Phase 1: the live curve is composed per vial
+# ---------------------------------------------------------------------------
+
+import math  # noqa: E402
+
+import od_curve_fit as F  # noqa: E402
+from mock_serial_manager import MockSerialManager  # noqa: E402
+from test_serial_manager import FakeSerial, fresh  # noqa: E402
+
+LEGACY_OD = np.genfromtxt(REPO_CAL / "OD_cal.txt", delimiter=",")
+DARK = 1200.0
+
+
+def _turb(values) -> bytes:
+    return ("turb" + ",".join(str(int(v)) for v in values) + ",end\n").encode()
+
+
+def _ds_shift(rows: np.ndarray, dark: float = DARK) -> np.ndarray:
+    """The same curve, re-expressed on dark-subtracted signal: exact."""
+    out = np.array(rows, dtype=float)
+    out[0] -= dark
+    out[1] -= dark
+    return out
+
+
+def test_one_read_serves_a_dark_subtracted_profile_and_the_legacy_curve():
+    """Vials 0-1 run an organism profile fit on dark-subtracted signal, the
+    rest the 2016 curve: one dark read + one lit read, subtracted per vial."""
+    sm, fake = fresh()
+    sm.assign_od_curve([0, 1], _ds_shift(LEGACY_OD), dark_subtracted=True)
+    assert sm.od_dark_subtracted_by_vial[:3] == [True, True, False]
+    fake.read_queue = [_turb([DARK] * N_VIALS), _turb([50000] * N_VIALS)]
+    r = sm.read_od_enhanced(2125, n_samples=1, n_dark=1, dark_subtract=None)
+    assert fake.write_log[0].startswith(b"we0,")          # dark first
+    assert fake.write_log[1].startswith(b"we2125,")       # LED left on
+    assert r.raw[0] == 50000 - DARK and r.raw[5] == 50000
+    assert r.dark_subtracted[:2] == [True, True] and r.dark_subtracted[5] is False
+    assert r.dark_used[0] == DARK and math.isnan(r.dark_used[5])
+    assert r.lit[0] == r.lit[5] == 50000 and r.led_power == 2125
+    # Vial 0's shifted curve on lit - dark reads exactly what its own 2016
+    # curve reads on lit; vial 5 is read by its 2016 curve directly.
+    assert abs(r.calibrated[0] - F.od_from_signal(50000.0, *LEGACY_OD[:, 0])) < 1e-9
+    assert abs(r.calibrated[5] - F.od_from_signal(50000.0, *LEGACY_OD[:, 5])) < 1e-9
+
+
+def test_explicit_dark_subtraction_on_a_raw_signal_vial_is_refused():
+    sm, _fake = fresh()
+    sm.assign_od_curve([0], _ds_shift(LEGACY_OD), dark_subtracted=True)
+    mask = [False] * N_VIALS
+    mask[0] = mask[3] = True
+    try:
+        sm.read_od_enhanced(2125, n_samples=1, n_dark=1, dark_subtract=mask)
+    except ValueError as exc:
+        assert "vials [3]" in str(exc)
+    else:
+        raise AssertionError("dark subtraction on a raw-signal curve was allowed")
+
+
+def test_a_dark_subtracted_vial_with_no_dark_at_all_is_dropped_not_zeroed():
+    """Before: subtracted 0 and called it "ok" -- a ~1200-count error."""
+    sm, fake = fresh()
+    sm.assign_od_curve([0], _ds_shift(LEGACY_OD), dark_subtracted=True)
+    fake.read_queue = [b"", _turb([50000] * N_VIALS)]     # the dark read drops
+    r = sm.read_od_enhanced(2125, n_samples=1, n_dark=1, dark_subtract=None)
+    assert r.flags[0] == "dropped" and math.isnan(r.calibrated[0])
+    assert r.lit[0] == 50000                              # the count is kept
+    assert r.flags[5] == "ok"                             # legacy vial unaffected
+
+
+def test_record_dark_logs_the_dark_without_subtracting_it():
+    sm, fake = fresh()
+    fake.read_queue = [_turb([DARK] * N_VIALS), _turb([50000] * N_VIALS)]
+    r = sm.read_od_enhanced(2125, n_samples=1, n_dark=1, dark_subtract=None,
+                            record_dark=True)
+    assert r.dark[0] == DARK and r.dark_n_valid[0] == 1
+    assert r.raw[0] == 50000 and math.isnan(r.dark_used[0])
+    assert r.dark_subtracted[0] is False
+    # Without record_dark (and no dark-subtracted vial) no dark read happens.
+    fake.read_queue = [_turb([50000] * N_VIALS)]
+    fake.write_log.clear()
+    r = sm.read_od_enhanced(2125, n_samples=1, n_dark=1, dark_subtract=None)
+    assert len(fake.write_log) == 1 and math.isnan(r.dark[0])
+
+
+def test_assign_release_and_blank_restore_per_vial():
+    sm, _fake = fresh()
+    profile = LEGACY_OD.copy()
+    profile[2] -= 0.3
+    sm.assign_od_curve([2], profile, dark_subtracted=False)
+    sm.apply_od_blank({2: -1.5, 7: -0.9})
+    # Clearing the blank restores the ASSIGNED curve's row 2, not the default.
+    sm.clear_od_blank([2])
+    assert sm.od_cal[2, 2] == profile[2, 2]
+    assert sm.od_cal[2, 7] == -0.9                         # other run untouched
+    # Assigning over a blanked vial replaces the whole column.
+    sm.assign_od_curve([7], profile, dark_subtracted=True)
+    assert sm.od_cal[2, 7] == profile[2, 7] and sm.od_dark_subtracted_by_vial[7]
+    sm.release_od_curve([2, 7])
+    assert np.array_equal(sm.od_cal[:, [2, 7]], LEGACY_OD[:, [2, 7]])
+    assert sm.od_dark_subtracted_by_vial[7] is False
+    try:
+        sm.assign_od_curve([16], profile, dark_subtracted=False)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("vial 16 accepted")
+
+
+def test_mock_truth_mode_shows_a_vial_on_the_wrong_organisms_curve():
+    m = MockSerialManager(seed=3)
+    m.load_calibration(str(REPO_CAL / "temp_calibration.txt"),
+                       str(REPO_CAL / "OD_cal.txt"))
+    truth = _ds_shift(LEGACY_OD)
+    truth[2] -= 0.4                                       # this organism's curve
+    m.set_true_od_curve(truth, dark_counts=DARK)
+    m.assign_od_curve([0, 1, 2, 3], truth, dark_subtracted=True)
+    m.set_true_od(range(N_VIALS), 0.8)
+    r = m.read_od_enhanced(2125, n_samples=5, dark_subtract=None, record_dark=True)
+    for v in (0, 1, 2, 3):                                # the right curve
+        assert abs(r.calibrated[v] - 0.8) < 1e-9, (v, r.calibrated[v])
+    assert abs(r.calibrated[8] - 0.8) > 0.05              # the wrong curve shows
+    assert r.dark[8] == DARK and r.dark_subtracted[8] is False
+    # Default mode (no truth): true OD reported, raw fields synthesized.
+    m2 = MockSerialManager(seed=4)
+    m2.load_calibration(str(REPO_CAL / "temp_calibration.txt"),
+                        str(REPO_CAL / "OD_cal.txt"))
+    m2.assign_od_curve([0], _ds_shift(LEGACY_OD), dark_subtracted=True)
+    r2 = m2.read_od_enhanced(2125, n_samples=3, dark_subtract=None)
+    assert r2.dark_subtracted[0] and r2.lit[0] == r2.raw[0] + r2.dark_used[0]
+    assert abs(F.od_from_signal(r2.raw[0], *m2.od_cal[:, 0]) - r2.calibrated[0]) < 1e-6

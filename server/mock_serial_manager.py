@@ -52,9 +52,11 @@ from serial_manager import (
     OD_DEFAULT_N_SAMPLES,
     OD_LED_MAX,
     ODReading,
+    OdCurveMixin,
     SerialManager,
     apply_floor_override,
     led_power_vector,
+    od_reading_from_samples,
 )
 
 
@@ -147,7 +149,7 @@ def growth_rate_factor(temp_C) -> np.ndarray:
     return np.clip(np.minimum(rising, falling), 0.0, 1.0)
 
 
-class MockSerialManager:
+class MockSerialManager(OdCurveMixin):
     def __init__(
         self,
         # TIME MULTIPLIERS HERE#
@@ -176,9 +178,8 @@ class MockSerialManager:
         self.volume_ml = DEFAULT_VOLUME_ML
 
         self.temp_cal: Optional[np.ndarray] = None
-        self.od_cal: Optional[np.ndarray] = None
-        self._od_cal_base: Optional[np.ndarray] = None
-        self._od_cal_dark_subtracted = False
+        # The OD curve, per vial -- same state and methods as SerialManager.
+        self._init_od_curve_state()
         # Synthetic ADC model for collect_od_raw (the sim has no real ADC):
         # dark floor + read noise, in counts.
         self.mock_dark_counts = 1200.0
@@ -225,16 +226,9 @@ class MockSerialManager:
         dark_subtracted = SerialManager._read_cal_dark_subtracted(od_cal_path)
         with self._lock:
             self.temp_cal = temp_cal
-            self.od_cal = od_cal
-            self._od_cal_base = od_cal.copy()
-            self._od_cal_dark_subtracted = dark_subtracted
+            self._set_default_od_curve_locked(od_cal, dark_subtracted)
             if self._true_temp_cal is None:
                 self._true_temp_cal = temp_cal.copy()
-
-    @property
-    def od_cal_dark_subtracted(self) -> bool:
-        """Parity with SerialManager.od_cal_dark_subtracted."""
-        return self._od_cal_dark_subtracted
 
     # ------------------------------------------------------------------
     # Ground-truth controls (tests of the Tier 3 wizards)
@@ -278,37 +272,6 @@ class MockSerialManager:
                 self.mock_dark_counts = np.broadcast_to(
                     np.asarray(dark_counts, dtype=float), (N_VIALS,)
                 ).copy()
-
-    def apply_od_blank(self, c_run_by_vial: dict) -> None:
-        """Parity with SerialManager.apply_od_blank. The mock's calibrated
-        reads come from the simulation's OD state directly, so this only
-        affects the stored calibration (raw inversion), not read values."""
-        with self._lock:
-            if self.od_cal is None:
-                raise RuntimeError("apply_od_blank requires a loaded OD calibration")
-            od_cal = self.od_cal.copy()
-            for vial, c_run in c_run_by_vial.items():
-                v = int(vial)
-                if not (0 <= v < N_VIALS):
-                    raise ValueError(f"vial must be in 0..{N_VIALS - 1}, got {v}")
-                od_cal[2, v] = float(c_run)
-            self.od_cal = od_cal
-
-    def clear_od_blank(self, vials=None) -> None:
-        """Parity with SerialManager.clear_od_blank (all vials, or only
-        ``vials``)."""
-        with self._lock:
-            if self._od_cal_base is None:
-                return
-            if vials is None:
-                self.od_cal = self._od_cal_base.copy()
-                return
-            od_cal = self.od_cal.copy()
-            for vial in vials:
-                v = int(vial)
-                if 0 <= v < N_VIALS:
-                    od_cal[2, v] = self._od_cal_base[2, v]
-            self.od_cal = od_cal
 
     # Calibration helpers retained for the round-trip test and any
     # external utility that wants to convert between physical units and
@@ -487,47 +450,66 @@ class MockSerialManager:
         led_power: int = 2125,
         *,
         n_samples: int = OD_DEFAULT_N_SAMPLES,
-        dark_subtract: bool = False,
+        dark_subtract=False,
         n_dark: int = OD_DEFAULT_N_DARK,
         agg: str = OD_AGG_DEFAULT,
+        record_dark: bool = False,
     ) -> ODReading:
-        """Mock parity for SerialManager.read_od_enhanced.
+        """Mock parity for SerialManager.read_od_enhanced: same dark plan and
+        guard (per vial), same fields, and the sim advances **exactly once**
+        (never ``n_samples`` times, which would over-run sim time).
 
-        The simulation works in OD600 directly, so there is no raw-ADC noise to
-        average — the sim advances **exactly once** (never ``n_samples`` times,
-        which would over-run sim time) and the structured fields are synthesized
-        to mirror the real reader's shape and conventions. ``raw`` is the
-        dark-subtracted signal recovered by inverting the calibration (NaN when
-        uncalibrated); the per-vial range guard mirrors the real reader so the
-        ``out_of_range`` path stays exercisable against a calibration."""
-        if dark_subtract and self.od_cal is not None \
-                and not self._od_cal_dark_subtracted:
-            # Parity with SerialManager: dark subtraction against a curve fit
-            # on non-dark-subtracted signal is a hard error (SPEC §19.2).
-            raise ValueError(
-                "dark_subtract=True requires an OD calibration marked "
-                "dark_subtracted in OD_cal.meta.json; the loaded "
-                "calibration is not"
-            )
+        Two modes:
+
+        - **default** -- the simulation's true OD is reported directly, and
+          the raw fields are synthesized by inverting each vial's composed
+          curve, i.e. what the real reader would have fed that curve (plus
+          the dark floor on a dark-subtracted vial). The historical mock.
+        - **truth** (``set_true_od_curve``) -- the photodiode sees
+          ``dark + S_true(OD)``, and that goes through the SAME conversion as
+          the real reader (``od_reading_from_samples``). A vial given the
+          wrong organism's curve then reads the wrong OD, as it would on
+          the rig."""
+        led = int(np.clip(led_power, 0, OD_LED_MAX))
         with self._lock:
+            mask, n_dark = self._resolve_dark_plan_locked(
+                dark_subtract, max(0, int(n_dark))
+            )
+            take_dark = n_dark > 0 and bool(mask.any() or record_dark)
             self._advance()
             n = max(1, int(n_samples))
             od = np.asarray(self.od_abs, dtype=float)
+            dark_counts = np.broadcast_to(
+                np.asarray(self.mock_dark_counts, dtype=float), (N_VIALS,)
+            ).copy()
+            dark = dark_counts if take_dark else np.full(N_VIALS, np.nan)
+            dark_n_valid = np.full(N_VIALS, n_dark if take_dark else 0)
+            n_valid = np.full(N_VIALS, n)
+
+            if self._true_od_rows is not None:
+                a, b, c, d = self._true_od_rows
+                lit = dark_counts + a + (b - a) / (1.0 + np.power(10.0, d * (c - od)))
+                reading, self._last_good_dark = od_reading_from_samples(
+                    lit, n_valid, dark, dark_n_valid, mask,
+                    self.od_cal, self._last_good_dark, led,
+                )
+                return reading
+
             if self.od_cal is not None:
-                raw = self._od_abs_to_raw(od)
+                signal = self._od_abs_to_raw(od)
                 mn, mx = self.od_cal[0], self.od_cal[1]
-                in_domain = (raw > mn) & (raw < mx)
+                in_domain = (signal > mn) & (signal < mx)
             else:
-                raw = np.full(N_VIALS, np.nan)
+                signal = np.full(N_VIALS, np.nan)
                 in_domain = np.ones(N_VIALS, dtype=bool)
-            dark = np.zeros(N_VIALS) if dark_subtract else np.full(N_VIALS, np.nan)
+            if take_dark:
+                self._last_good_dark = dark_counts.copy()
+            lit = np.where(mask, signal + dark_counts, signal)
+            dark_used = np.where(mask, dark_counts, np.nan)
 
             calibrated: list[float] = []
-            raw_out: list[float] = []
             flags: list[str] = []
             for v in range(N_VIALS):
-                raw_v = float(raw[v]) if not np.isnan(raw[v]) else float("nan")
-                raw_out.append(raw_v)
                 if in_domain[v]:
                     flags.append("ok")
                     calibrated.append(float(od[v]))
@@ -536,12 +518,15 @@ class MockSerialManager:
                     calibrated.append(float("nan"))
             return ODReading(
                 calibrated=calibrated,
-                raw=raw_out,
-                dark=[
-                    float(d) if not np.isnan(d) else float("nan") for d in dark
-                ],
-                n_valid=[n] * N_VIALS,
+                raw=[float(x) for x in signal],
+                dark=[float(x) for x in dark],
+                n_valid=[int(x) for x in n_valid],
                 flags=flags,
+                lit=[float(x) for x in lit],
+                dark_used=[float(x) for x in dark_used],
+                dark_n_valid=[int(x) for x in dark_n_valid],
+                dark_subtracted=[bool(x) for x in mask],
+                led_power=led,
             )
 
     # ------------------------------------------------------------------

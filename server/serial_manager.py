@@ -137,12 +137,23 @@ class ODReading:
 
     - ``calibrated`` — OD600; ``NaN`` when the vial was ``dropped`` or
       ``out_of_range``.
-    - ``raw`` — aggregated, **dark-subtracted** photodiode signal (the value
-      actually fed to the calibration); ``NaN`` when dropped.
-    - ``dark`` — aggregated LED-off reading; ``NaN`` when dark subtraction is
-      off.
+    - ``raw`` — the signal actually fed to the calibration: LED-on, minus
+      the dark for a vial whose curve is dark-subtracted; ``NaN`` when
+      dropped.
+    - ``dark`` — this cycle's aggregated LED-off reading; ``NaN`` when no
+      dark read was taken, or it dropped.
     - ``n_valid`` — surviving samples per vial after NaN/garble rejection.
     - ``flags`` — per vial, one of ``"ok" | "out_of_range" | "dropped"``.
+
+    And, for re-applying a better curve after the fact (per-organism OD
+    profiles), the counts before any interpretation:
+
+    - ``lit`` — aggregated LED-on reading.
+    - ``dark_used`` — the dark actually subtracted (this cycle's, or the
+      vial's last good one if it dropped); ``NaN`` where nothing was.
+    - ``dark_n_valid`` — surviving dark samples per vial.
+    - ``dark_subtracted`` — per vial, whether ``raw = lit - dark_used``.
+    - ``led_power`` — the LED power of the lit reads.
     """
 
     calibrated: list[float]
@@ -150,12 +161,254 @@ class ODReading:
     dark: list[float]
     n_valid: list[int]
     flags: list[str]
+    lit: Optional[list[float]] = None
+    dark_used: Optional[list[float]] = None
+    dark_n_valid: Optional[list[int]] = None
+    dark_subtracted: Optional[list[bool]] = None
+    led_power: Optional[int] = None
 
 
 log = logging.getLogger(__name__)
 
 
-class SerialManager:
+def od_reading_from_samples(
+    lit,
+    lit_n_valid,
+    dark,
+    dark_n_valid,
+    mask,
+    od_cal: Optional[np.ndarray],
+    last_good_dark,
+    led_power: int,
+) -> tuple[ODReading, np.ndarray]:
+    """One acquisition's aggregated counts -> an :class:`ODReading`, per
+    vial. Pure; shared by :class:`SerialManager` and the mock so both apply
+    the same dark rule, range guard and flags.
+
+    ``mask[v]`` says vial ``v``'s curve wants dark-subtracted signal. Its
+    dark is this cycle's reading, else its last good one; a masked vial
+    with NEITHER is ``dropped`` -- subtracting 0 would feed a dark-
+    subtracted curve a signal ~1200 counts high and call it "ok".
+    ``od_cal`` is the composed per-vial curve (``None`` = raw passthrough).
+
+    Returns ``(reading, updated last_good_dark)``."""
+    lit = np.asarray(lit, dtype=float)
+    lit_n_valid = np.asarray(lit_n_valid, dtype=int)
+    dark = np.asarray(dark, dtype=float)
+    dark_n_valid = np.asarray(dark_n_valid, dtype=int)
+    mask = np.asarray(mask, dtype=bool)
+    last_good_dark = np.asarray(last_good_dark, dtype=float)
+
+    good_dark = np.isfinite(dark)
+    new_last_good = np.where(good_dark, dark, last_good_dark)
+    dark_used = np.where(mask, np.where(good_dark, dark, last_good_dark), np.nan)
+    signal = np.where(mask, lit - dark_used, lit)
+
+    if od_cal is not None:
+        a, b, c, d = od_cal[0], od_cal[1], od_cal[2], od_cal[3]
+        with np.errstate(invalid="ignore", divide="ignore"):
+            in_domain = (signal > a) & (signal < b)
+            od_all = c - np.log10((b - a) / (signal - a) - 1.0) / d
+    else:
+        in_domain = np.ones(N_VIALS, dtype=bool)
+        od_all = signal  # no calibration -> raw passthrough
+
+    calibrated: list[float] = []
+    raw_out: list[float] = []
+    flags: list[str] = []
+    for v in range(N_VIALS):
+        no_signal = lit_n_valid[v] <= 0 or not np.isfinite(lit[v])
+        no_dark = bool(mask[v]) and not np.isfinite(dark_used[v])
+        if no_signal or no_dark:
+            flags.append("dropped")
+            calibrated.append(float("nan"))
+            raw_out.append(float("nan"))
+            continue
+        raw_out.append(float(signal[v]))
+        if od_cal is not None and not in_domain[v]:
+            flags.append("out_of_range")
+            calibrated.append(float("nan"))
+            continue
+        flags.append("ok")
+        calibrated.append(float(od_all[v]))
+
+    reading = ODReading(
+        calibrated=calibrated,
+        raw=raw_out,
+        dark=[float(x) for x in dark],
+        n_valid=[int(x) for x in lit_n_valid],
+        flags=flags,
+        lit=[float(x) for x in lit],
+        dark_used=[float(x) for x in dark_used],
+        dark_n_valid=[int(x) for x in dark_n_valid],
+        dark_subtracted=[bool(x) for x in mask],
+        led_power=int(led_power),
+    )
+    return reading, new_last_good
+
+
+class OdCurveMixin:
+    """The live OD curve, composed PER VIAL (per-organism OD profiles).
+
+    ``_od_cal_default`` / ``_od_cal_dark_subtracted`` are the machine's
+    default curve (``OD_cal.txt`` and its sidecar). An experiment's organism
+    profile is written over ITS vials' columns by :meth:`assign_od_curve`
+    and taken back by :meth:`release_od_curve`. ``_od_cal_base`` is the
+    composed curve before any per-run blank; ``od_cal`` is that plus the
+    blank's row-2 re-anchors. One OD read serves all sixteen vials, which
+    is why an E. coli run and a Pichia run can only share a tick this way --
+    and why dark subtraction is per vial too (``_od_ds_by_vial``).
+
+    Shared by :class:`SerialManager` and the mock; needs ``self._lock``."""
+
+    def _init_od_curve_state(self) -> None:
+        self.od_cal: Optional[np.ndarray] = None
+        self._od_cal_default: Optional[np.ndarray] = None
+        self._od_cal_base: Optional[np.ndarray] = None
+        # The DEFAULT curve's flag (OD_cal.meta.json); per vial below.
+        self._od_cal_dark_subtracted = False
+        self._od_ds_by_vial = np.zeros(N_VIALS, dtype=bool)
+        # Per-vial last good dark reading: a dropped dark read in a dark-
+        # subtracted acquisition falls back to it (see od_reading_from_samples).
+        self._last_good_dark = np.full(N_VIALS, np.nan)
+
+    def _set_default_od_curve_locked(self, od_cal: np.ndarray, dark_subtracted: bool) -> None:
+        """(Re)load the default curve. Every vial reverts to it: any assigned
+        profile curve and any per-run blank are gone."""
+        self._od_cal_default = np.array(od_cal, dtype=float)
+        self._od_cal_base = self._od_cal_default.copy()
+        self.od_cal = self._od_cal_default.copy()
+        self._od_cal_dark_subtracted = bool(dark_subtracted)
+        self._od_ds_by_vial = np.full(N_VIALS, bool(dark_subtracted))
+
+    @property
+    def od_cal_dark_subtracted(self) -> bool:
+        """True when the DEFAULT OD curve's sidecar records dark-subtracted
+        signal. A vial running an organism profile has its own flag:
+        :attr:`od_dark_subtracted_by_vial`."""
+        return self._od_cal_dark_subtracted
+
+    @property
+    def od_dark_subtracted_by_vial(self) -> list[bool]:
+        return [bool(x) for x in self._od_ds_by_vial]
+
+    @staticmethod
+    def _check_vials(vials) -> list[int]:
+        out = []
+        for vial in vials:
+            v = int(vial)
+            if not (0 <= v < N_VIALS):
+                raise ValueError(f"vial must be in 0..{N_VIALS - 1}, got {v}")
+            out.append(v)
+        return out
+
+    def assign_od_curve(self, vials, rows, dark_subtracted: bool) -> None:
+        """Give ``vials`` the columns of ``rows`` (a 4x16 curve -- an
+        organism profile) and its dark-subtraction flag. Replaces those
+        vials' curve AND any blank on them; other vials are untouched."""
+        rows = np.asarray(rows, dtype=float)
+        if rows.shape != (4, N_VIALS):
+            raise ValueError(f"rows shape {rows.shape}, expected (4, {N_VIALS})")
+        vials = self._check_vials(vials)
+        with self._lock:
+            if self._od_cal_base is None:
+                raise RuntimeError("assign_od_curve requires a loaded OD calibration")
+            base = self._od_cal_base.copy()
+            od_cal = self.od_cal.copy()
+            ds = self._od_ds_by_vial.copy()
+            for v in vials:
+                base[:, v] = rows[:, v]
+                od_cal[:, v] = rows[:, v]
+                ds[v] = bool(dark_subtracted)
+            self._od_cal_base, self.od_cal, self._od_ds_by_vial = base, od_cal, ds
+
+    def release_od_curve(self, vials) -> None:
+        """Return ``vials`` to the default curve (and drop their blank)."""
+        vials = self._check_vials(vials)
+        with self._lock:
+            if self._od_cal_default is None:
+                return
+            base = self._od_cal_base.copy()
+            od_cal = self.od_cal.copy()
+            ds = self._od_ds_by_vial.copy()
+            for v in vials:
+                base[:, v] = self._od_cal_default[:, v]
+                od_cal[:, v] = self._od_cal_default[:, v]
+                ds[v] = self._od_cal_dark_subtracted
+            self._od_cal_base, self.od_cal, self._od_ds_by_vial = base, od_cal, ds
+
+    def apply_od_blank(self, c_run_by_vial: dict) -> None:
+        """Apply a per-run OD blank re-anchor (CALIBRATION_PROTOCOL §5.4 /
+        §10.1) to the in-memory calibration: set row 2 (inflection OD) to
+        ``c_run`` for each given vial. Rows 0, 1 and 3 are never touched, and
+        no calibration file is modified — the persisted artefact is the run's
+        ``od_blank.json``. Idempotent per vial; vials not listed keep their
+        current row-2 value. ``clear_od_blank`` restores the vial's curve."""
+        with self._lock:
+            if self.od_cal is None:
+                raise RuntimeError("apply_od_blank requires a loaded OD calibration")
+            od_cal = self.od_cal.copy()
+            for vial, c_run in c_run_by_vial.items():
+                v = self._check_vials([vial])[0]
+                od_cal[2, v] = float(c_run)
+            self.od_cal = od_cal
+
+    def clear_od_blank(self, vials=None) -> None:
+        """Restore row 2 of the vial's curve before any blank -- the curve
+        ASSIGNED to it (its organism profile), not the default -- for every
+        vial, or only ``vials``. No-op without a calibration.
+
+        Per-vial because a per-run blank belongs to one run: with parallel
+        experiments, stopping one must restore ITS vials' row 2 and leave the
+        other run's re-anchor alone, or that run's OD silently reverts to the
+        offset curve mid-experiment."""
+        with self._lock:
+            if self._od_cal_base is None:
+                return
+            if vials is None:
+                self.od_cal = self._od_cal_base.copy()
+                return
+            od_cal = self.od_cal.copy()
+            for v in self._check_vials(vials):
+                od_cal[2, v] = self._od_cal_base[2, v]
+            self.od_cal = od_cal
+
+    def _resolve_dark_plan_locked(self, dark_subtract, n_dark: int) -> tuple[np.ndarray, int]:
+        """``(mask, n_dark)`` for one acquisition.
+
+        ``dark_subtract``: ``None`` = auto, each vial as its curve wants
+        (a dark read is then forced when any vial needs one); a bool or a
+        16-list = explicit, and asking for dark subtraction on a vial whose
+        curve was fit on raw signal is a hard error (SPEC §19.2 /
+        CALIBRATION_PROTOCOL §13) -- silently wrong OD otherwise. An
+        explicit request with ``n_dark == 0`` subtracts nothing (there is
+        no dark to subtract), as before per-vial curves."""
+        if dark_subtract is None:
+            mask = self._od_ds_by_vial.copy()
+            if mask.any():
+                n_dark = max(1, n_dark)
+            return mask, n_dark
+        if isinstance(dark_subtract, (list, tuple, np.ndarray)):
+            mask = np.asarray(dark_subtract, dtype=bool)
+            if mask.shape != (N_VIALS,):
+                raise ValueError(f"dark_subtract list must have {N_VIALS} entries")
+        else:
+            mask = np.full(N_VIALS, bool(dark_subtract))
+        if n_dark <= 0:
+            return np.zeros(N_VIALS, dtype=bool), n_dark
+        if self.od_cal is not None:
+            bad = np.flatnonzero(mask & ~self._od_ds_by_vial)
+            if bad.size:
+                raise ValueError(
+                    "dark_subtract=True requires an OD calibration marked "
+                    "dark_subtracted in OD_cal.meta.json; the loaded "
+                    "calibration is not"
+                    + ("" if bad.size == N_VIALS else f" on vials {bad.tolist()}")
+                )
+        return mask, n_dark
+
+
+class SerialManager(OdCurveMixin):
     def __init__(
         self,
         port: str = DEFAULT_PORT,
@@ -188,21 +441,10 @@ class SerialManager:
         # (NaN until the first, or for a dropped read). The public reads
         # return °C; the Tier 3 thermistor wizard needs the counts themselves.
         self.last_temperature_raw = np.full(N_VIALS, np.nan)
-        # Per-vial last good dark reading, so a dropped dark read in a
-        # dark-subtracted acquisition falls back to it instead of to 0 (which
-        # would bias that vial's signal by the whole dark offset).
-        self._last_good_dark = np.full(N_VIALS, np.nan)
 
         self.temp_cal: Optional[np.ndarray] = None
-        self.od_cal: Optional[np.ndarray] = None
-        # Pristine copy of the loaded OD calibration, before any per-run
-        # blank re-anchor (apply_od_blank). clear_od_blank restores from it.
-        self._od_cal_base: Optional[np.ndarray] = None
-        # True when the loaded OD calibration was measured on dark-subtracted
-        # signal (LED-on - LED-off), per the OD_cal.meta.json sidecar. The
-        # enhanced reader REFUSES dark subtraction against a calibration that
-        # is NOT dark-subtracted (would yield silently wrong OD).
-        self._od_cal_dark_subtracted = False
+        # The OD curve, per vial: default + organism profiles + blanks.
+        self._init_od_curve_state()
 
     def close(self) -> None:
         with self._lock:
@@ -232,55 +474,7 @@ class SerialManager:
         dark_subtracted = self._read_cal_dark_subtracted(od_cal_path)
         with self._lock:
             self.temp_cal = temp_cal
-            self.od_cal = od_cal
-            self._od_cal_base = od_cal.copy()
-            self._od_cal_dark_subtracted = dark_subtracted
-
-    @property
-    def od_cal_dark_subtracted(self) -> bool:
-        """True when the loaded OD calibration's sidecar records that it was
-        fit on dark-subtracted signal. Gates ``dark_subtract`` everywhere."""
-        return self._od_cal_dark_subtracted
-
-    def apply_od_blank(self, c_run_by_vial: dict) -> None:
-        """Apply a per-run OD blank re-anchor (CALIBRATION_PROTOCOL §5.4 /
-        §10.1) to the in-memory calibration: set row 2 (inflection OD) to
-        ``c_run`` for each given vial. Rows 0, 1 and 3 are never touched, and
-        no calibration file is modified — the persisted artefact is the run's
-        ``od_blank.json``. Idempotent per vial; vials not listed keep their
-        current row-2 value. ``clear_od_blank`` restores the pristine curve."""
-        with self._lock:
-            if self.od_cal is None:
-                raise RuntimeError("apply_od_blank requires a loaded OD calibration")
-            od_cal = self.od_cal.copy()
-            for vial, c_run in c_run_by_vial.items():
-                v = int(vial)
-                if not (0 <= v < N_VIALS):
-                    raise ValueError(f"vial must be in 0..{N_VIALS - 1}, got {v}")
-                od_cal[2, v] = float(c_run)
-            self.od_cal = od_cal
-
-    def clear_od_blank(self, vials=None) -> None:
-        """Restore the pristine (pre-blank) OD calibration -- for every vial,
-        or only ``vials``. No-op when no calibration is loaded or no blank
-        was ever applied.
-
-        Per-vial because a per-run blank belongs to one run: with parallel
-        experiments, stopping one must restore ITS vials' row 2 and leave the
-        other run's re-anchor alone, or that run's OD silently reverts to the
-        offset curve mid-experiment."""
-        with self._lock:
-            if self._od_cal_base is None:
-                return
-            if vials is None:
-                self.od_cal = self._od_cal_base.copy()
-                return
-            od_cal = self.od_cal.copy()
-            for vial in vials:
-                v = int(vial)
-                if 0 <= v < N_VIALS:
-                    od_cal[2, v] = self._od_cal_base[2, v]
-            self.od_cal = od_cal
+            self._set_default_od_curve_locked(od_cal, dark_subtracted)
 
     @staticmethod
     def _read_cal_dark_subtracted(od_cal_path: str) -> bool:
@@ -470,109 +664,62 @@ class SerialManager:
         led_power: int = 2125,
         *,
         n_samples: int = OD_DEFAULT_N_SAMPLES,
-        dark_subtract: bool = False,
+        dark_subtract=False,
         n_dark: int = OD_DEFAULT_N_DARK,
         agg: str = OD_AGG_DEFAULT,
+        record_dark: bool = False,
     ) -> ODReading:
-        """Acquire one OD cycle with averaging, optional dark subtraction, and
+        """Acquire one OD cycle with averaging, per-vial dark subtraction and
         a per-vial calibration range guard. See :class:`ODReading`.
 
-        ``dark_subtract`` requires the loaded calibration to be fit on
-        dark-subtracted signal (LED-on - LED-off, per the OD_cal.meta.json
-        sidecar); requesting it against any other calibration raises
-        ``ValueError`` — mixing the two yields silently wrong OD."""
+        ``dark_subtract``: ``None`` follows each vial's curve (the sensor
+        loop's setting: an organism profile may be dark-subtracted while the
+        default curve is not); a bool or 16-list is explicit, and asking for
+        it on a vial whose curve is not dark-subtracted raises
+        ``ValueError`` -- mixing the two yields silently wrong OD.
+
+        ``record_dark`` takes the dark read even when no vial subtracts it,
+        so the logged raw counts can be re-interpreted by a dark-subtracted
+        curve later. The dark phase comes FIRST, so the LED is left on
+        between cycles exactly as before."""
         with self._lock:
             return self._read_od_enhanced_locked(
-                led_power, n_samples, dark_subtract, n_dark, agg,
+                led_power, n_samples, dark_subtract, n_dark, agg, record_dark,
             )
 
     def _read_od_enhanced_locked(
         self,
         led_power: int,
         n_samples: int,
-        dark_subtract: bool,
+        dark_subtract,
         n_dark: int,
         agg: str,
+        record_dark: bool = False,
     ) -> ODReading:
         led = int(np.clip(led_power, 0, OD_LED_MAX))
         n_samples = max(1, int(n_samples))
-        n_dark = max(0, int(n_dark))
+        mask, n_dark = self._resolve_dark_plan_locked(dark_subtract, max(0, int(n_dark)))
 
         # --- Dark phase (LED off). The photodiode still responds, so each
         # dark read is a full request/response we must drain. ---
-        if dark_subtract and n_dark > 0:
-            if self.od_cal is not None and not self._od_cal_dark_subtracted:
-                # Hard error (SPEC §19.2 / CALIBRATION_PROTOCOL §13): the
-                # curve was fit on non-dark-subtracted signal, so subtracting
-                # the dark first yields silently wrong OD. Previously a
-                # one-time warning; the guard at experiment creation should
-                # make this unreachable, but a hand-edited config must not
-                # slip through.
-                raise ValueError(
-                    "dark_subtract=True requires an OD calibration marked "
-                    "dark_subtracted in OD_cal.meta.json; the loaded "
-                    "calibration is not"
-                )
+        if n_dark > 0 and (mask.any() or record_dark):
             dark_body = self._format_csv(np.zeros(N_VIALS, dtype=int))
             dark_samples = self._collect_od_reads(dark_body, n_dark)
-            dark_agg, _ = self._aggregate_samples(dark_samples, agg)
-            # A dropped dark read falls back to that vial's last good dark:
-            # against a dark-subtracted curve, subtracting 0 would bias the
-            # vial by the whole dark offset (~1200 counts). With no history
-            # yet it still subtracts 0 rather than poisoning the vial.
-            good = ~np.isnan(dark_agg)
-            self._last_good_dark = np.where(good, dark_agg, self._last_good_dark)
-            dark_for_calc = np.where(
-                good, dark_agg, np.nan_to_num(self._last_good_dark, nan=0.0),
-            )
+            dark_agg, dark_n_valid = self._aggregate_samples(dark_samples, agg)
         else:
             dark_agg = np.full(N_VIALS, np.nan)
-            dark_for_calc = np.zeros(N_VIALS)
+            dark_n_valid = np.zeros(N_VIALS, dtype=int)
 
         # --- Light phase ---
         light_body = self._format_csv(np.full(N_VIALS, led))
         light_samples = self._collect_od_reads(light_body, n_samples)
         signal_on, n_valid = self._aggregate_samples(light_samples, agg)
 
-        corrected = signal_on - dark_for_calc  # NaN where signal_on is NaN
-
-        od_cal = self.od_cal
-        if od_cal is not None:
-            mn, mx = od_cal[0], od_cal[1]
-            in_domain = (corrected > mn) & (corrected < mx)
-            od_all = self._od_raw_to_OD(corrected)
-        else:
-            in_domain = np.ones(N_VIALS, dtype=bool)
-            od_all = corrected  # no calibration -> raw passthrough
-
-        calibrated: list[float] = []
-        raw_out: list[float] = []
-        flags: list[str] = []
-        valid = (n_valid > 0) & (~np.isnan(corrected))
-        for v in range(N_VIALS):
-            if not valid[v]:
-                flags.append("dropped")
-                calibrated.append(float("nan"))
-                raw_out.append(float("nan"))
-                continue
-            raw_out.append(float(corrected[v]))
-            if od_cal is not None and not in_domain[v]:
-                flags.append("out_of_range")
-                calibrated.append(float("nan"))
-                continue
-            flags.append("ok")
-            calibrated.append(float(od_all[v]))
-
-        dark_list = [
-            float(d) if not np.isnan(d) else float("nan") for d in dark_agg
-        ]
-        return ODReading(
-            calibrated=calibrated,
-            raw=raw_out,
-            dark=dark_list,
-            n_valid=[int(x) for x in n_valid],
-            flags=flags,
+        reading, self._last_good_dark = od_reading_from_samples(
+            signal_on, n_valid, dark_agg, dark_n_valid, mask,
+            self.od_cal, self._last_good_dark, led,
         )
+        return reading
 
     # ------------------------------------------------------------------
     # Public reads
