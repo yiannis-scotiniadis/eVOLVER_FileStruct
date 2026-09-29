@@ -8,6 +8,12 @@ dashboard would have shown at hour 3.
 
     python server/replay_growth.py TestForLabMeeting2
     python server/replay_growth.py TestForLabMeeting3 --vial 4 --verbose
+    python server/replay_growth.py MyRun --od-dir escherichia-coli-k-12__2026-10-01T120000Z
+
+``--od-dir`` reads the OD series from a post-hoc recalibration
+(``od_recalibrate.py``; an id under ``experiments/<run>/recalibrated/`` or any
+directory of ``vialNN_OD.csv`` files) while the config and the pump log still
+come from the run itself.
 
 Reusable on any future run, including the first real one. It is also what
 ``verify_growth_rate.py`` section 3 drives, and what the regression tests use
@@ -58,14 +64,15 @@ def _epoch(s: str) -> Optional[float]:
     return dt.timestamp() if dt is not None else None
 
 
-def load_od_series(exp_dir: Path, vial: int) -> list:
-    """``[(t_epoch_seconds, od), ...]`` from ``vialNN_OD.csv``.
+def load_od_series(exp_dir: Path, vial: int, od_dir: Optional[Path] = None) -> list:
+    """``[(t_epoch_seconds, od), ...]`` from ``vialNN_OD.csv`` (in
+    ``od_dir`` when given -- a recalibrated copy -- else the run's own).
 
     NaN and blank OD cells are dropped, never interpolated (§8). Real
     timestamps are used rather than the nominal cadence: the sensor loop's
     period is ``max(10 s, work)`` and genuinely varies.
     """
-    path = exp_dir / f"vial{vial:02d}_OD.csv"
+    path = (od_dir or exp_dir) / f"vial{vial:02d}_OD.csv"
     if not path.is_file():
         return []
     out: list = []
@@ -141,13 +148,14 @@ def replay_vial(
     od_floor: float = growth.DEFAULT_OD_FLOOR,
     pump_calibrated: bool = False,
     extra_flags: tuple = (growth.FLAG_UNCALIBRATED_FLOOR,),
+    od_dir: Optional[Path] = None,
 ) -> list:
     """Walk the estimator forward over one vial's logged series.
 
     Returns ``[(t, GrowthReport), ...]`` — one entry per recompute tick, using
     only the samples and events that existed at that instant.
     """
-    samples = load_od_series(exp_dir, vial)
+    samples = load_od_series(exp_dir, vial, od_dir)
     if not samples:
         return []
     # Vial groups: the vial's own group supplies its mode and its merged
@@ -279,6 +287,10 @@ def main(argv=None) -> int:
         "--verbose", action="store_true",
         help="print every tick rather than a summary",
     )
+    ap.add_argument(
+        "--od-dir",
+        help="read OD from a recalibration (its id, or a directory of vialNN_OD.csv)",
+    )
     args = ap.parse_args(argv)
 
     exp_dir = EXPERIMENTS_DIR / args.experiment
@@ -287,9 +299,19 @@ def main(argv=None) -> int:
         return 1
     config = json.loads((exp_dir / "config.json").read_text(encoding="utf-8"))
     vials = [args.vial] if args.vial is not None else config.get("vials", [])
+    od_dir = None
+    if args.od_dir:
+        od_dir = exp_dir / "recalibrated" / args.od_dir
+        if not od_dir.is_dir():
+            od_dir = Path(args.od_dir)
+        if not od_dir.is_dir():
+            print(f"no such OD directory: {args.od_dir}", file=sys.stderr)
+            return 1
+        print(f"OD from {od_dir}")
 
     results = {
-        int(v): replay_vial(exp_dir, int(v), config, interval_seconds=args.interval)
+        int(v): replay_vial(exp_dir, int(v), config, interval_seconds=args.interval,
+                            od_dir=od_dir)
         for v in vials
     }
     print(f"mode={config.get('mode')}  "
