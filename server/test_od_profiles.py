@@ -358,3 +358,159 @@ def test_the_live_sensor_loop_logs_the_raw_counts():
                 if t.name == "sensor-loop":
                     t.join(timeout=5)
             A.SENSOR_LOOP_INTERVAL_SECONDS, A.OD_INTERVAL_SECONDS = saved
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: organism profiles in the store; the series creates / recalibrates
+# ---------------------------------------------------------------------------
+
+from calibration_service import (  # noqa: E402
+    CalibrationService,
+    LEGACY_OD_ORGANISM,
+    od_profile_id_of,
+    od_profile_slug,
+)
+from test_calibration_tier3 import (  # noqa: E402
+    SERIES_LEVELS,
+    OdRig,
+    _Clock,
+    _legacy_store,
+)
+
+
+def _series_svc(tmp: Path, rig=None):
+    _legacy_store(tmp)
+    (tmp / "experiments").mkdir(exist_ok=True)
+    return CalibrationService(tmp / "calibration", tmp / "experiments",
+                              rig or OdRig(), clock=_Clock())
+
+
+def _series(svc, rig, target: dict, vials=(0, 1, 2)):
+    svc.series_start({"operator": "t", "vials": list(vials), **target})
+    svc.series_apply()
+    for od in SERIES_LEVELS:
+        rig.set_od(vials, od)
+        svc.series_point(spec_reading=od, vials=list(vials))
+    return svc.series_finish()
+
+
+def test_the_default_slot_is_derived_without_writing_current_json():
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _legacy_store(Path(tmp))
+        before = (store.root / "current.json").read_bytes()
+        profiles = store.od_profiles()
+        assert profiles == {"legacy-2016": {
+            "version": store.current_versions()["od"],
+            "organism": LEGACY_OD_ORGANISM, "is_default": True}}
+        assert store.od_default_profile() == "legacy-2016"
+        assert (store.root / "current.json").read_bytes() == before
+
+
+def test_profile_less_curves_are_assigned_by_source_not_all_to_legacy():
+    assert od_profile_id_of({"source": "legacy-import-2016"}) == "legacy-2016"
+    assert od_profile_id_of({"source": "dilution-series"}) == "machine-default"
+    assert od_profile_id_of({"source": "x", "profile": {"id": "e-coli"}}) == "e-coli"
+    assert od_profile_slug("Pichia  pastoris GS115") == "pichia-pastoris-gs115"
+    assert od_profile_slug("Cupriavidus necátor H16") == "cupriavidus-necator-h16"
+
+
+def test_a_profile_install_leaves_the_default_and_its_view_alone():
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _legacy_store(Path(tmp))
+        view = (store.root / "OD_cal.txt").read_bytes()
+        default = store.current_versions()["od"]
+        v1 = store.save_od_profile_version("e-coli", "E. coli", _od_env(store.fresh_version("od")))
+        v2 = store.save_od_profile_version("e-coli", "E. coli", _od_env(store.fresh_version("od"), c=0.1))
+        assert store.current_versions()["od"] == default
+        assert (store.root / "OD_cal.txt").read_bytes() == view
+        assert store.get_od_profile("e-coli")["version"] == v2
+        assert store.get_od_profile("e-coli")["supersedes"] == v1
+        assert store.od_profile_versions("e-coli") == [v2, v1]
+        assert store.history()["od_profile_of"][v1] == "e-coli"
+        # A pinned version must belong to the profile asked for.
+        try:
+            store.get_od_profile("legacy-2016", v2)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("another profile's version was accepted")
+        for bad in ("legacy-2016", "machine-default", "!!"):
+            try:
+                store.save_od_profile_version(bad, "x", _od_env(store.fresh_version("od")))
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"installed into {bad!r}")
+
+
+def test_a_series_target_is_exactly_one_known_profile_or_one_new_organism():
+    with tempfile.TemporaryDirectory() as tmp:
+        svc = _series_svc(Path(tmp))
+        for body, why in (
+            ({}, "exactly one"),
+            ({"profile": "legacy-2016", "new_organism": "E. coli"}, "exactly one"),
+            ({"profile": "legacy-2016"}, "default curve"),
+            ({"profile": "nope"}, "unknown OD profile"),
+            ({"new_organism": "x"}, "characters"),
+            ({"new_organism": "Legacy 2016"}, "already exists"),
+        ):
+            try:
+                svc.series_start({"operator": "t", **body})
+            except ValueError as exc:
+                assert why in str(exc), (body, str(exc))
+            else:
+                raise AssertionError(f"series started for {body}")
+
+
+def test_introduce_then_recalibrate_an_organism():
+    with tempfile.TemporaryDirectory() as tmp:
+        rig = OdRig()
+        svc = _series_svc(Path(tmp), rig)
+        first = _series(svc, rig, {"new_organism": "Pichia pastoris"}, vials=(0, 1, 2))
+        assert first["new_profile"] and first["profile_id"] == "pichia-pastoris"
+        try:
+            svc.series_start({"operator": "t", "new_organism": "PICHIA pastoris"})
+        except ValueError as exc:
+            assert "recalibrate it instead" in str(exc)
+        else:
+            raise AssertionError("an existing organism was re-introduced")
+        second = _series(svc, rig, {"profile": "pichia-pastoris"}, vials=(2, 3))
+        assert second["new_profile"] is False and second["organism"] == "Pichia pastoris"
+        env = svc.store.get_od_profile("pichia-pastoris")
+        assert env["supersedes"] == first["version"]
+        # Vials 0-1 measured by the first series, 2-3 by the second: all are
+        # this organism's own; the rest are still the default curve.
+        assert svc.store.od_vials_measured("pichia-pastoris", env) == [0, 1, 2, 3]
+        summary = {p["id"]: p for p in svc.store.od_profile_summaries()}["pichia-pastoris"]
+        assert summary["vials_measured"] == [0, 1, 2, 3]
+        assert summary["dark_subtracted"] is True
+        assert summary["versions"] == [second["version"], first["version"]]
+        assert any("2016" in r for r in summary["reasons"])     # 12 vials carried
+
+
+def test_the_series_target_survives_a_restart():
+    with tempfile.TemporaryDirectory() as tmp:
+        svc = _series_svc(Path(tmp))
+        svc.series_start({"operator": "t", "vials": [0], "new_organism": "C. necator H16"})
+        svc2 = CalibrationService(Path(tmp) / "calibration", Path(tmp) / "experiments",
+                                  OdRig(), clock=_Clock())
+        svc2.bootstrap()
+        cfg = svc2.series_session()["config"]
+        assert cfg["organism"] == "C. necator H16" and cfg["profile_id"] == "c-necator-h16"
+        assert cfg["new_profile"] is True
+
+
+def test_staleness_follows_the_loaded_experiments_pinned_profile():
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        rig = OdRig()
+        svc = _series_svc(tmp, rig)
+        out = _series(svc, rig, {"new_organism": "E. coli"}, vials=list(range(N_VIALS)))
+        exp = tmp / "experiments" / "run1"
+        exp.mkdir()
+        (exp / "config.json").write_text(json.dumps({"calibration": {
+            "od": out["version"], "od_profile": "e-coli"}}))
+        od = svc.store.staleness(loaded_experiment="run1", loaded_status="created")["od"]
+        assert od["profile"] == "e-coli" and od["stale"] is False, od
+        default = svc.store.staleness()["od"]
+        assert default["profile"] == "legacy-2016" and default["stale"] is True

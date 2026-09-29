@@ -121,6 +121,18 @@ TEMP_CAL_SOURCE = "two-point-reference"
 
 # --- OD dilution series (CALIBRATION_PROTOCOL §8.2, amended in Session AA).
 OD_SERIES_SOURCE = "dilution-series"
+
+# --- Per-organism OD profiles. Cells scatter light by size, shape and
+# contents, so the counts -> OD600 mapping is organism-specific: each
+# organism gets its own versioned curve, and a run pins one at create.
+# The DEFAULT slot is current["od"] -- the 2016 import, whose organism is
+# unknown -- and OD_cal.txt stays its view. It is never recalibrated by a
+# series: an organism only comes into existence by being calibrated.
+LEGACY_OD_PROFILE = "legacy-2016"
+LEGACY_OD_ORGANISM = "Unknown organism — 2016 inherited curve (unverified)"
+MACHINE_DEFAULT_OD_PROFILE = "machine-default"
+RESERVED_OD_PROFILES = (LEGACY_OD_PROFILE, MACHINE_DEFAULT_OD_PROFILE)
+OD_ORGANISM_NAME_MAX = 80
 OD_SERIES_MIN_LEVELS = 8             # "at least 8 points" (§8.2 step 1)
 OD_SERIES_R2_MIN = 0.99
 OD_SERIES_RESIDUAL_ABS = 0.02        # OD
@@ -207,6 +219,33 @@ def per_vial_sources(env: Optional[dict]) -> list[Optional[str]]:
 
 def _is_legacy_source(source: Optional[str]) -> bool:
     return str(source or "").startswith("legacy-import")
+
+
+def od_profile_id_of(env: Optional[dict]) -> Optional[str]:
+    """Which OD profile an envelope belongs to: its recorded ``profile.id``;
+    else, by SOURCE, the 2016 import -> ``legacy-2016``, and any other
+    profile-less OD curve (a Session AA series installed before profiles
+    existed) -> ``machine-default``. Never "everything untagged is legacy":
+    that would label a dark-subtracted dilution series as the 2016 curve."""
+    if env is None:
+        return None
+    profile = env.get("profile")
+    if isinstance(profile, dict) and profile.get("id"):
+        return str(profile["id"])
+    if _is_legacy_source(env.get("source")):
+        return LEGACY_OD_PROFILE
+    return MACHINE_DEFAULT_OD_PROFILE
+
+
+def od_profile_slug(organism: str) -> str:
+    """A stable profile id from an organism name: lowercase ASCII words
+    joined by '-', e.g. "Pichia pastoris GS115" -> "pichia-pastoris-gs115"."""
+    import re
+    import unicodedata
+    ascii_name = unicodedata.normalize("NFKD", str(organism)).encode(
+        "ascii", "ignore").decode("ascii")
+    slug = re.sub(r"[^a-z0-9]+", "-", ascii_name.lower()).strip("-")
+    return slug[:48].strip("-")
 
 
 def _per_vial_values(values) -> dict[int, float]:
@@ -523,6 +562,10 @@ class CalibrationStore:
                 for p in sorted(d.glob("*.json"), reverse=True):
                     versions.append(p.stem)
             out[subsystem] = versions
+        # Which organism profile each OD version belongs to.
+        out["od_profile_of"] = {
+            v: od_profile_id_of(self.get_version("od", v)) for v in out.get("od", [])
+        }
         return out
 
     def current_pump_rates(self) -> Optional[list[float]]:
@@ -538,6 +581,171 @@ class CalibrationStore:
         if any(r is None for r in rates):
             return None
         return [float(r) for r in rates]
+
+    # -- per-organism OD profiles ----------------------------------------
+
+    def od_default_profile(self) -> Optional[str]:
+        """The default slot's profile id (``current["od"]``), or None when
+        no OD curve is installed at all."""
+        env = self.get_current("od")
+        return od_profile_id_of(env) if env is not None else None
+
+    def od_profiles(self) -> dict:
+        """``{profile_id: {"version", "organism", "is_default"}}`` -- every
+        selectable OD profile. Derived, not migrated: the default slot comes
+        from ``current["od"]`` (so a boot writes nothing to the tracked
+        current.json), named organisms from ``current["od_profiles"]``."""
+        with self._lock:
+            current = self._read_current()
+            out: dict = {}
+            default_env = self.get_current("od")
+            if default_env is not None:
+                pid = od_profile_id_of(default_env)
+                organism = (LEGACY_OD_ORGANISM if pid == LEGACY_OD_PROFILE else
+                            "Default OD curve (organism unrecorded)")
+                out[pid] = {"version": current.get("od"), "organism": organism,
+                            "is_default": True}
+            for pid, entry in (current.get("od_profiles") or {}).items():
+                if isinstance(entry, dict) and entry.get("version"):
+                    out[str(pid)] = {"version": str(entry["version"]),
+                                     "organism": str(entry.get("organism") or pid),
+                                     "is_default": False}
+            return out
+
+    def get_od_profile(self, profile_id: str, version: Optional[str] = None) -> Optional[dict]:
+        """A profile's envelope: its CURRENT version, or the given (pinned)
+        one. A pinned version must belong to the profile."""
+        if version is None:
+            entry = self.od_profiles().get(profile_id)
+            if entry is None:
+                return None
+            version = entry["version"]
+        env = self.get_version("od", version)
+        if env is not None and od_profile_id_of(env) != profile_id:
+            raise ValueError(
+                f"OD calibration {version} belongs to profile "
+                f"{od_profile_id_of(env)!r}, not {profile_id!r}"
+            )
+        return env
+
+    def od_profile_versions(self, profile_id: str) -> list[str]:
+        """Every stored version of a profile, newest first."""
+        d = self._subsystem_dir("od")
+        out = []
+        if d.is_dir():
+            for path in sorted(d.glob("*.json"), reverse=True):
+                env = self.get_version("od", path.stem)
+                if env is not None and od_profile_id_of(env) == profile_id:
+                    out.append(path.stem)
+        return out
+
+    def experiment_od_pin(self, experiment: Optional[str]) -> Optional[tuple[str, str]]:
+        """``(profile_id, version)`` the experiment pinned at create, from its
+        config.json. A config from before profiles has only ``od`` (a
+        version); its profile is whatever that version belongs to."""
+        if not experiment or self.experiments_root is None:
+            return None
+        try:
+            config = json.loads(
+                (self.experiments_root / experiment / "config.json").read_text(encoding="utf-8")
+            )
+        except Exception:
+            return None
+        cal = config.get("calibration") or {}
+        version = cal.get("od")
+        if not version:
+            return None
+        profile = cal.get("od_profile") or od_profile_id_of(self.get_version("od", version))
+        return (str(profile), str(version)) if profile else None
+
+    def od_vials_measured(self, profile_id: str, env: Optional[dict]) -> list[int]:
+        """The vials whose constants in ``env`` were measured under
+        ``profile_id`` -- the rest were carried in from another curve
+        (a new organism's unmeasured vials come from the default slot)."""
+        if env is None:
+            return []
+        fit = env.get("fit") or {}
+        per_profile = fit.get("per_vial_profile")
+        if isinstance(per_profile, list) and len(per_profile) == N_VIALS:
+            return [v for v in range(N_VIALS) if per_profile[v] == profile_id]
+        # Pre-profile envelopes: the whole curve is the profile's own.
+        return list(range(N_VIALS)) if od_profile_id_of(env) == profile_id else []
+
+    def od_profile_summaries(self) -> list[dict]:
+        """One summary per selectable profile, default first, for the
+        experiment designer and the Calibration tab."""
+        out = []
+        profiles = self.od_profiles()
+        order = sorted(profiles, key=lambda p: (not profiles[p]["is_default"], p))
+        for pid in order:
+            entry = profiles[pid]
+            env = self.get_version("od", entry["version"])
+            data = (env or {}).get("data") or {}
+            age = None
+            dt = _parse_version(entry["version"])
+            if dt is not None:
+                age = round((_utc_now() - dt).total_seconds() / 86400.0, 2)
+            reasons = self._od_env_staleness(env, entry["version"])
+            sources = per_vial_sources(env)
+            out.append({
+                "id": pid,
+                "organism": entry["organism"],
+                "version": entry["version"],
+                "is_default": entry["is_default"],
+                "source": (env or {}).get("source"),
+                "age_days": age,
+                "dark_subtracted": bool(data.get("dark_subtracted", False)),
+                "vials_measured": self.od_vials_measured(pid, env),
+                "legacy_vials": [v for v in range(N_VIALS) if _is_legacy_source(sources[v])],
+                "stale": bool(reasons),
+                "reasons": reasons,
+                "versions": self.od_profile_versions(pid),
+            })
+        return out
+
+    def _od_env_staleness(self, env: Optional[dict], version: Optional[str]) -> list[str]:
+        """Staleness reasons for one OD curve (any profile)."""
+        if env is None:
+            return ["no OD calibration installed"]
+        reasons = []
+        legacy = [v for v, src in enumerate(per_vial_sources(env)) if _is_legacy_source(src)]
+        if len(legacy) == N_VIALS:
+            reasons.append("never verified against a spectrophotometer "
+                           "(2016 inherited constants)")
+        elif legacy:
+            reasons.append(f"vials {legacy} are still on 2016 constants never "
+                           "verified against a spectrophotometer")
+        stamps = (env.get("fit") or {}).get("per_vial_version")
+        ages = []
+        now = _utc_now()
+        for stamp in (stamps if isinstance(stamps, list) else [version]):
+            dt = _parse_version(stamp) if stamp else None
+            if dt is not None:
+                ages.append((now - dt).total_seconds() / 86400.0)
+        if ages and max(ages) > CURVE_STALE_DAYS:
+            reasons.append(f"calibration is {max(ages):.0f} days old (> {CURVE_STALE_DAYS:.0f})")
+        return reasons
+
+    def save_od_profile_version(self, profile_id: str, organism: str, envelope: dict) -> str:
+        """Install a new version of a NAMED organism profile. Never touches
+        ``current["od"]`` or the ``OD_cal.txt`` view: the default slot is not
+        an organism, and machine idle reads keep using it."""
+        if profile_id in RESERVED_OD_PROFILES or not od_profile_slug(profile_id):
+            raise ValueError(f"{profile_id!r} is not a valid organism profile id")
+        with self._lock:
+            current = self._read_current()
+            if profile_id == self.od_default_profile():
+                raise ValueError("the default OD slot is not an organism profile")
+            profiles = dict(current.get("od_profiles") or {})
+            previous = (profiles.get(profile_id) or {}).get("version")
+            env = dict(envelope)
+            env["profile"] = {"id": profile_id, "organism": str(organism)}
+            env["supersedes"] = previous
+            self._write_version_locked("od", env)
+            profiles[profile_id] = {"version": env["version"], "organism": str(organism)}
+            current["od_profiles"] = profiles
+            self._write_current(current)
+            return env["version"]
 
     # -- writes ----------------------------------------------------------
 
@@ -946,21 +1154,23 @@ class CalibrationStore:
                         f"verified against a {instrument}")
             return None
 
-        # OD curve
+        # OD curve: the loaded experiment's organism profile (the curve its
+        # numbers actually go through) when there is one, else the default.
         od_version = current.get("od")
-        od_env = self.get_current("od") if od_version else None
-        reasons = []
-        if od_version is None:
-            reasons.append("no OD calibration installed")
-        else:
-            legacy = _legacy_reason(od_env, "spectrophotometer")
-            if legacy:
-                reasons.append(legacy)
-            age = _curve_age_days(od_env, od_version)
-            if age is not None and age > CURVE_STALE_DAYS:
-                reasons.append(f"calibration is {age:.0f} days old (> {CURVE_STALE_DAYS:.0f})")
+        od_profile = self.od_default_profile()
+        pinned = self.experiment_od_pin(loaded_experiment) if loaded_experiment else None
+        if pinned is not None:
+            od_profile, od_version = pinned
+        od_env = self.get_version("od", od_version) if od_version else None
+        reasons = (self._od_env_staleness(od_env, od_version) if od_version
+                   else ["no OD calibration installed"])
         out["od"] = {"stale": bool(reasons), "reasons": reasons,
-                     "version": od_version}
+                     "version": od_version, "profile": od_profile}
+        out["od_profiles"] = {
+            p["id"]: {"stale": p["stale"], "reasons": p["reasons"],
+                      "version": p["version"]}
+            for p in self.od_profile_summaries()
+        }
 
         # Temperature
         temp_version = current.get("temperature")
@@ -1786,8 +1996,18 @@ class OdSeriesSession(Tier3Session):
         medium: str = "",
         spectrophotometer: str = "",
         points_expected: int = OD_SERIES_MIN_LEVELS,
+        profile_id: str = "",
+        organism: str = "",
+        new_profile: bool = False,
+        base_profile: str = "",
     ) -> None:
         super().__init__(operator=operator, vials=vials, stir_pwm=stir_pwm)
+        # The organism profile this series recalibrates, or creates on
+        # finish (new_profile); unmeasured vials come from base_profile.
+        self.profile_id = str(profile_id)
+        self.organism = str(organism)
+        self.new_profile = bool(new_profile)
+        self.base_profile = str(base_profile)
         led_power = int(led_power)
         if not (1 <= led_power <= 2200):
             raise ValueError(f"led_power must be in 1..2200, got {led_power}")
@@ -1831,6 +2051,10 @@ class OdSeriesSession(Tier3Session):
             "medium": self.medium,
             "spectrophotometer": self.spectrophotometer,
             "points_expected": self.points_expected,
+            "profile_id": self.profile_id,
+            "organism": self.organism,
+            "new_profile": self.new_profile,
+            "base_profile": self.base_profile,
             "points": self.points,
             "dark_captures": self.dark_captures,
             "next_point": self._next_point,
@@ -1847,6 +2071,10 @@ class OdSeriesSession(Tier3Session):
             standard=d.get("standard", ""), medium=d.get("medium", ""),
             spectrophotometer=d.get("spectrophotometer", ""),
             points_expected=d.get("points_expected", OD_SERIES_MIN_LEVELS),
+            profile_id=d.get("profile_id", ""),
+            organism=d.get("organism", ""),
+            new_profile=d.get("new_profile", False),
+            base_profile=d.get("base_profile", ""),
         )
         s._restore_base(d)
         s.points = list(d.get("points") or [])
@@ -1854,6 +2082,13 @@ class OdSeriesSession(Tier3Session):
         s._next_point = int(d.get("next_point", len(s.points) + 1))
         s._next_capture = int(d.get("next_capture", len(s.dark_captures) + 1))
         return s
+
+
+    def summary(self) -> dict:
+        out = super().summary()
+        out.update({"profile_id": self.profile_id, "organism": self.organism,
+                    "new_profile": self.new_profile})
+        return out
 
 
 TIER3_SESSION_CLASSES["od_series"] = OdSeriesSession
@@ -1947,6 +2182,7 @@ class CalibrationService:
             "pump_session_active": self._pump is not None,
             "blank_session_active": self._blank is not None,
             "tier3_session": tier3,
+            "od_profiles": self.store.od_profile_summaries(),
             "temperature_session_active": bool(tier3 and tier3["kind"] == "temperature"),
             "od_series_session_active": bool(tier3 and tier3["kind"] == "od_series"),
         }
@@ -2850,11 +3086,7 @@ class CalibrationService:
         """Open an OD dilution-series session. It drives nothing until
         ``series_apply``."""
         with self._lock:
-            if self.store.get_current("od") is None:
-                raise CalibrationConflict(
-                    "no OD calibration is installed — vials this series does "
-                    "not measure are carried forward from it"
-                )
+            target = self._series_target(body)
             s = OdSeriesSession(
                 operator=body.get("operator", "unknown"),
                 vials=body.get("vials") or list(range(N_VIALS)),
@@ -2866,6 +3098,7 @@ class CalibrationService:
                 medium=body.get("medium", ""),
                 spectrophotometer=body.get("spectrophotometer", ""),
                 points_expected=body.get("points_expected", OD_SERIES_MIN_LEVELS),
+                **target,
             )
             if s.target_temp_c is not None:
                 self._installed_temp_cal()
@@ -2886,6 +3119,55 @@ class CalibrationService:
                 )
             self._vial_map_version({"warnings": warnings_})
             return {"status": "started", "warnings": warnings_, **self.series_session()}
+
+    def _series_target(self, body: dict) -> dict:
+        """Which organism profile a series is for. Exactly one of
+        ``profile`` (recalibrate an existing organism) or ``new_organism``
+        (introduce one -- the ONLY way an organism comes into existence).
+        The default slot is not an organism and is never recalibrated."""
+        existing = body.get("profile")
+        new_name = body.get("new_organism")
+        if bool(existing) == bool(new_name):
+            raise ValueError(
+                "name exactly one of 'profile' (recalibrate an existing "
+                "organism) or 'new_organism' (introduce a new one)"
+            )
+        profiles = self.store.od_profiles()
+        default = self.store.od_default_profile()
+        if default is None:
+            raise CalibrationConflict(
+                "no OD calibration is installed — vials a series does not "
+                "measure are carried forward from the default curve"
+            )
+        if existing:
+            existing = str(existing)
+            if existing not in profiles:
+                raise ValueError(
+                    f"unknown OD profile {existing!r}; known: {sorted(profiles)}"
+                )
+            if existing == default:
+                raise ValueError(
+                    f"{profiles[existing]['organism']!r} is the machine's default "
+                    "curve, not an organism — calibrate a named organism instead "
+                    "(new_organism)"
+                )
+            return {"profile_id": existing, "organism": profiles[existing]["organism"],
+                    "new_profile": False, "base_profile": existing}
+        organism = " ".join(str(new_name).split())
+        if not (2 <= len(organism) <= OD_ORGANISM_NAME_MAX):
+            raise ValueError(
+                f"new_organism must be 2..{OD_ORGANISM_NAME_MAX} characters"
+            )
+        profile_id = od_profile_slug(organism)
+        clash = [pid for pid, e in profiles.items()
+                 if pid == profile_id or e["organism"].casefold() == organism.casefold()]
+        if not profile_id or profile_id in RESERVED_OD_PROFILES or clash:
+            raise ValueError(
+                f"an OD profile for {organism!r} already exists"
+                + (f" ({clash[0]!r}) — recalibrate it instead" if clash else "")
+            )
+        return {"profile_id": profile_id, "organism": organism,
+                "new_profile": True, "base_profile": default}
 
     def series_apply(self) -> dict:
         """(Re-)command stir, and the heaters (to the series' temperature
@@ -2949,6 +3231,9 @@ class CalibrationService:
                 "active": True,
                 **s.summary(),
                 "config": {
+                    "profile_id": s.profile_id,
+                    "organism": s.organism,
+                    "new_profile": s.new_profile,
                     "led_power": s.led_power,
                     "stir_pwm": s.stir_pwm,
                     "target_temp_c": s.target_temp_c,
@@ -3088,15 +3373,28 @@ class CalibrationService:
     def _series_fit_and_qc_locked(
         self, s: "OdSeriesSession", exclude_vials, version: str,
     ) -> tuple[np.ndarray, dict, dict, Optional[str]]:
-        prev_env = self.store.get_current("od")
+        # Unmeasured vials carry forward from the profile itself (a
+        # recalibration) or from the default slot (a new organism); which
+        # profile measured each vial is recorded, so a new organism's
+        # carried-in 2016 vials are never mistaken for its own.
+        prev_env = self.store.get_od_profile(s.base_profile)
         if prev_env is None:
-            raise CalibrationConflict("no OD calibration installed to carry vials forward from")
+            raise CalibrationConflict(
+                f"OD profile {s.base_profile!r} has no calibration to carry "
+                "vials forward from"
+            )
         prev_rows = np.asarray(prev_env["data"]["rows"], dtype=float)
         prev_ds = bool(prev_env["data"].get("dark_subtracted", False))
         per_vial_source = per_vial_sources(prev_env)
         per_vial_version = list(
             (prev_env.get("fit") or {}).get("per_vial_version")
             or [prev_env.get("version")] * N_VIALS
+        )
+        prev_profile_of = (prev_env.get("fit") or {}).get("per_vial_profile")
+        per_vial_profile = (
+            list(prev_profile_of)
+            if isinstance(prev_profile_of, list) and len(prev_profile_of) == N_VIALS
+            else [od_profile_id_of(prev_env)] * N_VIALS
         )
         exclude = {int(v) for v in (exclude_vials or [])}
         failures: list[str] = []
@@ -3157,6 +3455,7 @@ class CalibrationService:
             rows[:, v] = (f["a"], f["b"], f["c"], f["d"])
             per_vial_source[v] = OD_SERIES_SOURCE
             per_vial_version[v] = version
+            per_vial_profile[v] = s.profile_id
 
             res = np.asarray(f["residuals"])
             allowed = np.maximum(OD_SERIES_RESIDUAL_ABS, OD_SERIES_RESIDUAL_FRACTION * ods)
@@ -3299,11 +3598,23 @@ class CalibrationService:
             "excluded_vials": sorted(exclude),
         }
         vial_map_version = self._vial_map_version(qc)
+        not_this_organism = [v for v in range(N_VIALS) if per_vial_profile[v] != s.profile_id]
+        if not_this_organism and s.new_profile:
+            warnings_.append(
+                f"vials {not_this_organism} were not measured for {s.organism!r}: "
+                "this new profile carries the default curve on them, and an "
+                "experiment on those vials is warned at create"
+            )
         fit = {
+            "profile_id": s.profile_id,
+            "organism": s.organism,
+            "base_profile": s.base_profile,
+            "base_version": prev_env.get("version"),
             "measured_vials": measured,
             "converted_vials": converted,
             "per_vial_source": per_vial_source,
             "per_vial_version": per_vial_version,
+            "per_vial_profile": per_vial_profile,
             "dark_medians": [_finite_or_none(x) for x in dark],
             "review": review,
         }
@@ -3331,7 +3642,8 @@ class CalibrationService:
         with self._lock:
             s = self._require_tier3("od_series")
             version = self.store.fresh_version("od")
-            prev_version = self.store.current_versions().get("od")
+            base_env = self.store.get_od_profile(s.base_profile)
+            prev_version = base_env.get("version") if base_env else None
             rows, fit, qc, vial_map_version = self._series_fit_and_qc_locked(
                 s, exclude_vials, version,
             )
@@ -3349,6 +3661,7 @@ class CalibrationService:
                 operator=operator or s.operator,
                 source=OD_SERIES_SOURCE,
                 conditions={
+                    "organism": s.organism,
                     "led_power": s.led_power,
                     "stir_pwm": s.stir_pwm,
                     "target_temp_c": s.target_temp_c,
@@ -3373,11 +3686,16 @@ class CalibrationService:
                 qc=qc,
                 version=version,
             )
-            installed = self.store.save_version("od", envelope)
+            installed = self.store.save_od_profile_version(
+                s.profile_id, s.organism, envelope,
+            )
             self._end_tier3()
             return {
                 "status": "installed",
                 "version": installed,
+                "profile_id": s.profile_id,
+                "organism": s.organism,
+                "new_profile": s.new_profile,
                 "measured_vials": fit["measured_vials"],
                 "converted_vials": fit["converted_vials"],
                 "review": fit["review"],

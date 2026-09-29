@@ -322,7 +322,7 @@ def _run_http_series(client, mgr, rows, vials):
     mgr.mock_dark_noise_sd = 0.0
     _post(client, "/api/calibration/od/series/start",
           {"operator": "t", "vials": vials, "standard": "beads",
-           "spectrophotometer": "Genesys 30"})
+           "spectrophotometer": "Genesys 30", "new_organism": "Pichia pastoris"})
     _post(client, "/api/calibration/od/series/apply")
     for od in SERIES_LEVELS:
         mgr.set_true_od(vials, od)
@@ -330,42 +330,43 @@ def _run_http_series(client, mgr, rows, vials):
               {"spec_reading": od, "vials": vials})
 
 
-def test_od_series_over_http_installs_a_dark_subtracted_curve_live():
+def test_od_series_over_http_creates_an_organism_profile():
+    """A series introduces an organism: a new profile, dark-subtracted, with
+    the machine's default curve -- and so the live reader -- untouched."""
     with tempfile.TemporaryDirectory() as tmp:
         flask_app = _make_app(Path(tmp))
         try:
             state = _state(flask_app)
             mgr = state.manager
+            default_rows = np.array(mgr.od_cal)
             client = flask_app.test_client()
             rows = _true_ds_rows()
             _run_http_series(client, mgr, rows, list(range(N_VIALS)))
             sess = client.get("/api/calibration/od/series/session?preview=1").get_json()
+            assert sess["organism"] == "Pichia pastoris" and sess["new_profile"] is True
             assert sess["per_vial"]["0"]["n_levels"] == len(SERIES_LEVELS)
             assert sess["per_vial"]["0"]["preview"]["r2"] > 0.9999
             review = _post(client, "/api/calibration/od/series/fit")
             assert review["qc"]["passed"], review["qc"]
             out = _post(client, "/api/calibration/od/series/finish")
-            # Live without a restart, and flagged dark-subtracted everywhere.
-            assert mgr.od_cal_dark_subtracted is True
-            assert np.allclose(mgr.od_cal, rows, rtol=1e-6)
-            assert np.allclose(state.od_cal, mgr.od_cal)
+            assert out["profile_id"] == "pichia-pastoris"
+            env = state.cal_service.store.get_od_profile("pichia-pastoris")
+            assert np.allclose(env["data"]["rows"], rows, rtol=1e-6)
+            assert env["data"]["dark_subtracted"] is True
+            # The default curve is not an organism: unchanged, live and on disk.
+            assert np.array_equal(mgr.od_cal, default_rows)
+            assert mgr.od_cal_dark_subtracted is False
             idx = client.get("/api/calibration/").get_json()
-            assert idx["subsystems"]["od"]["version"] == out["version"]
-            assert not any("never verified" in r
-                           for r in idx["staleness"]["od"]["reasons"])
-
-            # An experiment that asks to read WITHOUT the dark is refused
-            # (the engine's guard: nothing else is loaded to conflict with).
-            body = _experiment_body("ds0")
-            body["parameters"]["od_acquisition"] = {"dark_subtract": False}
-            r = client.post("/api/experiments/create", json=body)
-            assert r.status_code == 400 and "dark-subtracted" in r.get_json()["error"]
-            # One that says nothing defaults to dark subtraction, written
-            # into config.json so a resume cannot re-resolve it.
-            _post(client, "/api/experiments/create", _experiment_body("ds1"))
-            cfg = json.loads((Path(tmp) / "experiments" / "ds1" / "config.json").read_text())
-            assert cfg["parameters"]["od_acquisition"]["dark_subtract"] is True
-            assert cfg["calibration"]["od"] == out["version"]
+            ids = [p["id"] for p in idx["od_profiles"]]
+            assert ids == ["legacy-2016", "pichia-pastoris"], ids
+            # The install event names the organism.
+            events = [e.get("data") or {} for e in state.event_log.recent()]
+            assert any(d.get("organism") == "Pichia pastoris" and d.get("new_profile")
+                       for d in events), events
+            # A second series may recalibrate it, but not re-introduce it.
+            r = client.post("/api/calibration/od/series/start",
+                            json={"new_organism": "pichia  PASTORIS"})
+            assert r.status_code == 400 and "already exists" in r.get_json()["error"]
         finally:
             _stop(flask_app)
 

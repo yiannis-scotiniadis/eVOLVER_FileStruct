@@ -889,10 +889,16 @@ def _series_service(tmp: Path, rig: OdRig) -> CalibrationService:
     return CalibrationService(tmp / "calibration", tmp / "experiments", rig, clock=_Clock())
 
 
-def _run_series(svc, rig, vials=None, levels=SERIES_LEVELS):
+ORGANISM = "Escherichia coli K-12"
+ORGANISM_ID = "escherichia-coli-k-12"
+
+
+def _run_series(svc, rig, vials=None, levels=SERIES_LEVELS, organism=ORGANISM):
+    """A series that introduces ``organism`` (the only way one comes into
+    existence: the default 2016 curve is not recalibrated by a series)."""
     vials = list(range(N_VIALS)) if vials is None else vials
     svc.series_start({"operator": "t", "vials": vials, "standard": "heat-killed E. coli",
-                      "spectrophotometer": "Genesys 30"})
+                      "spectrophotometer": "Genesys 30", "new_organism": organism})
     svc.series_apply()
     for od in levels:
         rig.set_od(vials, od)
@@ -911,22 +917,27 @@ def test_series_recovers_the_true_curve_and_installs_it_dark_subtracted():
         rig = OdRig()
         svc = _series_service(Path(tmp), rig)
         _run_series(svc, rig)
+        view_before = (svc.store.root / "OD_cal.txt").read_bytes()
+        default_before = svc.store.current_versions()["od"]
         out = svc.series_finish()
         assert out["qc"]["passed"], out["qc"]
-        env = svc.store.get_current("od")
+        assert out["profile_id"] == ORGANISM_ID and out["new_profile"] is True
+        env = svc.store.get_od_profile(ORGANISM_ID)
         rows = np.asarray(env["data"]["rows"])
         assert np.allclose(rows, rig.rows, rtol=1e-6), np.abs(rows / rig.rows - 1).max()
         assert env["data"]["dark_subtracted"] is True
+        assert env["profile"] == {"id": ORGANISM_ID, "organism": ORGANISM}
         assert env["fit"]["per_vial_source"] == [OD_SERIES_SOURCE] * N_VIALS
         assert env["conditions"]["standard"] == "heat-killed E. coli"
-        # The sidecar that lets the dark read graduate to a correction.
-        meta = json.loads((svc.store.root / "OD_cal.meta.json").read_text())
-        assert meta["dark_subtracted"] is True
+        # An organism profile is not the machine's default curve: the
+        # default slot and its OD_cal.txt view are untouched.
+        assert svc.store.current_versions()["od"] == default_before
+        assert (svc.store.root / "OD_cal.txt").read_bytes() == view_before
         # c sits below OD 0 on these shapes: warned, never refused.
         assert any("inflection" in w for w in out["qc"]["warnings"])
         assert out["review"]["1"]["previous_od_at_blank"] is not None
-        stale = svc.store.staleness()["od"]
-        assert not any("never verified" in r for r in stale["reasons"]), stale
+        stale = svc.store.staleness()["od_profiles"][ORGANISM_ID]
+        assert stale["stale"] is False, stale
         assert svc.tier3_status() is None
 
 
@@ -941,21 +952,27 @@ def test_five_priority_vials_install_dark_subtracted_and_convert_the_rest_exactl
         out = svc.series_finish()
         assert out["measured_vials"] == [0, 1, 6, 14, 15]
         assert out["converted_vials"] == [2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13]
-        rows = np.asarray(svc.store.get_current("od")["data"]["rows"])
+        env = svc.store.get_od_profile(ORGANISM_ID)
+        rows = np.asarray(env["data"]["rows"])
         for v in out["converted_vials"]:
             for s in (40_000.0, 50_000.0, 57_000.0):
                 if LEGACY_OD[0, v] < s < LEGACY_OD[1, v]:
                     assert abs(_od(rows, v, s - DARK) - _od(LEGACY_OD, v, s)) < 1e-9
-        src = svc.store.get_current("od")["fit"]["per_vial_source"]
+        src = env["fit"]["per_vial_source"]
         assert src[0] == OD_SERIES_SOURCE and src[2] == "legacy-import-2016"
-        assert svc.store.get_current("od")["data"]["dark_subtracted"] is True
+        assert env["data"]["dark_subtracted"] is True
+        # Only the five were measured FOR this organism; the rest are the
+        # default curve carried in, and the profile says so.
+        assert svc.store.od_vials_measured(ORGANISM_ID, env) == [0, 1, 6, 14, 15]
+        assert env["fit"]["per_vial_profile"][2] == "legacy-2016"
+        assert any("were not measured for" in w for w in out["qc"]["warnings"])
 
 
 def test_series_refuses_too_few_levels_non_monotone_and_bad_residuals():
     with tempfile.TemporaryDirectory() as tmp:
         rig = OdRig()
         svc = _series_service(Path(tmp), rig)
-        svc.series_start({"operator": "t", "vials": [3, 4, 5]})
+        svc.series_start({"operator": "t", "vials": [3, 4, 5], "new_organism": ORGANISM})
         svc.series_apply()
         for od in SERIES_LEVELS:
             rig.set_od([3, 4, 5], od)
@@ -1038,10 +1055,14 @@ def test_blank_against_a_dark_subtracted_curve_subtracts_the_dark():
     with tempfile.TemporaryDirectory() as tmp:
         rig = OdRig()
         svc = _series_service(Path(tmp), rig)
-        _run_series(svc, rig)
-        svc.series_finish()
-        ds_rows = np.asarray(svc.store.get_current("od")["data"]["rows"])
-        # A blank run on the new curve.
+        # A dark-subtracted DEFAULT curve (installed directly): the blank
+        # follows whichever curve it re-anchors.
+        ds_rows = np.asarray(rig.rows)
+        svc.store.save_version("od", make_envelope(
+            "od", operator="t", source="dilution-series", conditions={"n": 1},
+            data={"rows": ds_rows.tolist(), "dark_subtracted": True},
+            version=svc.store.fresh_version("od"),
+        ))
         import test_calibration_service as T
         clock = T.FakeClock()
         svc.tracker = TempStabilityTracker(clock=clock)

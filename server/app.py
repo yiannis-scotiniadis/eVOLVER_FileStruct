@@ -887,7 +887,7 @@ def create_app(use_mock: bool):
         if getattr(state.manager, "od_cal", None) is not None:
             state.od_cal = np.asarray(state.manager.od_cal)
 
-    def _reload_calibration(subsystem: str, version: str) -> None:
+    def _reload_calibration(subsystem: str, version: str, extra: dict | None = None) -> None:
         """Make a just-installed od/temperature version live WITHOUT a
         restart. Before Session AA nothing did: a new calibration took effect
         only at the next boot.
@@ -928,6 +928,7 @@ def create_app(use_mock: bool):
             "type": "calibration_installed",
             "subsystem": subsystem,
             "version": version,
+            **(extra or {}),
         })
 
     # Exposed for the API tests, which drive installs white-box.
@@ -2458,7 +2459,14 @@ def create_app(use_mock: bool):
             override_reason=body.get("override_reason"),
             operator=body.get("operator"),
         )
-        _reload_calibration("od", result["version"])
+        # A series installs an ORGANISM profile; the default curve (and so
+        # the live view) is unchanged, but the reload keeps every cache
+        # honest and the event records which organism was (re)calibrated.
+        _reload_calibration("od", result["version"], {
+            "od_profile": result["profile_id"],
+            "organism": result["organism"],
+            "new_profile": result["new_profile"],
+        })
         return jsonify(result)
 
     @flask_app.route("/api/calibration/od/series/abort", methods=["POST"])
