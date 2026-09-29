@@ -352,13 +352,14 @@ def _read_od_pair(state: AppState) -> dict:
             OD_LED_POWER, **engine.od_acquisition_params()
         )
         return _od_reading_dict(r)
-    if getattr(state.manager, "od_cal_dark_subtracted", False):
-        # Against a dark-subtracted curve (Session AA) even an idle read must
-        # subtract the dark -- the naive read cannot, and would be biased by
-        # the whole dark offset. One lit and one dark read keeps standby
-        # bus time small.
+    if any(getattr(state.manager, "od_dark_subtracted_by_vial", None) or []):
+        # A vial on a dark-subtracted curve (an organism profile, or a
+        # dark-subtracted default) must have the dark subtracted even on an
+        # idle read -- the naive read cannot, and would be biased by the
+        # whole dark offset. Each vial as its curve wants; one lit and one
+        # dark read keeps standby bus time small.
         r = state.manager.read_od_enhanced(
-            OD_LED_POWER, n_samples=1, dark_subtract=True, n_dark=1,
+            OD_LED_POWER, n_samples=1, dark_subtract=None, n_dark=1,
         )
         return _od_reading_dict(r)
     # Naive idle path (unchanged conversion) with neutral diagnostics. NaN
@@ -376,12 +377,22 @@ def _read_od_pair(state: AppState) -> dict:
 
 
 def _od_reading_dict(r) -> dict:
+    """An ODReading as the dict the sensor loop logs and broadcasts. The raw
+    fields (lit/dark_used/...) are what vialNN_OD.csv's schema-v2 columns
+    record for post-hoc recalibration; None when the reader predates them."""
+    def opt(x):
+        return None if x is None else list(x)
     return {
         "calibrated": list(r.calibrated),
         "raw": list(r.raw),
         "dark": list(r.dark),
         "n_valid": list(r.n_valid),
         "flags": list(r.flags),
+        "lit": opt(getattr(r, "lit", None)),
+        "dark_used": opt(getattr(r, "dark_used", None)),
+        "dark_n_valid": opt(getattr(r, "dark_n_valid", None)),
+        "dark_subtracted": opt(getattr(r, "dark_subtracted", None)),
+        "led_power": getattr(r, "led_power", None),
     }
 
 
@@ -3044,6 +3055,11 @@ def create_app(use_mock: bool):
                         od_n_valid=o.get("n_valid") if o else None,
                         od_flags=o.get("flags") if o else None,
                         od_dark=o.get("dark") if o else None,
+                        od_lit=o.get("lit") if o else None,
+                        od_dark_used=o.get("dark_used") if o else None,
+                        od_dark_n_valid=o.get("dark_n_valid") if o else None,
+                        od_dark_subtracted=o.get("dark_subtracted") if o else None,
+                        od_led_power=o.get("led_power") if o else None,
                     )
                 except Exception:
                     log.exception("data_logger.log_sensor_cycle failed")

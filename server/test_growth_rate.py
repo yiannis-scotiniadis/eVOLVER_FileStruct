@@ -614,16 +614,17 @@ def test_growth_csv_flags_are_pipe_separated():
             assert len(line.split(",")) == len(GROWTH_HEADER)
 
 
-def test_od_csv_header_is_unchanged():
-    """§7.7: `data_export.py` carries no schema marker, so any positional
-    parser — including the lab's own analysis scripts — breaks silently on a
-    column inserted into vialNN_OD.csv. Growth went to a parallel file for
-    exactly this reason."""
-    from data_logger import OD_HEADER
-    assert OD_HEADER == (
+def test_od_csv_header_only_ever_grows_at_the_end():
+    """§7.7 / CLAUDE.md fact 6: a positional parser -- the lab's own analysis
+    scripts included -- breaks silently on a column INSERTED into
+    vialNN_OD.csv. Columns may only be appended: the first seven are the v1
+    file, forever, in this order. (Growth estimates are a parallel file.)"""
+    from data_logger import OD_HEADER, OD_HEADER_V1
+    assert OD_HEADER_V1 == (
         "timestamp", "elapsed_hours", "raw_adc", "calibrated_od",
         "n_valid", "flag", "dark",
     )
+    assert OD_HEADER[:len(OD_HEADER_V1)] == OD_HEADER_V1
 
 
 def test_suppressed_pump_creates_no_boundary():

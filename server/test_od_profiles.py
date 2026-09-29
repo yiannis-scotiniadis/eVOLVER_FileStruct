@@ -222,3 +222,132 @@ def test_mock_truth_mode_shows_a_vial_on_the_wrong_organisms_curve():
     r2 = m2.read_od_enhanced(2125, n_samples=3, dark_subtract=None)
     assert r2.dark_subtracted[0] and r2.lit[0] == r2.raw[0] + r2.dark_used[0]
     assert abs(F.od_from_signal(r2.raw[0], *m2.od_cal[:, 0]) - r2.calibrated[0]) < 1e-6
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: vialNN_OD.csv schema v2 -- the raw counts, appended
+# ---------------------------------------------------------------------------
+
+import io  # noqa: E402
+import json  # noqa: E402
+import zipfile  # noqa: E402
+
+import data_export as dx  # noqa: E402
+from data_logger import OD_HEADER, OD_HEADER_V1  # noqa: E402
+
+TS0 = "2026-09-29T12:00:00+00:00"
+TS1 = "2026-09-29T12:00:10+00:00"
+
+
+def _log_od(dl, ts, *, lit=50000.5, dark=1200.25, ds=True):
+    nan = float("nan")
+    raw = lit - dark if ds else lit
+    dl.log_sensor_cycle(
+        ts, [30.0] * N_VIALS, [500.0] * N_VIALS,
+        od_calibrated=[0.4123456] * N_VIALS, od_raw=[raw] * N_VIALS,
+        od_n_valid=[5] * N_VIALS, od_flags=["ok"] * N_VIALS,
+        od_dark=[dark] * N_VIALS, od_lit=[lit] * N_VIALS,
+        od_dark_used=[dark if ds else nan] * N_VIALS,
+        od_dark_n_valid=[3] * N_VIALS, od_dark_subtracted=[ds] * N_VIALS,
+        od_led_power=2125,
+    )
+
+
+def test_new_od_files_carry_the_raw_counts_exactly():
+    with tempfile.TemporaryDirectory() as tmp:
+        dl = DataLogger(Path(tmp) / "experiments")
+        config = dl.create_experiment(name="r", mode="turbidostat", vials=[0, 1])
+        assert config["od_csv_schema"] == 2
+        dl.activate_experiment("r")
+        _log_od(dl, TS0)
+        rows = _rows(Path(tmp) / "experiments" / "r" / "vial00_OD.csv")
+        assert tuple(rows[0]) == OD_HEADER and len(rows[1]) == len(OD_HEADER)
+        row = dict(zip(rows[0], rows[1]))
+        # The v1 columns keep their v1 format (raw_adc and dark are integers).
+        assert row["raw_adc"] == "48800" and row["dark"] == "1200"
+        assert row["calibrated_od"] == "0.4123"
+        # The v2 columns are exact.
+        assert row["lit_adc"] == "50000.5" and row["dark_adc"] == "1200.25"
+        assert row["dark_used"] == "1200.25" and row["dark_n_valid"] == "3"
+        assert row["dark_subtracted"] == "1" and row["led_power"] == "2125"
+        # A raw-signal row: nothing subtracted, dark still recorded.
+        _log_od(dl, TS1, ds=False)
+        row = dict(zip(rows[0], _rows(Path(tmp) / "experiments" / "r" / "vial00_OD.csv")[2]))
+        assert row["dark_used"] == "" and row["dark_subtracted"] == "0"
+        assert row["dark_adc"] == "1200.25" and row["raw_adc"] == "50000"
+
+
+def test_a_pre_upgrade_od_file_keeps_seven_column_rows():
+    """A run resumed across the upgrade: its rows must match ITS header."""
+    with tempfile.TemporaryDirectory() as tmp:
+        dl = DataLogger(Path(tmp) / "experiments")
+        dl.create_experiment(name="old", mode="turbidostat", vials=[0, 1])
+        path0 = Path(tmp) / "experiments" / "old" / "vial00_OD.csv"
+        path0.write_text(",".join(OD_HEADER_V1) + "\n" + "t,0.0,1,0.1,5,ok,\n")
+        dl.activate_experiment("old")
+        _log_od(dl, TS0)
+        old = _rows(path0)
+        assert all(len(r) == 7 for r in old), old
+        new = _rows(Path(tmp) / "experiments" / "old" / "vial01_OD.csv")
+        assert all(len(r) == len(OD_HEADER) for r in new)
+
+
+def test_readers_and_bundles_handle_schema_v2():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "experiments"
+        dl = DataLogger(root)
+        dl.create_experiment(name="r", mode="turbidostat", vials=[0, 1])
+        dl.activate_experiment("r")
+        _log_od(dl, TS0)
+        _log_od(dl, TS1)
+        exp = root / "r"
+        (exp / "od_blank.json").write_text("{}")
+        # By-name readers see the same calibrated values as before.
+        wide = dx.wide_csv(exp, "od", [0, 1], None)
+        assert wide.splitlines()[1].split(",")[-1] == "0.4123"
+        from replay_growth import load_od_series
+        assert [od for _t, od in load_od_series(exp, 0)] == [0.4123, 0.4123]
+        name, blob = dx.build_bundle(exp, name="r", vials=[0], parameters=["od", "temp"])
+        zf = zipfile.ZipFile(io.BytesIO(blob))
+        assert "raw/vial00_OD.csv" in zf.namelist() and "od_blank.json" in zf.namelist()
+        raw = zf.read("raw/vial00_OD.csv").decode().splitlines()
+        assert raw[0] == ",".join(OD_HEADER) and len(raw) == 3
+        manifest = json.loads(zf.read("export_manifest.json"))
+        assert manifest["od_csv_schema"] == 2
+        assert manifest["files"]["raw/vial00_OD.csv"]["data_rows"] == 2
+        # The raw files are only exported with OD.
+        _n, blob = dx.build_bundle(exp, name="r", vials=[0], parameters=["temp", "pump"])
+        assert not any(n.startswith("raw/") for n in zipfile.ZipFile(io.BytesIO(blob)).namelist())
+
+
+def test_the_live_sensor_loop_logs_the_raw_counts():
+    """End to end through app.py's loop: a new experiment's config asks for
+    the dark read, and every OD row carries lit/dark counts."""
+    import time
+    import app as A
+    from test_calibration_api import _experiment_body, _make_app, _state
+    saved = (A.SENSOR_LOOP_INTERVAL_SECONDS, A.OD_INTERVAL_SECONDS)
+    A.SENSOR_LOOP_INTERVAL_SECONDS = A.OD_INTERVAL_SECONDS = 0.05
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            flask_app = _make_app(Path(tmp))
+            client = flask_app.test_client()
+            assert client.post("/api/experiments/create",
+                               json=_experiment_body("live")).status_code == 200
+            cfg = json.loads((Path(tmp) / "experiments" / "live" / "config.json").read_text())
+            assert cfg["parameters"]["od_acquisition"]["record_dark"] is True
+            assert client.post("/api/experiments/live/start",
+                               json={"allow_missing_od_blank": True}).status_code == 200
+            path = Path(tmp) / "experiments" / "live" / "vial00_OD.csv"
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and len(_rows(path)) < 3:
+                time.sleep(0.05)
+            rows = _rows(path)
+            assert len(rows) >= 3, rows
+            row = dict(zip(rows[0], rows[-1]))
+            assert row["led_power"] == "2125" and row["dark_subtracted"] == "0"
+            assert row["dark_adc"] != "" and row["dark_n_valid"] != "0"
+            assert int(row["raw_adc"]) == round(float(row["lit_adc"]))
+        finally:
+            A.SENSOR_LOOP_INTERVAL_SECONDS, A.OD_INTERVAL_SECONDS = saved
+            _state(flask_app).sensor_thread_stop.set()

@@ -705,6 +705,11 @@ class ExperimentSupervisor:
         merged = dict(params[0])
         merged["n_samples"] = max(int(p["n_samples"]) for p in params)
         merged["n_dark"] = max(int(p["n_dark"]) for p in params)
+        # Any run that records the dark gets it recorded for every vial (one
+        # read serves all sixteen) -- and a dark read needs n_dark >= 1.
+        merged["record_dark"] = any(bool(p.get("record_dark")) for p in params)
+        if merged["record_dark"]:
+            merged["n_dark"] = max(1, merged["n_dark"])
         return merged
 
     # ------------------------------------------------------------------

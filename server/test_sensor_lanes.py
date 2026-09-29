@@ -388,9 +388,12 @@ def test_temperature_rows_outnumber_od_rows() -> None:
         # header + N data rows
         assert len(temp_rows) == 1 + 6, temp_rows
         assert len(od_rows) == 1 + 1, od_rows
-        # Column count is unchanged in both files.
+        # Every row has its file's column count (OD schema v2 appended the
+        # raw-count columns; a decimated lane changes rows, never shape).
+        from data_logger import OD_HEADER
         assert len(temp_rows[0].split(",")) == 4, temp_rows[0]
-        assert len(od_rows[0].split(",")) == 7, od_rows[0]
+        assert len(od_rows[0].split(",")) == len(OD_HEADER), od_rows[0]
+        assert all(len(r.split(",")) == len(OD_HEADER) for r in od_rows[1:]), od_rows
 
 
 def test_od_calibrated_without_od_raw_is_rejected() -> None:

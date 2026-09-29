@@ -35,10 +35,28 @@ from typing import Iterable, Optional
 
 N_VIALS = 16
 
-# raw_adc is the aggregated, dark-subtracted signal fed to the calibration;
-# n_valid/flag/dark are the enhanced-acquisition diagnostics (blank when a
-# cycle used the naive single read, e.g. idle standby).
-OD_HEADER = (
+# vialNN_OD.csv, schema v2. COLUMNS ARE APPENDED, NEVER INSERTED OR
+# REORDERED (CLAUDE.md fact 6): the first seven are the v1 file, unchanged in
+# name, meaning and format, so any reader of v1 -- positional or by name --
+# still reads them.
+#
+# v1 columns:
+#   raw_adc        the signal FED to the calibration: LED-on, minus the dark
+#                  on a vial whose curve is dark-subtracted (integer)
+#   calibrated_od  OD600 through the vial's curve (4 dp); blank when not ok
+#   n_valid        surviving LED-on samples
+#   flag           ok | out_of_range | dropped
+#   dark           this cycle's LED-off reading (integer); blank when none
+# v2 columns (per-organism OD profiles): the counts a better curve needs to
+# be re-applied after the fact (server/od_recalibrate.py), written exactly:
+#   lit_adc        LED-on reading, before any interpretation
+#   dark_adc       the same LED-off reading as `dark`, exact
+#   dark_used      the dark actually subtracted -- this cycle's, or the
+#                  vial's last good one if it dropped; blank when none was
+#   dark_n_valid   surviving LED-off samples
+#   dark_subtracted  1 if raw_adc = lit_adc - dark_used, else 0
+#   led_power      LED power of the lit reads
+OD_HEADER_V1 = (
     "timestamp",
     "elapsed_hours",
     "raw_adc",
@@ -47,6 +65,16 @@ OD_HEADER = (
     "flag",
     "dark",
 )
+OD_HEADER = OD_HEADER_V1 + (
+    "lit_adc",
+    "dark_adc",
+    "dark_used",
+    "dark_n_valid",
+    "dark_subtracted",
+    "led_power",
+)
+# Written into every new experiment's config.json; absent = 1.
+OD_CSV_SCHEMA = 2
 TEMP_HEADER = ("timestamp", "elapsed_hours", "raw_adc", "calibrated_temp_c")
 PUMP_HEADER = (
     "timestamp",
@@ -56,10 +84,10 @@ PUMP_HEADER = (
     "od_at_pump",
 )
 # SPEC §17 / GROWTH_RATE_METHOD.md §7.7 — a PARALLEL file, not new columns
-# in vial{NN}_OD.csv. That file's header is load-bearing: data_export.py
-# carries no version or schema marker at all, so any positional parser --
-# including the lab's own analysis scripts -- would break silently on an
-# inserted column.
+# in vial{NN}_OD.csv: growth estimates are derived, on their own cadence,
+# and do not belong in the raw sensor record. (That file only ever gains
+# columns at its END -- see OD_HEADER -- because positional parsers,
+# including the lab's own analysis scripts, break silently on an insert.)
 #
 # `flags` is PIPE-separated, not comma. events.csv and the export filters are
 # read back with line/comma splitting (data_export.filter_rows_by_hours), so a
@@ -138,6 +166,15 @@ def _format_int(x) -> str:
     return str(int(round(float(x))))
 
 
+def _format_exact(x) -> str:
+    """Raw counts for re-calibration: exact (``.10g`` -- a whole number
+    still prints as ``58000``; a median of an even sample count or a trimmed
+    mean keeps its fraction); empty for None/NaN."""
+    if x is None or _is_nan(x):
+        return ""
+    return format(float(x), ".10g")
+
+
 def _one_line(text) -> str:
     """Collapse newlines to spaces.
 
@@ -164,13 +201,16 @@ def _deep_merge(base: dict, overlay: dict) -> dict:
 class _ActiveRun:
     """One experiment the logger is writing rows for."""
 
-    __slots__ = ("name", "dir", "start", "vials")
+    __slots__ = ("name", "dir", "start", "vials", "od_v1_vials")
 
     def __init__(self, name: str, directory: Path, start: datetime, vials: list[int]):
         self.name = name
         self.dir = directory
         self.start = start
         self.vials = list(vials)
+        # Vials whose vialNN_OD.csv predates schema v2: a run resumed across
+        # the upgrade keeps writing 7-column rows under its 7-column header.
+        self.od_v1_vials: set[int] = set()
 
 
 class DataLogger:
@@ -317,6 +357,8 @@ class DataLogger:
             "parameters": parameters or {},
             "calibration": calibration or {},
             "notes": notes or "",
+            # vialNN_OD.csv layout (OD_HEADER); absent in older configs = 1.
+            "od_csv_schema": OD_CSV_SCHEMA,
         }
         if media is not None:
             config["media"] = media
@@ -388,9 +430,26 @@ class DataLogger:
         with self._lock:
             self._check_can_activate_locked(name, vials)
             run = _ActiveRun(name, exp_dir, start or datetime.now(timezone.utc), vials)
+            run.od_v1_vials = self._od_v1_vials(exp_dir, vials)
             self._active[name] = run
         log.info("experiment '%s' activated (start=%s)", name, run.start)
         return config
+
+    @staticmethod
+    def _od_v1_vials(exp_dir: Path, vials: list[int]) -> set[int]:
+        """Vials whose OD file carries the v1 (7-column) header. Rows must
+        match their file's header, whatever the current schema."""
+        out: set[int] = set()
+        for v in vials:
+            path = exp_dir / f"vial{v:02d}_OD.csv"
+            try:
+                with path.open("r", encoding="utf-8") as f:
+                    header = f.readline().strip().split(",")
+            except OSError:
+                continue
+            if header == list(OD_HEADER_V1):
+                out.add(v)
+        return out
 
     def _check_can_activate_locked(self, name: str, vials: list[int]) -> None:
         if name in self._active:
@@ -481,6 +540,11 @@ class DataLogger:
         od_n_valid: Optional[list] = None,
         od_flags: Optional[list] = None,
         od_dark: Optional[list] = None,
+        od_lit: Optional[list] = None,
+        od_dark_used: Optional[list] = None,
+        od_dark_n_valid: Optional[list] = None,
+        od_dark_subtracted: Optional[list] = None,
+        od_led_power: Optional[int] = None,
     ) -> None:
         """Append one temperature row per active vial, and one OD row when
         OD was actually acquired this cycle.
@@ -497,14 +561,16 @@ class DataLogger:
         (``data_export``, ``get_data``, the lab's own scripts) opens them
         independently. Nothing joins them positionally by row index.
 
-        No column is added to or removed from either file. ``data_export``
-        has no schema marker, so a positional parser breaks silently on an
-        inserted column (CLAUDE.md fact 6) -- changing the row *rate* is
-        invisible to such a parser, changing the row *shape* is not.
+        Columns are only ever APPENDED to either file, never inserted or
+        reordered (CLAUDE.md fact 6): a positional parser of the old columns
+        keeps working. Each row matches its own file's header -- a v1 OD file
+        (7 columns) resumed across the upgrade keeps getting v1 rows.
 
-        ``od_n_valid`` / ``od_flags`` / ``od_dark`` are the optional
-        enhanced-acquisition diagnostics; when omitted (naive read) the
-        corresponding CSV columns are left blank.
+        ``od_n_valid`` / ``od_flags`` / ``od_dark`` are the enhanced-
+        acquisition diagnostics, and ``od_lit`` / ``od_dark_used`` /
+        ``od_dark_n_valid`` / ``od_dark_subtracted`` / ``od_led_power`` the
+        raw counts for post-hoc recalibration (``OD_HEADER``); omitted ones
+        leave their columns blank.
 
         File writes are serialized via ``self._lock`` so concurrent callers
         cannot corrupt CSV rows (Windows lacks POSIX O_APPEND atomic-write
@@ -530,6 +596,10 @@ class DataLogger:
                 (od_n_valid, "od_n_valid"),
                 (od_flags, "od_flags"),
                 (od_dark, "od_dark"),
+                (od_lit, "od_lit"),
+                (od_dark_used, "od_dark_used"),
+                (od_dark_n_valid, "od_dark_n_valid"),
+                (od_dark_subtracted, "od_dark_subtracted"),
             ):
                 if series is not None and len(series) != N_VIALS:
                     raise ValueError(
@@ -544,16 +614,21 @@ class DataLogger:
                     for x in od_calibrated
                 ]
 
+            od_v2 = {
+                "lit": od_lit, "dark_used": od_dark_used,
+                "dark_n_valid": od_dark_n_valid,
+                "dark_subtracted": od_dark_subtracted, "led_power": od_led_power,
+            }
             for run in self._active.values():
                 self._write_sensor_rows_locked(
                     run, timestamp_iso, temperature_calibrated, temperature_raw,
-                    od_calibrated, od_raw, od_n_valid, od_flags, od_dark,
+                    od_calibrated, od_raw, od_n_valid, od_flags, od_dark, od_v2,
                 )
 
     def _write_sensor_rows_locked(
         self, run: _ActiveRun, timestamp_iso: str,
         temperature_calibrated, temperature_raw,
-        od_calibrated, od_raw, od_n_valid, od_flags, od_dark,
+        od_calibrated, od_raw, od_n_valid, od_flags, od_dark, od_v2=None,
     ) -> None:
         """One temperature row (and one OD row on an OD tick) per vial of
         ``run``, stamped with ``run``'s own elapsed hours."""
@@ -572,18 +647,32 @@ class DataLogger:
             )
             if not has_od:
                 continue
-            self._append_row(
-                exp_dir / f"vial{v:02d}_OD.csv",
-                [
-                    timestamp_iso,
-                    elapsed_str,
-                    _format_int(od_raw[v]),
-                    _format_number(od_calibrated[v], 4),
-                    _format_int(od_n_valid[v]) if od_n_valid is not None else "",
-                    (od_flags[v] if od_flags is not None else "") or "",
-                    _format_int(od_dark[v]) if od_dark is not None else "",
-                ],
-            )
+            row = [
+                timestamp_iso,
+                elapsed_str,
+                _format_int(od_raw[v]),
+                _format_number(od_calibrated[v], 4),
+                _format_int(od_n_valid[v]) if od_n_valid is not None else "",
+                (od_flags[v] if od_flags is not None else "") or "",
+                _format_int(od_dark[v]) if od_dark is not None else "",
+            ]
+            if v not in run.od_v1_vials:
+                x = od_v2 or {}
+
+                def at(key):
+                    series = x.get(key)
+                    return series[v] if series is not None else None
+                ds = at("dark_subtracted")
+                led = x.get("led_power")
+                row += [
+                    _format_exact(at("lit")),
+                    _format_exact(od_dark[v] if od_dark is not None else None),
+                    _format_exact(at("dark_used")),
+                    _format_int(at("dark_n_valid")),
+                    "" if ds is None else ("1" if ds else "0"),
+                    "" if led is None else str(int(led)),
+                ]
+            self._append_row(exp_dir / f"vial{v:02d}_OD.csv", row)
 
     def log_pump_event(
         self,

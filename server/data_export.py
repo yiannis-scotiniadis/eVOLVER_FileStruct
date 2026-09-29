@@ -740,6 +740,11 @@ def vial_groups_csv(exp_dir: Path, vials: Iterable[int]) -> Optional[str]:
     return "\n".join(lines) + "\n"
 
 
+def _count_lines(path: Path) -> int:
+    with path.open("rb") as f:
+        return sum(1 for _ in f)
+
+
 def build_bundle(
     exp_dir: Path,
     *,
@@ -810,9 +815,35 @@ def build_bundle(
             text = pump_events_csv(exp_dir, vials, hours)
             file_rows[pump_name] = _row_count(text)
             zf.writestr(pump_name, text)
+        # The raw record behind the OD (schema v2 carries the LED-on and dark
+        # counts), and the curve and blank that turned it into OD: everything
+        # a better calibration needs to be re-applied off the Pi.
+        raw_rows: dict[str, int] = {}
+        if "od" in requested:
+            for v in vials:
+                src = exp_dir / f"vial{v:02d}_OD.csv"
+                if not src.is_file():
+                    continue
+                arc = f"raw/vial{v:02d}_OD.csv"
+                if hours is None:
+                    zf.write(src, arc)
+                    raw_rows[arc] = max(0, _count_lines(src) - 1)
+                else:
+                    header, rows = read_tail_rows(src, hours=hours, elapsed_col=1)
+                    zf.writestr(arc, "\n".join([",".join(header)] + rows) + "\n")
+                    raw_rows[arc] = len(rows)
+            for extra in ("od_blank.json", "od_calibration.json"):
+                if (exp_dir / extra).is_file():
+                    zf.write(exp_dir / extra, extra)
         config_path = exp_dir / "config.json"
+        od_csv_schema = 1
         if config_path.is_file():
-            zf.writestr("config.json", config_path.read_text(encoding="utf-8"))
+            config_text = config_path.read_text(encoding="utf-8")
+            zf.writestr("config.json", config_text)
+            try:
+                od_csv_schema = int(json.loads(config_text).get("od_csv_schema", 1))
+            except (ValueError, TypeError, AttributeError):
+                pass
         if events_text is not None:
             zf.writestr("events.csv", events_text)
         if growth_text is not None:
@@ -829,8 +860,13 @@ def build_bundle(
                 "hours": hours,
             },
             "files": dict(file_rows),
+            # Layout of vialNN_OD.csv (data_logger.OD_HEADER); 1 = the v1
+            # seven columns, 2 = + the raw counts for recalibration.
+            "od_csv_schema": od_csv_schema,
         }
         manifest["files"] = {fn: {"data_rows": n} for fn, n in file_rows.items()}
+        for arc, n in raw_rows.items():
+            manifest["files"][arc] = {"data_rows": n}
         if events_text is not None:
             manifest["files"]["events.csv"] = {"data_rows": _row_count(events_text)}
         if growth_text is not None:

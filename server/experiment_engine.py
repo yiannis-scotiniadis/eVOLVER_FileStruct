@@ -180,6 +180,13 @@ DEFAULT_OD_ACQUISITION: dict = {
     "dark_subtract": False,
     "n_dark": OD_DEFAULT_N_DARK,
     "agg": OD_AGG_DEFAULT,
+    # Take the dark read even when no vial subtracts it, so vialNN_OD.csv
+    # carries the counts a dark-subtracted curve needs post hoc. False here
+    # (the implicit value for configs from before it existed, so a run
+    # resumed across the upgrade keeps its acquisition); every NEW
+    # experiment has True written into its config by
+    # materialize_od_acquisition.
+    "record_dark": False,
 }
 
 log = logging.getLogger(__name__)
@@ -559,6 +566,8 @@ def _parse_od_acquisition(parameters: dict) -> dict:
         raise ValueError(f"od_acquisition.n_dark must be >= 0, got {n_dark}")
     if not isinstance(out["dark_subtract"], bool):
         raise ValueError("od_acquisition.dark_subtract must be a boolean")
+    if not isinstance(out["record_dark"], bool):
+        raise ValueError("od_acquisition.record_dark must be a boolean")
     agg = str(out["agg"])
     if agg not in OD_AGG_CHOICES:
         raise ValueError(
@@ -569,26 +578,28 @@ def _parse_od_acquisition(parameters: dict) -> dict:
         "dark_subtract": out["dark_subtract"],
         "n_dark": n_dark,
         "agg": agg,
+        "record_dark": out["record_dark"],
     }
 
 
 def materialize_od_acquisition(parameters: dict, curve_dark_subtracted: bool) -> dict:
-    """``parameters`` with ``od_acquisition.dark_subtract`` made explicit
-    when the installed OD curve is dark-subtracted (Session AA).
+    """``parameters`` with the create-time acquisition defaults WRITTEN into
+    ``od_acquisition``, never left implicit -- an implicit default would
+    re-resolve against whatever is installed when the run is resumed.
 
-    Against such a curve the default must be True -- the curve was fit on
-    LED-on minus LED-off signal -- and it is WRITTEN into the experiment's
-    config, never left implicit: an implicit default would re-resolve
-    against whatever curve is installed when the run is resumed. Against a
-    non-dark-subtracted curve nothing changes (the module default, False, is
-    fixed), so pre-Session-AA configs stay byte-identical. An explicit value
-    is never overwritten; the create-time guard judges it."""
+    - ``record_dark: True`` for every new experiment: the raw dark counts
+      go into vialNN_OD.csv so a better curve can be applied post hoc.
+    - ``dark_subtract: True`` when the run's OD curve is dark-subtracted
+      (Session AA): it was fit on LED-on minus LED-off signal.
+
+    An explicit value is never overwritten; the create-time guard judges
+    it."""
     params = dict(parameters or {})
-    if not curve_dark_subtracted:
-        return params
     block = params.get("od_acquisition")
     block = dict(block) if isinstance(block, dict) else {}
-    block.setdefault("dark_subtract", True)
+    block.setdefault("record_dark", True)
+    if curve_dark_subtracted:
+        block.setdefault("dark_subtract", True)
     params["od_acquisition"] = block
     return params
 
