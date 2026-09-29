@@ -431,7 +431,11 @@ class MockSerialManager(OdCurveMixin):
                 od = np.asarray(self.od_abs, dtype=float)
                 lit = dark_counts + a + (b - a) / (1.0 + np.power(10.0, d * (c - od)))
             elif self.od_cal is not None:
+                # Invert each vial's composed curve; on a dark-subtracted
+                # vial that is the signal ABOVE the dark floor, as in
+                # read_od_enhanced's default mode.
                 lit = self._od_abs_to_raw(np.asarray(self.od_abs, dtype=float))
+                lit = lit + np.where(self._od_ds_by_vial, dark_counts, 0.0)
             else:
                 lit = np.full(N_VIALS, float(self.mock_uncal_signal_counts))
             # Per vial: a dark LED reads the dark floor, a lit one the signal.

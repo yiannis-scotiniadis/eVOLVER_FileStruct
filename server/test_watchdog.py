@@ -189,7 +189,9 @@ def test_monitor_thread_lifecycle() -> None:
     wd.start()
     try:
         deadline = time.monotonic() + 3.0
-        while time.monotonic() < deadline and not wd.triggered:
+        # triggered latches before _fire() runs the shutdown, so wait on
+        # both or the assertions race the monitor thread.
+        while time.monotonic() < deadline and not (wd.triggered and triggers):
             time.sleep(0.05)
         assert wd.triggered, "watchdog did not fire within 3 s"
         assert fake.shutdown_count >= 1

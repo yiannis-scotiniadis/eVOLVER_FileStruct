@@ -582,6 +582,17 @@ def _parse_od_acquisition(parameters: dict) -> dict:
     }
 
 
+def od_curve_dark_subtracted(calibration: Optional[dict], manager) -> bool:
+    """Whether the run's OD curve was fit on dark-subtracted signal: its
+    pinned organism profile's flag (``calibration.od_dark_subtracted``,
+    written at create), else -- a config from before profiles, or a caller
+    that pins none -- the manager's default curve."""
+    flag = (calibration or {}).get("od_dark_subtracted")
+    if isinstance(flag, bool):
+        return flag
+    return bool(getattr(manager, "od_cal_dark_subtracted", False))
+
+
 def materialize_od_acquisition(parameters: dict, curve_dark_subtracted: bool) -> dict:
     """``parameters`` with the create-time acquisition defaults WRITTEN into
     ``od_acquisition``, never left implicit -- an implicit default would
@@ -1073,7 +1084,7 @@ class ExperimentEngine:
 
         # Validate the optional od_acquisition block up front so a malformed
         # config fails at create time (HTTP 400) rather than at first read.
-        curve_ds = bool(getattr(self._manager, "od_cal_dark_subtracted", False))
+        curve_ds = od_curve_dark_subtracted(calibration, self._manager)
         parameters = materialize_od_acquisition(parameters or {}, curve_ds)
         od_acq = _parse_od_acquisition(parameters)
         # Dark-subtraction coherence guard (SPEC §19.2 / CALIBRATION_PROTOCOL
@@ -1203,7 +1214,8 @@ class ExperimentEngine:
                 self._register_owned_vessels_locked(name, normalized_media)
             self._save_state_locked()
 
-        created_event: dict = {"type": "created", "name": name, "vials": self._vials}
+        created_event: dict = {"type": "created", "name": name, "vials": self._vials,
+                               **self._organism_fields()}
         if grouped:
             created_event["groups"] = [g.summary() for g in group_list]
         self._broadcast_event(created_event)
@@ -1377,7 +1389,8 @@ class ExperimentEngine:
                 params.get("efflux_extra_seconds", DEFAULT_EFFLUX_EXTRA_SECONDS)
             )
 
-        self._broadcast_event({"type": "started", "name": cfg["name"], "vials": self._vials})
+        self._broadcast_event({"type": "started", "name": cfg["name"], "vials": self._vials,
+                               **self._organism_fields()})
         # X-1 (CONTROL_MODE_AUDIT.md / SPEC §16.2): efflux overrun is what
         # engages the ONLY volume-regulation loop this machine has -- the
         # efflux straw draws air once the level reaches its tip, pinning
@@ -2409,6 +2422,7 @@ class ExperimentEngine:
                 "stop_reason": self._stop_reason,
                 "operator": (self._config or {}).get("operator", ""),
                 "expected_end": (self._config or {}).get("expected_end"),
+                **self._organism_fields(),
                 "elapsed_hours": round(elapsed_h, 4),
                 "vials": self._vials,
                 "groups": [
@@ -3560,6 +3574,18 @@ class ExperimentEngine:
             stir_list[vial] = self._stir_by_vial.get(vial, 0)
         self._manager.set_stir(stir_list)
 
+    def _organism_fields(self) -> dict:
+        """The organism and the OD calibration profile + version this run
+        pinned at create (its ``calibration`` block), for status payloads
+        and lifecycle events -- so events.csv records what the OD numbers
+        went through. ``organism`` is None for a run from before profiles."""
+        cal = (self._config or {}).get("calibration") or {}
+        return {
+            "organism": cal.get("od_organism"),
+            "od_profile": cal.get("od_profile"),
+            "od_version": cal.get("od"),
+        }
+
     def reapply_temperature_targets(self) -> list[int]:
         """Recompute every live vial's heater setpoint from its group's °C
         target through the CURRENT calibration, and re-send.
@@ -4181,7 +4207,8 @@ class ExperimentEngine:
             except Exception:
                 log.exception("resume: re-send actuators failed")
 
-        self._broadcast_event({"type": "resumed", "name": winner, "vials": self._vials})
+        self._broadcast_event({"type": "resumed", "name": winner, "vials": self._vials,
+                               **self._organism_fields()})
         log.info("experiment '%s' resumed on startup", winner)
         return winner
 

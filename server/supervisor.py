@@ -63,6 +63,7 @@ from experiment_engine import (
     InvalidExperimentStateError,
     _parse_od_acquisition,
     materialize_od_acquisition,
+    od_curve_dark_subtracted,
 )
 from vessels import VesselRegistry
 
@@ -403,12 +404,11 @@ class ExperimentSupervisor:
                     f"vials {taken} belong to experiment {who}; a vial can be "
                     "in one experiment at a time"
                 )
-            # Resolve the dark_subtract default against the installed curve
-            # BEFORE comparing with the running experiments, whose configs
-            # carry the resolved value.
+            # Resolve the acquisition defaults against THIS run's pinned OD
+            # profile before comparing with the loaded experiments.
             parameters = materialize_od_acquisition(
                 parameters or {},
-                bool(getattr(self._manager, "od_cal_dark_subtracted", False)),
+                od_curve_dark_subtracted(calibration, self._manager),
             )
             self._check_od_acquisition_locked(parameters)
             self._check_vessel_sharing_locked(name, mode, vials, parameters, media, groups)
@@ -432,14 +432,16 @@ class ExperimentSupervisor:
         """One OD read serves all sixteen vials, so acquisition settings are a
         machine property (PARALLEL_EXPERIMENTS.md T2). ``n_samples`` merges by
         taking the maximum -- more samples is strictly better, just slower --
-        but aggregation and dark subtraction cannot differ."""
+        but aggregation cannot differ. Dark subtraction CAN: it is per vial,
+        following each vial's organism curve (an E. coli profile fit on
+        dark-subtracted signal beside a run on the 2016 raw-signal curve)."""
         try:
             new = _parse_od_acquisition(parameters)
         except ValueError:
             return  # the engine reports the malformed block
         for other, engine in self._runs.items():
             cur = engine.od_acquisition_params()
-            for key in ("agg", "dark_subtract"):
+            for key in ("agg",):
                 if cur.get(key) != new.get(key):
                     raise ConflictError(
                         f"od_acquisition.{key}={new.get(key)!r} conflicts with "
@@ -705,6 +707,9 @@ class ExperimentSupervisor:
         merged = dict(params[0])
         merged["n_samples"] = max(int(p["n_samples"]) for p in params)
         merged["n_dark"] = max(int(p["n_dark"]) for p in params)
+        # Per vial, as each vial's curve wants (the reader's auto mode): the
+        # runs' own dark_subtract equals their curve's by the create guard.
+        merged["dark_subtract"] = None
         # Any run that records the dark gets it recorded for every vial (one
         # read serves all sixteen) -- and a dark read needs n_dark >= 1.
         merged["record_dark"] = any(bool(p.get("record_dark")) for p in params)
@@ -933,8 +938,14 @@ class ExperimentSupervisor:
     # Resume
     # ------------------------------------------------------------------
 
-    def resume_on_startup(self) -> list[str]:
+    def resume_on_startup(self, prepare: Optional[Callable[[str], None]] = None) -> list[str]:
         """Resume EVERY experiment whose state.json says RUNNING.
+
+        ``prepare(name)`` runs before each run is loaded, i.e. before the
+        sensor loop can tick it: the app uses it to put the run's organism
+        OD curve and its per-run blank on its vials, so not one row is
+        logged or controlled on the default curve. A failing prepare is
+        alerted and the run still resumes.
 
         Before parallel experiments all but the most recent were demoted to
         ERROR. Now each resumes on its own engine -- unless two claim the same
@@ -989,6 +1000,17 @@ class ExperimentSupervisor:
         for name, state in candidates:
             if name in conflicted:
                 continue
+            if prepare is not None:
+                try:
+                    prepare(name)
+                except Exception as exc:
+                    log.exception("preparing '%s' for resume failed", name)
+                    self._alert(
+                        "critical",
+                        f"Experiment '{name}': its OD calibration could not be "
+                        f"re-applied before resume ({exc}) — check its OD",
+                        category="calibration", dedup_key=("resume_prepare_failed", name),
+                    )
             engine = self._new_engine()
             try:
                 with self._lock:
@@ -1058,6 +1080,8 @@ class ExperimentSupervisor:
                 "mode": s.get("mode"),
                 "operator": s.get("operator") or "",
                 "expected_end": s.get("expected_end"),
+                "organism": s.get("organism"),
+                "od_profile": s.get("od_profile"),
                 "vials": s.get("vials", []),
                 "elapsed_hours": s.get("elapsed_hours"),
                 "groups": [

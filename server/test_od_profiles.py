@@ -514,3 +514,348 @@ def test_staleness_follows_the_loaded_experiments_pinned_profile():
         assert od["profile"] == "e-coli" and od["stale"] is False, od
         default = svc.store.staleness()["od"]
         assert default["profile"] == "legacy-2016" and default["stale"] is True
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: a run reads on its organism's pinned curve -- create, start,
+# stop, resume
+# ---------------------------------------------------------------------------
+
+import threading  # noqa: E402
+import time  # noqa: E402
+
+from test_calibration_api import (  # noqa: E402
+    _experiment_body,
+    _make_app,
+    _state,
+    _warm_thermal_tracker,
+)
+
+# Two organisms whose curves differ from the default and from each other:
+# A is dark-subtracted, B reads the raw lit signal (the same truth, with its
+# asymptotes carried up by the dark floor -- an exact conversion).
+TRUTH_A = _ds_shift(LEGACY_OD)
+TRUTH_A[2] -= 0.4
+TRUTH_B = _ds_shift(LEGACY_OD)
+TRUTH_B[2] += 0.3
+RAW_B = TRUTH_B.copy()
+RAW_B[0] += DARK
+RAW_B[1] += DARK
+
+
+def _install(store, pid, organism, rows, ds, version):
+    env = make_envelope(
+        "od", operator="t", source="od-dilution-series", conditions={"n": 1},
+        data={"rows": np.asarray(rows).tolist(), "dark_subtracted": ds},
+        fit={"per_vial_profile": [pid] * N_VIALS}, version=version,
+    )
+    return store.save_od_profile_version(pid, organism, env)
+
+
+def _body(name, vials, profile=None):
+    body = _experiment_body(name)
+    body["vials"] = list(vials)
+    body["media"]["vial_to_bottle"] = {str(v): "b1" for v in vials}
+    if profile is not None:
+        body["od_profile"] = profile
+    return body
+
+
+def _stop_app(flask_app, threads_before):
+    _state(flask_app).sensor_thread_stop.set()
+    for t in set(threading.enumerate()) - threads_before:
+        if t.name == "sensor-loop":
+            t.join(timeout=5)
+
+
+def _alerts(state, key_part):
+    return [e for e in state.event_log.recent() if key_part in (e.get("message") or "")]
+
+
+def test_two_organisms_read_their_own_curves_in_one_acquisition():
+    threads_before = set(threading.enumerate())
+    with tempfile.TemporaryDirectory() as tmp:
+        flask_app = _make_app(Path(tmp))
+        try:
+            state = _state(flask_app)
+            store = state.cal_service.store
+            _install(store, "org-a", "Organism A", TRUTH_A, True, "2026-09-01T000000Z")
+            _install(store, "org-b", "Organism B", RAW_B, False, "2026-09-02T000000Z")
+            c = flask_app.test_client()
+            r = c.post("/api/experiments/create", json=_body("ra", range(0, 4), "org-a"))
+            assert r.status_code == 200, r.get_json()
+            assert r.get_json()["organism"] == "Organism A"
+            r = c.post("/api/experiments/create", json=_body("rb", range(4, 8), "org-b"))
+            assert r.status_code == 200, r.get_json()
+
+            # The photodiodes see each organism's own truth on its vials.
+            truth = _ds_shift(LEGACY_OD)
+            truth[:, 0:4] = TRUTH_A[:, 0:4]
+            truth[:, 4:8] = TRUTH_B[:, 4:8]
+            state.manager.set_true_od_curve(truth, dark_counts=DARK)
+            state.manager.set_true_od(range(N_VIALS), 0.8)
+            rd = state.manager.read_od_enhanced(2125, n_samples=5, dark_subtract=None,
+                                                record_dark=True)
+            for v in range(8):
+                assert abs(rd.calibrated[v] - 0.8) < 1e-9, (v, rd.calibrated[v])
+            assert rd.dark_subtracted[:8] == [True] * 4 + [False] * 4
+            # The default curve still serves the idle vials.
+            assert np.allclose(state.manager.od_cal[:, 12], LEGACY_OD[:, 12])
+
+            cfg = json.loads((Path(tmp) / "experiments" / "ra" / "config.json").read_text())
+            cal = cfg["calibration"]
+            assert cal["od"] == "2026-09-01T000000Z" and cal["od_profile"] == "org-a"
+            assert cal["od_organism"] == "Organism A" and cal["od_dark_subtracted"] is True
+            snap = json.loads((Path(tmp) / "experiments" / "ra" / "od_calibration.json").read_text())
+            assert snap["version"] == "2026-09-01T000000Z"
+            created = [e for e in state.event_log.recent()
+                       if (e.get("data") or {}).get("od_profile") == "org-b"]
+            assert created, "the created event carries the organism"
+            summary = {x["name"]: x for x in state.engine.experiments_summary()}
+            assert summary["rb"]["organism"] == "Organism B"
+        finally:
+            _stop_app(flask_app, threads_before)
+
+
+def test_stop_and_emergency_stop_return_the_vials_to_the_default_curve():
+    threads_before = set(threading.enumerate())
+    with tempfile.TemporaryDirectory() as tmp:
+        flask_app = _make_app(Path(tmp))
+        try:
+            state = _state(flask_app)
+            _install(state.cal_service.store, "org-a", "A", TRUTH_A, True, "2026-09-01T000000Z")
+            c = flask_app.test_client()
+            assert c.post("/api/experiments/create",
+                          json=_body("r1", [0], "org-a")).status_code == 200
+            assert c.post("/api/experiments/create",
+                          json=_body("r2", [1], "org-a")).status_code == 200
+            assert np.allclose(state.manager.od_cal[:, :2], TRUTH_A[:, :2])
+            assert state.manager.od_dark_subtracted_by_vial[:2] == [True, True]
+
+            c.post("/api/experiments/r1/stop")
+            assert np.allclose(state.manager.od_cal[:, 0], LEGACY_OD[:, 0])
+            assert np.allclose(state.manager.od_cal[:, 1], TRUTH_A[:, 1])   # r2's own
+
+            assert c.post("/api/experiments/r2/start",
+                          json={"allow_missing_od_blank": True}).status_code == 200
+            assert c.post("/api/actuators/emergency_stop").status_code == 200
+            assert np.allclose(state.manager.od_cal, LEGACY_OD)
+            assert not any(state.manager.od_dark_subtracted_by_vial)
+        finally:
+            _stop_app(flask_app, threads_before)
+
+
+def test_the_designer_must_name_a_known_organism_and_owns_no_od_keys():
+    threads_before = set(threading.enumerate())
+    with tempfile.TemporaryDirectory() as tmp:
+        flask_app = _make_app(Path(tmp))
+        try:
+            state = _state(flask_app)
+            _install(state.cal_service.store, "org-a", "A", TRUTH_A, True, "2026-09-01T000000Z")
+            c = flask_app.test_client()
+            r = c.post("/api/experiments/create", json=_body("x", [0], "pichia"))
+            assert r.status_code == 400 and r.get_json()["code"] == "unknown_od_profile"
+            assert "org-a" in r.get_json()["profiles"]
+            # An organism cannot be created by typing it into the designer.
+            assert "pichia" not in state.cal_service.store.od_profiles()
+            for key in ("od", "od_profile", "od_dark_subtracted"):
+                body = _body("x", [0], "org-a")
+                body["calibration"] = {key: "2020-01-01T000000Z"}
+                r = c.post("/api/experiments/create", json=body)
+                assert r.status_code == 400, (key, r.get_json())
+            assert not (Path(tmp) / "experiments" / "x").exists()
+
+            # Omitted: the default slot, labelled and warned about.
+            r = c.post("/api/experiments/create", json=_body("y", [0]))
+            assert r.status_code == 200, r.get_json()
+            d = r.get_json()
+            assert d["od_profile"] == "legacy-2016"
+            assert d["organism"] == LEGACY_OD_ORGANISM
+            assert any("never verified" in w for w in d["warnings"])
+        finally:
+            _stop_app(flask_app, threads_before)
+
+
+def test_a_partly_measured_profile_warns_about_the_carried_vials():
+    threads_before = set(threading.enumerate())
+    with tempfile.TemporaryDirectory() as tmp:
+        flask_app = _make_app(Path(tmp))
+        try:
+            store = _state(flask_app).cal_service.store
+            env = make_envelope(
+                "od", operator="t", source="od-dilution-series", conditions={"n": 1},
+                data={"rows": TRUTH_A.tolist(), "dark_subtracted": True},
+                fit={"per_vial_profile": ["org-a"] * 2 + ["legacy-2016"] * 14},
+                version="2026-09-01T000000Z",
+            )
+            store.save_od_profile_version("org-a", "A", env)
+            r = flask_app.test_client().post(
+                "/api/experiments/create", json=_body("x", [0, 1, 2, 3], "org-a"))
+            assert r.status_code == 200, r.get_json()
+            assert any("vials [2, 3] were never measured" in w
+                       for w in r.get_json()["warnings"]), r.get_json()["warnings"]
+        finally:
+            _stop_app(flask_app, threads_before)
+
+
+def test_the_blank_and_growth_context_follow_the_runs_profile():
+    threads_before = set(threading.enumerate())
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        flask_app = _make_app(tmp)
+        try:
+            state = _state(flask_app)
+            # Profile rows the legacy QC would call suspect on no vial.
+            rows = TRUTH_A.copy()
+            rows[0] = 1000.0
+            _install(state.cal_service.store, "org-a", "A", rows, True, "2026-09-01T000000Z")
+            c = flask_app.test_client()
+            assert c.post("/api/experiments/create",
+                          json=_body("b1", [0], "org-a")).status_code == 200
+            _warm_thermal_tracker(state, [0])
+            sid = c.post("/api/calibration/od/blank/start", json={}).get_json()["session"]
+            assert c.post("/api/calibration/od/blank/dark", json={"session": sid}).status_code == 200
+            assert c.post("/api/calibration/od/blank/measure", json={"session": sid}).status_code == 200
+            _warm_thermal_tracker(state, [0])
+            r = c.post("/api/calibration/od/blank/commit",
+                       json={"session": sid, "operator": "t"})
+            assert r.status_code == 200, r.get_json()
+            blank = json.loads((tmp / "experiments" / "b1" / "od_blank.json").read_text())
+            assert blank["conditions"]["parent_od_cal"] == "2026-09-01T000000Z"
+            assert blank["conditions"]["od_profile"] == "org-a"
+            # c_run re-anchors the ORGANISM's row 2, on the organism's signal.
+            c_run = float(blank["fit"]["c_run"]["0"])
+            signal = float(blank["data"]["blank_signal"][0])
+            assert abs(F.od_from_signal(signal, rows[0, 0], rows[1, 0], c_run, rows[3, 0])) < 1e-9
+            assert abs(float(state.manager.od_cal[2, 0]) - c_run) < 1e-9
+
+            ctx = state.cal_service.growth_context("b1")
+            assert ctx["suspect_vials"] == []
+            legacy_suspect = [v for v in range(N_VIALS) if LEGACY_OD[0, v] > 40000.0]
+            assert state.cal_service.growth_context(None)["suspect_vials"] == legacy_suspect
+            assert c.post("/api/experiments/b1/start").status_code == 200
+        finally:
+            _stop_app(flask_app, threads_before)
+
+
+def _od_row(path: Path, after: int, timeout: float = 10.0) -> dict:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        rows = _rows(path)
+        if len(rows) > after:
+            return dict(zip(rows[0], rows[after]))
+        time.sleep(0.05)
+    raise AssertionError(f"no OD row {after} in {path}")
+
+
+def test_a_resumed_run_reads_its_first_row_on_its_pinned_curve_and_blank():
+    import app as A
+    saved = (A.SENSOR_LOOP_INTERVAL_SECONDS, A.OD_INTERVAL_SECONDS)
+    threads_before = set(threading.enumerate())
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        flask_app = _make_app(tmp)
+        try:
+            state = _state(flask_app)
+            _install(state.cal_service.store, "org-a", "A", TRUTH_A, True, "2026-09-01T000000Z")
+            c = flask_app.test_client()
+            assert c.post("/api/experiments/create",
+                          json=_body("res", [0], "org-a")).status_code == 200
+            _warm_thermal_tracker(state, [0])
+            sid = c.post("/api/calibration/od/blank/start", json={}).get_json()["session"]
+            c.post("/api/calibration/od/blank/dark", json={"session": sid})
+            c.post("/api/calibration/od/blank/measure", json={"session": sid})
+            _warm_thermal_tracker(state, [0])
+            c_run = c.post("/api/calibration/od/blank/commit",
+                           json={"session": sid, "operator": "t"}).get_json()["c_run"]["0"]
+            assert c.post("/api/experiments/res/start").status_code == 200
+            # A newer version of the profile lands while the run is down.
+            _install(state.cal_service.store, "org-a", "A", TRUTH_B, True, "2026-09-03T000000Z")
+        finally:
+            _stop_app(flask_app, threads_before)
+
+        # "Restart": a fresh app and manager resume the run from state.json.
+        A.SENSOR_LOOP_INTERVAL_SECONDS = A.OD_INTERVAL_SECONDS = 0.05
+        path = tmp / "experiments" / "res" / "vial00_OD.csv"
+        before = len(_rows(path)) if path.exists() else 1
+        app2 = _make_app(tmp)
+        try:
+            state2 = _state(app2)
+            assert state2.engine.get_run("res") is not None, "the run resumed"
+            want = TRUTH_A[:, 0].copy()
+            want[2] = c_run
+            assert np.allclose(state2.manager.od_cal[:, 0], want)
+            row = _od_row(path, before)
+            assert row["dark_subtracted"] == "1"
+            signal = float(row["lit_adc"]) - float(row["dark_used"])
+            od = F.od_from_signal(signal, *want)
+            assert abs(od - float(row["calibrated_od"])) < 1e-3, (od, row)
+            # It stays on its pinned version; the newer one is only mentioned.
+            infos = _alerts(state2, "2026-09-03T000000Z")
+            assert infos and infos[0]["level"] == "info", infos
+            assert not _alerts(state2, "is missing")
+        finally:
+            _stop_app(app2, threads_before)
+            A.SENSOR_LOOP_INTERVAL_SECONDS, A.OD_INTERVAL_SECONDS = saved
+
+
+def test_pre_profile_configs_resume_and_a_lost_pin_is_quarantined():
+    threads_before = set(threading.enumerate())
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        flask_app = _make_app(tmp)
+        try:
+            c = flask_app.test_client()
+            for name, vial in (("old", 0), ("older", 1), ("lost", 2)):
+                assert c.post("/api/experiments/create",
+                              json=_body(name, [vial])).status_code == 200
+                assert c.post(f"/api/experiments/{name}/start",
+                              json={"allow_missing_od_blank": True}).status_code == 200
+        finally:
+            _stop_app(flask_app, threads_before)
+
+        def edit(name, fn):
+            p = tmp / "experiments" / name / "config.json"
+            cfg = json.loads(p.read_text())
+            fn(cfg)
+            p.write_text(json.dumps(cfg))
+
+        # Session O config: a version, no profile. Pre-Session-O: nothing.
+        edit("old", lambda cfg: [cfg["calibration"].pop(k) for k in list(cfg["calibration"])
+                                 if k.startswith("od") and k != "od"])
+        edit("older", lambda cfg: cfg.pop("calibration"))
+        edit("lost", lambda cfg: cfg["calibration"].update(
+            od="2020-01-01T000000Z", od_profile="gone"))
+
+        app2 = _make_app(tmp)
+        try:
+            state2 = _state(app2)
+            assert np.allclose(state2.manager.od_cal[:, :2], LEGACY_OD[:, :2])
+            assert np.all(np.isnan(state2.manager.od_cal[:, 2]))
+            crit = _alerts(state2, "is missing")
+            assert len(crit) == 1 and "'lost'" in crit[0]["message"]
+            assert crit[0]["level"] == "critical"
+            # Stopping the quarantined run hands vial 2 back its default curve.
+            assert app2.test_client().post("/api/experiments/lost/stop").status_code == 200
+            assert np.allclose(state2.manager.od_cal[:, 2], LEGACY_OD[:, 2])
+        finally:
+            _stop_app(app2, threads_before)
+
+
+def test_start_refuses_a_run_whose_pinned_curve_is_gone():
+    threads_before = set(threading.enumerate())
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        flask_app = _make_app(tmp)
+        try:
+            c = flask_app.test_client()
+            assert c.post("/api/experiments/create", json=_body("s", [3])).status_code == 200
+            p = tmp / "experiments" / "s" / "config.json"
+            cfg = json.loads(p.read_text())
+            cfg["calibration"].update(od="2020-01-01T000000Z", od_profile="gone")
+            p.write_text(json.dumps(cfg))
+            r = c.post("/api/experiments/s/start", json={"allow_missing_od_blank": True})
+            assert r.status_code == 409 and r.get_json()["code"] == "od_pin_missing"
+            assert _state(flask_app).engine.get_run("s").status()["status"] == "created"
+        finally:
+            _stop_app(flask_app, threads_before)

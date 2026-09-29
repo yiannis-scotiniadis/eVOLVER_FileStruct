@@ -1351,6 +1351,10 @@ class OdBlankSession:
         self.created_at = _iso_now()
         self.dark: Optional[dict] = None
         self.blank: Optional[dict] = None
+        # The run's pinned OD curve (organism profile + version): the blank
+        # re-anchors THAT curve, never "whatever is current".
+        self.od_profile: Optional[str] = None
+        self.od_version: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -3792,6 +3796,9 @@ class CalibrationService:
                 targets_c=targets,
                 n_samples=int(n_samples),
             )
+            pin = self._od_pin_from_config(config)
+            if pin is not None:
+                self._blank.od_profile, self._blank.od_version = pin
             return {
                 "session": self._blank.id,
                 "experiment": experiment,
@@ -3800,6 +3807,17 @@ class CalibrationService:
                 "thermal": self.tracker.settled(vials, targets),
                 "stir_mismatch": self._stir_mismatch(stir_by_vial),
             }
+
+    def _od_pin_from_config(self, config: Optional[dict]) -> Optional[tuple[str, str]]:
+        """``(profile, version)`` from an experiment config's calibration
+        block; a pre-profile config's profile is its version's owner."""
+        cal = (config or {}).get("calibration") or {}
+        version = cal.get("od")
+        if not version:
+            return None
+        profile = cal.get("od_profile") or od_profile_id_of(
+            self.store.get_version("od", version))
+        return (str(profile), str(version)) if profile else None
 
     def _stir_mismatch(self, expected: dict) -> dict:
         """Vials whose actually-commanded stir differs from the run's.
@@ -3856,12 +3874,18 @@ class CalibrationService:
             s.blank = stats
             return {"session": s.id, "phase": "blank", **stats}
 
-    def _previous_blank(self, excluding_experiment: str) -> Optional[dict]:
+    def _previous_blank(self, excluding_experiment: str,
+                        od_profile: Optional[str] = None) -> Optional[dict]:
         """Most recent od_blank.json across experiments/ (the campaign
-        reference for the §5.4 drift checks), excluding the current one."""
+        reference for the §5.4 drift checks), excluding the current one --
+        and, with ``od_profile``, only blanks taken on that organism's
+        curve: another organism's run used another medium and vials, and
+        its blank median is no reference for this one. A blank from before
+        profiles counts as the default slot's."""
         latest: Optional[tuple[str, dict]] = None
         if not self.experiments_root.is_dir():
             return None
+        default = self.store.od_default_profile()
         for path in self.experiments_root.glob("*/od_blank.json"):
             if path.parent.name == excluding_experiment:
                 continue
@@ -3869,6 +3893,10 @@ class CalibrationService:
                 env = json.loads(path.read_text(encoding="utf-8"))
             except Exception:
                 continue
+            if od_profile is not None:
+                theirs = (env.get("conditions") or {}).get("od_profile") or default
+                if theirs != od_profile:
+                    continue
             version = str(env.get("version", ""))
             if latest is None or version > latest[0]:
                 latest = (version, env)
@@ -3909,9 +3937,12 @@ class CalibrationService:
                     f"in GET status: {json.dumps(thermal['per_vial'])}"
                 )
 
-            od_env = self.store.get_current("od")
+            if s.od_version is not None:
+                od_env = self.store.get_od_profile(s.od_profile, s.od_version)
+            else:
+                od_env = self.store.get_current("od")
             if od_env is None:
-                raise CalibrationConflict("no OD calibration installed")
+                raise CalibrationConflict("the run's OD calibration is not installed")
             od_cal = np.asarray(od_env["data"]["rows"], dtype=float)
             # A dark-subtracted curve (Session AA's dilution series) needs a
             # dark-subtracted blank, and the reverse: mixing the two is
@@ -3964,7 +3995,7 @@ class CalibrationService:
                         f"{BLANK_SIGNAL_SD_MAX:.0f} counts (provisional) — "
                         "bubbles, wobbling stir bar, or poorly seated vial"
                     )
-            previous = self._previous_blank(s.experiment)
+            previous = self._previous_blank(s.experiment, od_profile_id_of(od_env))
             reference = None
             if previous is not None:
                 reference = previous.get("version")
@@ -4044,6 +4075,7 @@ class CalibrationService:
                     },
                     "target_temp_c": {str(k): v for k, v in s.targets_c.items()},
                     "parent_od_cal": od_env.get("version"),
+                    "od_profile": od_profile_id_of(od_env),
                     "dark_subtracted": dark_subtracted,
                 },
                 data={
@@ -4161,7 +4193,17 @@ class CalibrationService:
         blank_present = False
         suspect: list = []
 
-        od_env = self.store.get_current("od")
+        # The rows this run's OD actually goes through: its pinned organism
+        # profile version, not the machine default.
+        pin = self.store.experiment_od_pin(experiment) if experiment else None
+        od_env = None
+        if pin is not None:
+            try:
+                od_env = self.store.get_od_profile(*pin)
+            except ValueError:
+                od_env = None
+        if od_env is None:
+            od_env = self.store.get_current("od")
         od_rows = None
         if od_env is not None:
             rows = (od_env.get("data") or {}).get("rows")

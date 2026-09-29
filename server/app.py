@@ -53,6 +53,7 @@ from calibration_service import (  # noqa: E402
     CalibrationConflict,
     CalibrationService,
     QCRefusal,
+    RESERVED_OD_PROFILES,
     SUBSYSTEMS as CAL_SUBSYSTEMS,
 )
 from data_logger import DataLogger  # noqa: E402
@@ -812,18 +813,19 @@ def create_app(use_mock: bool):
             timestamp=payload.get("timestamp"),
         )
         if kind == "stopped":
-            # A per-run OD blank belongs to one run (SPEC §19.2): restore the
-            # pristine curve for THAT run's vials only. With parallel
-            # experiments, clearing all sixteen would silently revert every
-            # other running experiment's OD to the offset curve.
+            # The run's organism OD curve and its per-run blank belong to
+            # THAT run's vials (SPEC §19.2): return only those vials to the
+            # default curve. With parallel experiments, releasing all sixteen
+            # would silently move every other run onto the wrong organism's
+            # curve. Every unload path (stop, E-stop, shutdown) emits this.
             try:
-                clear = getattr(state.manager, "clear_od_blank", None)
-                if clear is not None:
-                    clear(payload.get("vials"))
+                release = getattr(state.manager, "release_od_curve", None)
+                if release is not None and payload.get("vials"):
+                    release(payload.get("vials"))
                     if getattr(state.manager, "od_cal", None) is not None:
                         state.od_cal = np.asarray(state.manager.od_cal)
             except Exception:
-                log.exception("clearing per-run OD blank on stop failed")
+                log.exception("releasing the run's OD curve on stop failed")
         socketio.emit("experiment_event", payload)
 
     def _on_watchdog_trigger(reason: str) -> None:
@@ -934,14 +936,17 @@ def create_app(use_mock: bool):
     # Exposed for the API tests, which drive installs white-box.
     state.reload_calibration = _reload_calibration
 
-    def _blank_is_stale(blank: dict | None) -> bool:
+    def _blank_is_stale(blank: dict | None, name: str) -> bool:
         """A per-run blank re-anchors ONE curve: its c_run is meaningless on
         any other (and against a dark-subtracted curve it was computed from
-        the wrong signal). Stale once a new OD version has been installed."""
+        the wrong signal). Stale unless it was taken on the curve the run
+        pinned at create (its organism profile + version)."""
         if blank is None:
             return False
         parent = (blank.get("conditions") or {}).get("parent_od_cal")
-        return parent != cal_service.store.current_versions().get("od")
+        pin = cal_service.store.experiment_od_pin(name)
+        pinned = pin[1] if pin else cal_service.store.current_versions().get("od")
+        return parent != pinned
 
     def _apply_experiment_blank(name: str) -> None:
         """Re-apply a committed per-run blank to the live manager (used on
@@ -950,7 +955,7 @@ def create_app(use_mock: bool):
         blank = cal_service.load_experiment_blank(name)
         if blank is None:
             return
-        if _blank_is_stale(blank):
+        if _blank_is_stale(blank, name):
             log.warning(
                 "not applying the OD blank for '%s': it was taken against OD "
                 "calibration %s, not the installed one", name,
@@ -967,6 +972,52 @@ def create_app(use_mock: bool):
                      name, len(c_run))
         except Exception:
             log.exception("failed to apply per-run OD blank for '%s'", name)
+
+    def _experiment_od_setup(name: str) -> bool:
+        """Put the run's PINNED organism OD curve on its vials, then its
+        per-run blank. Called at create, before start, and -- through the
+        supervisor's resume hook -- before a resumed run can be ticked, so
+        no row is ever read on the default curve.
+
+        The pinned version is used even if the profile has since been
+        recalibrated: a run keeps the curve it started with. A config from
+        before calibration provenance existed pins nothing and reads on the
+        default slot, as it always did. If a RECORDED version's envelope is
+        gone, the vials are QUARANTINED (NaN curve -> every read
+        out_of_range, no OD-driven control), the operator is told, and this
+        returns False."""
+        config_path = cal_service.experiments_root / name / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        vials = [int(v) for v in config.get("vials", [])]
+        recorded = (config.get("calibration") or {}).get("od")
+        pin = cal_service.store.experiment_od_pin(name)
+        env = None
+        if pin is not None:
+            try:
+                env = cal_service.store.get_od_profile(*pin)
+            except ValueError:
+                env = None
+        elif not recorded:
+            env = cal_service.store.get_current("od")
+        if env is None:
+            state.manager.assign_od_curve(vials, np.full((4, N_VIALS), np.nan), False)
+            _sync_od_cal_from_manager()
+            _emit_alert(
+                "critical",
+                f"Experiment '{name}': its pinned OD calibration "
+                f"{pin[1] if pin else '(none recorded)'} is missing — its "
+                "vials read out_of_range until it is restored",
+                category=evlog.CATEGORY_CALIBRATION,
+                dedup_key=("od_pin_missing", name),
+            )
+            return False
+        state.manager.assign_od_curve(
+            vials, np.asarray(env["data"]["rows"], dtype=float),
+            bool((env.get("data") or {}).get("dark_subtracted", False)),
+        )
+        _sync_od_cal_from_manager()
+        _apply_experiment_blank(name)
+        return True
 
     def _push_growth_context(name: str | None) -> None:
         """Give the engine the calibration facts its growth estimator needs:
@@ -1484,8 +1535,19 @@ def create_app(use_mock: bool):
             return blocked
         # SPEC §19.1 provenance: record the calibration versions this run
         # will use, plus the measured 32-pump flow rates when a complete pump
-        # calibration exists. Caller-supplied values win (deep-merged last).
+        # calibration exists. Caller-supplied values win (deep-merged last) --
+        # except the OD curve, which is server-owned: it is the organism
+        # profile the operator picked, pinned here and nowhere else.
         calibration_body = dict(body.get("calibration") or {})
+        caller_od = sorted(k for k in calibration_body if k.startswith("od"))
+        if caller_od:
+            return jsonify(error=(
+                f"calibration keys {caller_od} are set by the server from the "
+                "chosen organism profile — pass 'od_profile' instead"
+            )), 400
+        od_profile, od_env, od_error = _resolve_od_profile(body.get("od_profile"))
+        if od_error is not None:
+            return od_error
         try:
             versions = cal_service.store.current_versions()
             provenance = {
@@ -1498,6 +1560,15 @@ def create_app(use_mock: bool):
             calibration_body = {**provenance, **calibration_body}
         except Exception:
             log.exception("calibration provenance enrichment failed")
+        od_organism = cal_service.store.od_profiles()[od_profile]["organism"]
+        od_measured = cal_service.store.od_vials_measured(od_profile, od_env)
+        calibration_body.update({
+            "od": od_env["version"],
+            "od_profile": od_profile,
+            "od_organism": od_organism,
+            "od_dark_subtracted": bool(od_env["data"].get("dark_subtracted", False)),
+            "od_vials_measured": od_measured,
+        })
         try:
             groups = body.get("groups")
             config = state.engine.create_experiment(
@@ -1532,10 +1603,51 @@ def create_app(use_mock: bool):
         # a clipped chemostat bolus, a band whose whole-second truncation
         # eats a large share of each dilution. Hard errors already 400'd
         # above; these are for the wizard's review step to show.
+        name = config["name"]
+        warnings = list(config.get("warnings") or [])
+        # A snapshot of the curve beside the data: the run's OD can be
+        # rebuilt from its own directory, even off the Pi.
+        try:
+            (cal_service.experiments_root / name / "od_calibration.json").write_text(
+                json.dumps(od_env, indent=4), encoding="utf-8")
+        except Exception:
+            log.exception("writing od_calibration.json for '%s' failed", name)
+        # The organism's curve goes on the run's vials NOW: the per-run blank
+        # is taken on a CREATED run and must re-anchor that curve.
+        try:
+            if not _experiment_od_setup(name):
+                raise RuntimeError("the pinned OD calibration is missing")
+        except Exception as exc:
+            log.exception("assigning the OD curve for '%s' failed", name)
+            try:
+                state.engine.stop_experiment(name, reason="od_curve_failed")
+            except Exception:
+                log.exception("rolling back '%s' failed", name)
+            return jsonify(error=(
+                f"experiment '{name}' could not be given its OD curve ({exc}); "
+                "it was stopped"
+            )), 500
+        run_vials = [int(v) for v in config.get("vials", [])]
+        if od_profile in RESERVED_OD_PROFILES:
+            warnings.append(
+                f"OD goes through {od_organism!r}: never verified against a "
+                "spectrophotometer, organism unknown — calibrate this organism "
+                "(Calibration → OD series) before relying on absolute OD"
+            )
+        else:
+            unmeasured = sorted(set(run_vials) - set(od_measured))
+            if unmeasured:
+                warnings.append(
+                    f"vials {unmeasured} were never measured for {od_organism!r}: "
+                    "the profile carries the default curve on them"
+                )
         return jsonify(
             status="created",
-            name=config["name"],
-            warnings=config.get("warnings") or [],
+            name=name,
+            organism=od_organism,
+            od_profile=od_profile,
+            od_version=od_env["version"],
+            warnings=warnings,
         )
 
     @flask_app.route("/api/experiments/<name>/precondition", methods=["POST"])
@@ -1567,7 +1679,7 @@ def create_app(use_mock: bool):
         # for sterile medium, vial-dependent. Overridable only explicitly,
         # and the override is recorded through the alert funnel.
         blank_missing = not (EXPERIMENTS_DIR / name / "od_blank.json").is_file()
-        if not blank_missing and _blank_is_stale(cal_service.load_experiment_blank(name)):
+        if not blank_missing and _blank_is_stale(cal_service.load_experiment_blank(name), name):
             # Taken against an OD calibration that has since been replaced
             # (Session AA): it would re-anchor the wrong curve. Retake it --
             # or start without one (recorded), exactly as for a missing blank.
@@ -1592,6 +1704,22 @@ def create_app(use_mock: bool):
                 ),
                 code="missing_od_blank",
             ), 409
+        # The run's pinned organism curve and its blank go live BEFORE the
+        # run can be ticked: start_experiment makes it RUNNING under the
+        # shared lock, and the very next tick would otherwise log a row on
+        # whatever curve those vials last held.
+        try:
+            od_ready = _experiment_od_setup(name)
+        except Exception as exc:
+            log.exception("assigning the OD curve for '%s' failed", name)
+            return jsonify(error=f"could not load the OD curve of '{name}': {exc}"), 500
+        if not od_ready:
+            return jsonify(
+                error=(f"the OD calibration '{name}' pinned at create is missing "
+                       "from the store — restore it, or stop this run and "
+                       "create a new one"),
+                code="od_pin_missing",
+            ), 409
         try:
             state.engine.start_experiment(name)
         except InvalidExperimentStateError as exc:
@@ -1609,10 +1737,6 @@ def create_app(use_mock: bool):
                 category=evlog.CATEGORY_CALIBRATION,
                 dedup_key=("blank_override", name),
             )
-        else:
-            # Belt and braces: make sure the committed blank is live on the
-            # manager (commit already applied it in this process lifetime).
-            _apply_experiment_blank(name)
         # After the blank is live, so the per-vial OD floors are derived from
         # the calibration the run will actually use.
         _push_growth_context(name)
@@ -2136,6 +2260,31 @@ def create_app(use_mock: bool):
             return wrapper
         return decorate
 
+    def _resolve_od_profile(requested):
+        """``(profile_id, envelope, None)`` for a new experiment, or
+        ``(None, None, error_response)``. Omitted = the default slot (API
+        back-compat; the designer always sends one). Only profiles that
+        exist -- an organism comes into existence by being calibrated,
+        never by being typed here."""
+        profiles = cal_service.store.od_profiles()
+        pid = str(requested) if requested else cal_service.store.od_default_profile()
+        if pid is None:
+            return None, None, (jsonify(error="no OD calibration is installed"), 409)
+        if pid not in profiles:
+            return None, None, (jsonify(
+                error=(f"unknown organism profile {pid!r} — organisms are added "
+                       "by calibrating them (Calibration → OD series); known: "
+                       f"{sorted(profiles)}"),
+                code="unknown_od_profile",
+                profiles=sorted(profiles),
+            ), 400)
+        env = cal_service.store.get_od_profile(pid)
+        rows = np.asarray((env or {}).get("data", {}).get("rows", []), dtype=float)
+        if rows.shape != (4, N_VIALS) or not np.all(np.isfinite(rows)) \
+                or not np.all(rows[0] < rows[1]):
+            return None, None, (jsonify(error=f"OD profile {pid!r} has an unusable curve"), 409)
+        return pid, env, None
+
     def _loaded_experiment_info() -> tuple[str | None, str | None]:
         """The experiment the calibration surface reports on: a CREATED one
         (the next blank to take) before a RUNNING one."""
@@ -2653,6 +2802,8 @@ def create_app(use_mock: bool):
             "vials": s.get("vials", []),
             "operator": s.get("operator") or "",
             "expected_end": s.get("expected_end"),
+            "organism": s.get("organism"),
+            "od_profile": s.get("od_profile"),
             # Vial groups: small (name, mode, vials) so the dashboard can
             # colour cards per group without polling /status.
             "groups": [
@@ -3175,11 +3326,12 @@ def create_app(use_mock: bool):
         config.json recorded -- possible only if a Tier 3 install landed
         while its resume had failed, but then silent without this.
 
-        OD: its numbers are no longer comparable across the restart, and
-        its blank is not applied (_apply_experiment_blank) -- critical, the
-        operator decides. Temperature: the persisted raw setpoints were
-        converted through the old curve; recompute them from the °C
-        targets so the vials go to the temperature the run asked for."""
+        OD: nothing to do -- a run reads on the organism profile version it
+        pinned at create (_experiment_od_setup), whatever has been installed
+        since; the operator is told a newer curve exists. Temperature: the
+        persisted raw setpoints were converted through the old curve;
+        recompute them from the °C targets so the vials go to the
+        temperature the run asked for."""
         try:
             config = json.loads(
                 (EXPERIMENTS_DIR / name / "config.json").read_text(encoding="utf-8")
@@ -3188,16 +3340,19 @@ def create_app(use_mock: bool):
             return
         recorded = config.get("calibration") or {}
         current = cal_service.store.current_versions()
-        if recorded.get("od") and recorded.get("od") != current.get("od"):
-            _emit_alert(
-                "critical",
-                f"Experiment '{name}' resumed on OD calibration "
-                f"{current.get('od')}, not the {recorded.get('od')} it started "
-                "with — its OD is not comparable across the restart and its "
-                "per-run blank was not applied. Stop and restart the run.",
-                category=evlog.CATEGORY_CALIBRATION,
-                dedup_key=("resume_od_calibration_changed", name),
-            )
+        pin = cal_service.store.experiment_od_pin(name)
+        if pin is not None:
+            latest = (cal_service.store.od_profiles().get(pin[0]) or {}).get("version")
+            if latest and latest != pin[1]:
+                _emit_alert(
+                    "info",
+                    f"Experiment '{name}' resumed on its pinned OD calibration "
+                    f"{pin[1]} ({pin[0]}); {latest} has been installed for that "
+                    "profile since. The run keeps its own curve — apply the new "
+                    "one after the run with Recalibrate OD.",
+                    category=evlog.CATEGORY_CALIBRATION,
+                    dedup_key=("resume_od_calibration_changed", name),
+                )
         if (recorded.get("temperature")
                 and recorded.get("temperature") != current.get("temperature")):
             run = state.engine.get_run(name)
@@ -3220,12 +3375,12 @@ def create_app(use_mock: bool):
     # Runs after the sensor thread has started so the engine's run_cycle
     # ticks will pick up immediately.
     try:
-        for resumed in state.engine.resume_on_startup():
+        # prepare= puts each run's pinned organism curve and its blank (both
+        # live in memory) on its vials BEFORE the run is loaded, so the first
+        # tick after the restart already reads on them.
+        for resumed in state.engine.resume_on_startup(prepare=_experiment_od_setup):
             log.info("resumed experiment '%s' from previous server run", resumed)
             _check_resumed_calibration(resumed)
-            # The blank re-anchor lives in memory; a restart must re-apply it
-            # or the resumed run's OD silently reverts to the offset curve.
-            _apply_experiment_blank(resumed)
             _push_growth_context(resumed)
     except Exception:
         log.exception("resume_on_startup failed")
