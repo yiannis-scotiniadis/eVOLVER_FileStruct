@@ -281,6 +281,13 @@ Each function:
 > blank, idle reads and new experiments all use LED-on minus LED-off signal; a mismatch in
 > either direction is refused at create, and a blank taken on the previous curve is refused
 > at start (`stale_od_blank`).
+>
+> **Since Session AG (2026-09-29):** OD calibration is **per organism**. `current.json`'s
+> `"od"` is the machine *default* (what `OD_cal.txt` views and idle reads use — currently the
+> 2016 import, labelled "Unknown organism — 2016 inherited curve (unverified)"); named
+> organisms live in `"od_profiles"`, and only the OD dilution series creates or recalibrates
+> one. Each experiment pins one profile version at create and reads on it, per vial, for its
+> whole life. See fact 12 and `SPEC.md` §19.7.
 
 ### Temperature calibration (`temp_calibration.txt`)
 - 2 rows x 16 columns (slope and intercept per vial)
@@ -417,6 +424,8 @@ processes, owns `/dev/ttyAMA0` directly, and serves the dashboard at
 | Parallel experiments (independent experiments, vial ownership, shared bottles/carboys, machine hold, N-way resume) | Built | `server/supervisor.py`, `server/vessels.py`, SPEC §9.2 |
 | Tier 3 calibration wizards: thermistor two-point (P2 built into the cold phase, retarget, verify before install) and OD dilution series (four-parameter fit, dark-subtracted install) | Built (software) | `server/calibration_service.py`, `server/od_curve_fit.py`, `/api/calibration/temperature/*`, `od/series/*`, SPEC §19.5 |
 | Live calibration reload; machine-reserving Tier 3 sessions with their own heater watchdog | Built | `app.py:_reload_calibration`, `_calibration_tick`, `_cal_route(idle=…)` |
+| Per-organism OD profiles (series creates/recalibrates; designer picks; run pins; per-vial live curve) | Built | `calibration_service.py`, `serial_manager.OdCurveMixin`, `app._experiment_od_setup`, SPEC §19.7 |
+| `vialNN_OD.csv` schema 2 (raw lit/dark counts appended) and post-hoc OD recalibration (CLI, API, GUI) | Built | `data_logger.py`, `server/od_recalibrate.py`, `/api/experiments/{name}/recalibrate_od`, SPEC §8 |
 
 **Session N shipped 2026-08-23** — the per-vial growth-rate service: the estimator, the
 engine-owned OD history and dilution boundaries, `status()` / WebSocket / API / CSV
@@ -428,6 +437,9 @@ gravimetric wizard, reconciliation, and the 32-flow-rate engine plumbing. The so
 bench-ready but **no Tier 1/Tier 2 procedure has yet been run on the bench**, so the
 inherited-constant caveats below still stand.
 
+**Session AG shipped 2026-09-29** — per-organism OD calibration profiles, the raw-count OD
+log (schema 2) and post-hoc recalibration. Software only: no organism has been calibrated
+on the rig, so every run still reads through the 2016 curve until one is.
 **Session AA shipped 2026-09-28** — the Tier 3 thermistor and OD dilution-series wizards,
 software only: neither has been run on the rig, and prerequisite P2 stays unresolved until
 the thermistor wizard's cold phase is.
@@ -466,7 +478,7 @@ backup, multi-phase protocols, and authentication.
   and how to verify `/dev/ttyAMA0` is the PL011, restoring the state git does not carry,
   Tailscale identity, and which parts of `DEPLOY.md` Phase 4 a rebuild may skip.
 
-### Eleven facts worth carrying into any new work
+### Twelve facts worth carrying into any new work
 
 1. **`xr` is a closed-loop setpoint, not a PWM, and the slope is negative.** The Arduino
    already closes the temperature loop. `xr=0` requests ~82 °C. See the Testing warning
@@ -510,10 +522,11 @@ backup, multi-phase protocols, and authentication.
    `POST /api/experiments/{name}/start` returns 409 (`code: "missing_od_blank"`) until a
    blank is committed for that experiment, overridable only with an explicit
    `allow_missing_od_blank: true` (recorded as a warning). A committed blank re-anchors
-   **row 2 only** of the OD calibration on the live `SerialManager` — never rows 0/1/3,
-   which are fitted asymptotes and the reader's validity domain. The re-anchor is
-   in-memory: it is re-applied from `experiments/{name}/od_blank.json` on crash-resume
-   and cleared when the experiment stops. The legacy `.txt` calibration files are now a
+   **row 2 only** of the run's **pinned organism curve** on that run's vials — never rows
+   0/1/3, which are fitted asymptotes and the reader's validity domain — and is valid only
+   for exactly that profile version (`stale_od_blank` otherwise). The re-anchor is
+   in-memory: it is re-applied from `experiments/{name}/od_blank.json` before a resumed run
+   can be ticked (fact 12) and released with the run's curve when the experiment stops. The legacy `.txt` calibration files are now a
    **derived view** regenerated from `calibration/current.json` — never hand-edit them;
    the versioned JSON envelopes are the source of truth. (The old fact here — that
    `_as_list_of_16` rejected 32-element `pump_flow_rates` — was fixed by Session O3a;
@@ -528,9 +541,13 @@ backup, multi-phase protocols, and authentication.
    doubles every volume and requires the reported μ to be bit-identical). Three
    consequences for new work: **fitting `ln(OD)` across a dilution reads 80–99 % low**, so
    never do it; **`r_squared` must never be presented without `windows_searched`**, because
-   max-R² selection inflates it; and growth output goes to `vialNN_growth.csv`, never a new
-   column in `vialNN_OD.csv` — `data_export.py` has no schema marker, so a positional
-   parser (the lab's own scripts included) breaks silently on an inserted column.
+   max-R² selection inflates it; and growth output goes to `vialNN_growth.csv`, never a
+   column in `vialNN_OD.csv` — derived values stay out of the raw sensor record. That
+   file's columns are **append-only**: schema 2 (Session AG) appended the raw counts at the
+   end and `config.json` carries `od_csv_schema`. Never insert or reorder a column — a
+   positional parser (the lab's own scripts included) breaks silently on an insert — and
+   keep the logger matching each file's own header, so a schema-1 file resumed across an
+   upgrade stays seven columns.
 
 7. **Everything is on one 10 s cycle, and the stirrers never stop — but the loop is
    two-lane *capable*, and that capability is a safety property.** `app.py` currently sets
@@ -629,8 +646,34 @@ backup, multi-phase protocols, and authentication.
     watchdog *fault* it — its stir re-send would otherwise undo an E-stop — and a restart
     reloads it *suspended*. `finish` reloads the calibration live through
     `_reload_calibration`, which is why it needs the machine idle: loaded engines cache the
-    temperature curve and their persisted raw setpoints. Any new route that drives
-    actuators must check `_tier3_in_progress()`.
+    temperature curve and their persisted raw setpoints, and the reload resets every run's
+    assigned OD curve. An OD series `finish` installs a version of an **organism profile**,
+    never the default slot (fact 12). Any new route that drives actuators must check
+    `_tier3_in_progress()`.
+
+12. **OD calibration is per organism, pinned per run, and composed per vial.** Cells
+    scatter light by their size and shape, so the counts→OD curve belongs to an organism.
+    An organism exists only once the OD dilution series has calibrated it; the designer
+    offers those plus the labelled 2016 curve. Create pins `calibration.od` /
+    `od_profile` / `od_organism` / `od_dark_subtracted` / `od_vials_measured` — server-owned,
+    a caller's `od*` key is a 400 — and the run reads on that version for life, restarts
+    included (a vanished version quarantines its vials, NaN curve plus a critical alert).
+    One OD read serves all sixteen vials, so the manager composes the curve per vial
+    (`assign_od_curve` / `release_od_curve`) and decides dark subtraction per vial;
+    runs on different organisms share a tick. Three rules for new work:
+
+    - **A run's curve and blank go on its vials before it can be ticked**:
+      `app._experiment_od_setup` runs at create, before `start_experiment`, and through
+      `supervisor.resume_on_startup(prepare=…)`; the `stopped` event releases them. Never
+      call `load_calibration` / `_reload_calibration` with a run loaded — it resets every
+      assigned curve.
+    - **Never write `current["od"]` from a series.** The default slot is the idle-read curve
+      and the fallback for unmeasured vials of a new organism, not an organism.
+    - **Anything that turns logged counts into OD after the fact goes through
+      `od_recalibrate.py`**: it rebuilds the signal in the *target* curve's space from the
+      schema-2 columns and re-anchors at the run's own blank, so re-applying a run's own
+      curve reproduces its OD. Output goes to `experiments/{name}/recalibrated/`, never over
+      the run's files.
 
 
 ## Technical constraints
@@ -692,7 +735,8 @@ eVOLVER_FileStruct/
     eVOLVER_module.py  main_eVOLVER.py  custom_script.py
 
   calibration/               # Versioned calibration store (Session O / SPEC §19.1)
-    current.json             # pointer: subsystem -> active version
+    current.json             # pointer: subsystem -> active version; "od" is the machine
+                             #   default, "od_profiles" the named organisms (Session AG)
     od/          <ver>.json  # versioned envelopes (immutable; retained forever)
     temperature/ <ver>.json  #   2016 files imported as source "legacy-import-2016"
     pump/        <ver>.json  #   written by the gravimetric wizard (none until Tier 2 runs)
@@ -726,7 +770,9 @@ eVOLVER_FileStruct/
     data_logger.py           # Per-vial CSV writers
     data_export.py           # ZIP bundles, filtering
     event_log.py             # rotating logs, event ring, error classification (SPEC §20)
-    calibration_service.py   # versioned store, blank/pump/Tier 3 wizard sessions, staleness (SPEC §19)
+    calibration_service.py   # versioned store, organism OD profiles, blank/pump/Tier 3 sessions,
+                             #   staleness (SPEC §19, §19.7)
+    od_recalibrate.py        # post-hoc OD recalibration of a finished run (CLI + library, §19.7)
     od_curve_fit.py          # four-parameter logistic fit for the OD dilution series — pure, numpy only
     watchdog.py              # Heartbeat -> emergency shutdown
     control_modes/
@@ -736,6 +782,8 @@ eVOLVER_FileStruct/
                              #   simulated culture and checks the OD band / delivered D
     test_vial_groups.py      #   vial groups: run_config, engine, API (SPEC §9.1)
     test_parallel_runs.py    #   parallel experiments: supervisor + API (SPEC §9.2)
+    test_od_profiles.py      #   organism profiles, per-vial curves, OD CSV schema 2, wiring
+    test_od_recalibrate.py   #   post-hoc recalibration: identity, true curve, schema 1, HTTP
     test_calibration_tier3*.py, test_od_curve_fit.py
                              #   Tier 3 wizards against a mock whose TRUE thermistor/OD
                              #   response differs from the installed curve (SPEC §19.5)
@@ -751,9 +799,11 @@ eVOLVER_FileStruct/
     config.json  state.json
     vial00_OD.csv  vial00_temp.csv  vial00_pump_log.csv  ...
     vial00_growth.csv        # SPEC §17 growth estimates, 60 s cadence — a PARALLEL file;
-                             #   vialNN_OD.csv's header is never extended (see fact 6)
+                             #   vialNN_OD.csv only ever gains columns at its end (fact 6)
     events.csv               # unified event log (SPEC §20.2)
     od_blank.json            # per-run OD blank envelope (SPEC §19.2) — run-scoped
+    od_calibration.json      # the organism profile version this run pinned (SPEC §19.7)
+    recalibrated/<profile>__<version>/   # post-hoc OD recalibrations; originals untouched
     reconciliation.json      # post-run mass reconciliation record (SPEC §19.4)
   exports/                   # Server-side export bundles (outside experiments/ by design)
   machine/                   # Machine-scoped runtime state (gitignored): vessels.json

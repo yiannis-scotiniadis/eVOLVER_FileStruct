@@ -384,7 +384,7 @@ cd /home/pi/evolver-gui
 git describe --tags                               # record CURRENT tag (rollback target)
 mkdir -p ~/backups/$(date +%F)
 cp -r experiments ~/backups/$(date +%F)/          # back up data
-cp calibration/*.txt ~/backups/$(date +%F)/       # back up calibration
+cp -r calibration ~/backups/$(date +%F)/          # back up calibration (all of it)
 
 # 1. Stop the service (ends any running experiment, zeros actuators).
 sudo systemctl stop evolver
@@ -445,6 +445,10 @@ legacy Jessie escape path.
 `calibration/temp_calibration.txt` and `OD_cal.txt` are **tracked in git**. A `git checkout <tag>` will overwrite them if a future commit ever changes those files — and this rig's calibration is hardware-specific (*calibration is law*). Conversely, re-calibrating on the Pi without committing will make git **block** the next checkout. Until calibration is moved out of version control:
 - **Always** back up `calibration/*.txt` before an update (step 0 above).
 - **After** every update, confirm the values are still this rig's: `head -1 calibration/temp_calibration.txt` — the slopes must be the negative values for this hardware, not something a checkout swapped in.
+
+**Organism OD profiles make this sharper (2026-09-29).** Every OD dilution series installs a new envelope under `calibration/od/` and rewrites `calibration/current.json` — and `current.json` is tracked. So after the first organism is calibrated on the Pi, `git status` there shows `current.json` modified and new `od/*.json` files, and a checkout of a tag that changes `current.json` is **blocked** (or, forced, would drop every organism profile from the pointer while leaving their envelopes orphaned). Before an update:
+- back up the whole `calibration/` directory, not just the `.txt` files (step 0 above does);
+- `git stash` is **not** the answer — it would take the profiles offline for the duration. Copy `current.json` aside, `git checkout -- calibration/current.json`, update, then copy it back and restart; confirm with `curl -s localhost:5000/api/calibration/od/profiles` that every organism is still listed.
 
 The durable fix is to stop tracking `calibration/` (gitignore it and treat it as on-Pi config like the secret and `experiments/`). Do that deliberately as its own change, not as part of a routine update.
 

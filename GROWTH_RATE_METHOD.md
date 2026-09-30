@@ -25,7 +25,7 @@ claims no longer match either the code or the decisions below.
 | **Session N touches no control mode.** | All state lives in `ExperimentEngine`. `turbidostat.py` and `chemostat.py` are not edited. §7. |
 | **Morbidostat is out of scope** (and may be removed entirely). | No migration of its private growth fit. `growth_rate.py` becomes the tree's only growth-rate implementation, not a replacement for one. |
 | **The plate-reader band and window constants are not ported.** | They were cadence and phase-selection artefacts, not physical constants. §1.1, §4.2. |
-| **Growth output goes to a parallel `vialNN_growth.csv`.** | `vialNN_OD.csv` keeps its current header, so positional parsers (including the lab's own analysis scripts) do not break. §7.7. |
+| **Growth output goes to a parallel `vialNN_growth.csv`.** | Derived values stay out of the raw sensor record, and positional parsers of `vialNN_OD.csv` (the lab's own scripts included) do not break. That file has since gained raw-count columns — appended, never inserted (`SPEC.md` §8, schema 2). §7.7. |
 
 ---
 
@@ -507,10 +507,11 @@ everything required.
 6. **WebSocket** — extend the `sensor_update` payload (`SPEC.md` §7) with a `growth` block
    carrying the cached values.
 
-7. **CSV logging — a parallel file, decided (§0).** `vialNN_OD.csv` keeps its current
-   header untouched, because `data_export.py` has **no version or schema marker at all**
-   and any positional parser — including the lab's own analysis scripts — would break
-   silently on inserted columns. Add instead:
+7. **CSV logging — a parallel file, decided (§0).** Growth does not go into
+   `vialNN_OD.csv`: any positional parser — including the lab's own analysis scripts —
+   would break silently on inserted columns. (That file later gained raw-count columns for
+   post-hoc recalibration, **appended** at the end with an `od_csv_schema` marker in
+   `config.json` — `SPEC.md` §8. Derived values still do not belong there.) Add instead:
 
    ```
    experiments/{name}/vialNN_growth.csv

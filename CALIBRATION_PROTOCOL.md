@@ -482,6 +482,16 @@ steps above:
 **Equipment:** benchtop spectrophotometer (the reference for true OD600), the run's medium,
 a dense culture or a turbidity standard.
 
+**A series is for one organism.** OD is light scattering, and cells scatter according to
+their size, shape and contents, so a curve fitted on *E. coli* misreads *Pichia* at every
+non-zero OD. Make the standard **from the organism the runs will grow** (heat-killed or fixed
+cells of it — beads calibrate beads). Each series either **recalibrates a named organism** or
+**introduces a new one**; this is the only way an organism enters the system, and the
+experiment designer offers only organisms calibrated here (`SPEC.md` §19.7). The machine's
+default curve (currently the 2016 import) is not an organism and a series never changes it.
+Runs already created keep the version they pinned; a new version reaches a finished run
+through *Recalibrate a run's OD*.
+
 **Procedure:**
 
 1. Prepare a dilution series in the run's medium spanning the intended working range with at
@@ -693,8 +703,19 @@ calibration/
 
 experiments/{name}/
   od_blank.json                       # per-run; envelope with subsystem "od_blank"
+  od_calibration.json                 # copy of the organism profile version the run pinned
   config.json                         # records every version used
+  recalibrated/<profile>__<version>/  # post-hoc recalibrations (SPEC §19.7); never the
+                                      #   run's own files
 ```
+
+**Organism profiles (2026-09-29).** An OD envelope carries `"profile": {"id", "organism"}`,
+and `current.json` carries `"od_profiles": {"<id>": {"version", "organism"}}` beside the
+default `"od"` pointer. `current["od"]` is the machine default — the only curve the `.txt`
+views reflect — and is identified as `legacy-2016` (the 2016 import) or `machine-default`.
+Every profile's versions live in the same `od/` directory; a profile install leaves
+`current["od"]` and the views untouched. An OD blank's `conditions` record `od_profile` and
+`parent_od_cal`: a blank re-anchors exactly that profile version.
 
 **Back-compatibility:** `SerialManager.load_calibration()` takes file paths and expects the
 two `.txt` shapes. Keep writing them, generated from `current.json`, so nothing in the serial
@@ -706,6 +727,10 @@ Retain every previous version — they are small.
 ```json
 "calibration": {
   "od": "2026-08-16T142203Z",
+  "od_profile": "pichia-pastoris-gs115",
+  "od_organism": "Pichia pastoris GS115",
+  "od_dark_subtracted": true,
+  "od_vials_measured": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
   "temperature": "2026-06-01T091455Z",
   "pump": "2026-08-14T110300Z",
   "stir": null,
@@ -714,6 +739,10 @@ Retain every previous version — they are small.
   "vial_map": "2026-08-10T…"
 }
 ```
+
+The `od*` keys are the organism profile version the run pinned at create; they are written
+by the server only (a create body that supplies one is refused), and the run reads on that
+version for its whole life.
 
 `pump_flow_rates` is a **flat 32-element array** ordered by the canonical pump index defined
 in `CLAUDE.md` ("Pump command format"): indices `0..15` are the influx pumps for vials 0–15,
@@ -741,7 +770,7 @@ the hardware binary address, so the software index and the wire address cannot d
 All under `/api/calibration/*`. All reject with **409** while an experiment is RUNNING, except
 the read-only ones. These are the **only** routes permitted to reach raw actuator paths.
 
-> **Implementation status (2026-09-28):** everything below is built except `stir/*`
+> **Implementation status (2026-09-29):** everything below is built except `stir/*`
 > (Session AC); the thermistor and OD-series blocks shipped in Session AA as listed. Every
 > Tier 3 session reserves the whole machine (§13). As built: the blank
 > routes operate on the loaded CREATED experiment (no experiment name in the body); QC
@@ -791,10 +820,14 @@ POST /api/calibration/temperature/fit       {exclude_vials} → review; writes n
 POST /api/calibration/temperature/finish    {exclude_vials, override_reason} → install, live (idle)
 POST /api/calibration/temperature/abort     → heaters parked; nothing written
 
---- OD dilution series (Tier 3 §8.2) — Session AA ---
-POST /api/calibration/od/series/start       {operator, vials?, led_power, stir_pwm,
-                                             target_temp_c | null, n_samples, standard,
-                                             medium, spectrophotometer}        (idle machine)
+--- OD dilution series (Tier 3 §8.2) — Session AA; organism target since Session AG ---
+POST /api/calibration/od/series/start       {profile | new_organism, operator, vials?,
+                                             led_power, stir_pwm, target_temp_c | null,
+                                             n_samples, standard, medium,
+                                             spectrophotometer}                (idle machine)
+                                            exactly one of profile (recalibrate a named
+                                            organism; never the default slot) or
+                                            new_organism (a name; refused if it exists)
 POST /api/calibration/od/series/apply       → stir + heaters, ARMS                  (idle)
 GET  /api/calibration/od/series/session     [?preview=1] → per-vial points, preview fits
 POST /api/calibration/od/series/point       {entries: [{vial, spec_reading, dilution_factor}]}
@@ -803,8 +836,16 @@ POST /api/calibration/od/series/point       {entries: [{vial, spec_reading, dilu
 POST /api/calibration/od/series/discard     {point_id}
 POST /api/calibration/od/series/fit         {exclude_vials} → review; writes nothing
 POST /api/calibration/od/series/finish      {exclude_vials, override_reason} → install
-                                            dark-subtracted, live                   (idle)
+                                            dark-subtracted as a new version of the
+                                            organism's profile; the default is untouched (idle)
 POST /api/calibration/od/series/abort
+
+--- organism profiles and post-hoc recalibration — Session AG ---
+GET  /api/calibration/od/profiles           → {default, profiles: [summaries + versions]}
+POST /api/experiments/{name}/recalibrate_od {profile, version?, vials?, reanchor} → 202 job
+                                            (409 while the run is created/running)
+GET  /api/experiments/{name}/recalibrations → {job, recalibrations}
+GET  /api/experiments/{name}/recalibrations/{id}/download → zip
 
 --- stir (Tier 3 §8.3) ---
 POST /api/calibration/stir/record           {vial, pwm, rpm}

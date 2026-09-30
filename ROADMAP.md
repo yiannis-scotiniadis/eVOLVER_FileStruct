@@ -1258,6 +1258,34 @@ inflection point inside the measured range, and the fit performed on **dark-subt
 signal with an `OD_cal.meta.json` sidecar recording that fact — that sidecar is what lets
 Session O2's dark read graduate from diagnostic to correction.
 
+### Session AG — Per-organism OD calibration profiles, raw-count OD log, post-hoc recalibration
+
+> **DONE (2026-09-29) — software; no organism has been calibrated on the rig yet.**
+> Specified in `SPEC.md` §19.7 and §8 (OD CSV schema 2); procedure in
+> `CALIBRATION_PROTOCOL.md` §8.2.
+>
+> - **An OD curve is per organism**, because OD is scattering and cells scatter by shape and
+>   size. The experiment designer requires an organism; the run pins that profile's version
+>   for life. The 2016 curve stays selectable, labelled *"Unknown organism — 2016 inherited
+>   curve (unverified)"* and warned about.
+> - **Organisms are created only by calibrating them**: the OD dilution series either
+>   recalibrates a named organism or introduces a new one. The default slot is never an
+>   organism and a profile install never touches it.
+> - **`vialNN_OD.csv` schema 2 appends the raw counts** (`lit_adc`, `dark_adc`, `dark_used`,
+>   `dark_n_valid`, `dark_subtracted`, `led_power`), and every logged acquisition now takes a
+>   dark read. CLAUDE.md fact 6 became *append only, never insert or reorder*.
+> - **Post-hoc recalibration** — `server/od_recalibrate.py` (CLI), a background API job and a
+>   Calibration-tab modal — applies any profile version to a finished run beside its own
+>   files, re-anchored at the run's blank; re-applying the run's own curve reproduces its OD.
+> - Found and fixed in passing: `make_envelope`'s `supersedes: None` meant no version ever
+>   recorded what it replaced; events of a CREATED run were broadcast into every running
+>   run's `events.csv`; a resumed or just-started run could log one tick on the wrong curve;
+>   a dark-subtracted vial whose dark read dropped with no fallback was reported "ok" on a
+>   signal ~1200 counts high (now `dropped`).
+>
+> Still open (bench): the first real organism series; an A/B check on a blank vial that the
+> dark read now preceding every lit read does not shift the lit reading.
+
 ### Session AB — True parallel experiments
 
 > **DONE (2026-09-24), not as described below.** Built as a single-threaded

@@ -519,6 +519,16 @@ POST /api/calibration/od/blank/commit
              "od_offset_removed": [...16], "qc": {...}}
 POST /api/calibration/od/blank/abort
 
+--- per-organism OD profiles and recalibration (§19.7) ---
+GET  /api/calibration/od/profiles           # {default, profiles: [{id, organism, version,
+                                            #   is_default, vials_measured, stale, reasons,
+                                            #   age_reasons, versions, ...}]}
+POST /api/experiments/{name}/recalibrate_od # {profile, version?, vials?, reanchor: true}
+                                            #   -> 202 background job; 409 while the run is
+                                            #   created/running or a job is in progress
+GET  /api/experiments/{name}/recalibrations # {job, recalibrations: [recalibration.json, ...]}
+GET  /api/experiments/{name}/recalibrations/{id}/download   # zip of one result
+
 --- pump gravimetric (§19.3) ---
 POST /api/calibration/pump/start      # {pumps, fire_seconds, replicates, fluid,
                                       #  fluid_density_g_ml, bench_temp_c}
@@ -717,13 +727,37 @@ socket.emit('emergency_stop');
 
 One file per vial per parameter per experiment. Files are append-only during an experiment.
 
-**OD data** (`vial00_OD.csv`):
+**OD data** (`vial00_OD.csv`, schema 2 — `config.json` carries `"od_csv_schema": 2`;
+absent means schema 1):
 ```csv
-timestamp,elapsed_hours,raw_adc,calibrated_od
-2026-05-12T14:30:00,0.000,52341,0.000
-2026-05-12T14:30:10,0.003,52298,0.012
+timestamp,elapsed_hours,raw_adc,calibrated_od,n_valid,flag,dark,lit_adc,dark_adc,dark_used,dark_n_valid,dark_subtracted,led_power
+2026-09-29T14:30:00+00:00,0.0000,48800,0.4123,5,ok,1200,50000.5,1200.25,1200.25,3,1,2125
 ...
 ```
+
+| Column | Meaning |
+|---|---|
+| `raw_adc` | the signal **fed to the vial's curve**: LED-on, minus `dark_used` when the curve is dark-subtracted (integer) |
+| `calibrated_od` | OD600 through the vial's curve and per-run blank (4 dp); blank unless `flag` is `ok` |
+| `n_valid` | surviving LED-on samples |
+| `flag` | `ok` · `out_of_range` (signal outside the curve's `(a, b)`) · `dropped` (no signal, or a dark-subtracted vial with no dark at all) |
+| `dark` | this cycle's LED-off reading (integer); blank when none was taken |
+| `lit_adc` | *schema 2:* the LED-on reading before any interpretation, exact |
+| `dark_adc` | *schema 2:* the same LED-off reading as `dark`, exact |
+| `dark_used` | *schema 2:* the dark actually subtracted — this cycle's, or the vial's last good one if it dropped; blank when nothing was subtracted |
+| `dark_n_valid` | *schema 2:* surviving LED-off samples |
+| `dark_subtracted` | *schema 2:* `1` if `raw_adc = lit_adc − dark_used`, else `0` |
+| `led_power` | *schema 2:* LED power of the lit reads |
+
+**Columns are only ever appended — never inserted or reordered.** The first seven are the
+schema-1 file, unchanged in name, meaning and format, so a positional parser of them keeps
+working. A schema-1 file whose run resumes across the upgrade keeps getting seven-column
+rows (the logger matches each file's own header). Schema 2 exists so a better calibration can
+be applied to a finished run from its own counts (§19.7): every logged acquisition takes a
+dark read (`od_acquisition.record_dark`, written into new configs), whether or not the
+vial's curve subtracts it. Raw counts are written with `.10g`, so a median of an even sample
+count keeps its fraction. The export bundle (§8.1) carries the raw per-vial files under
+`raw/`, with `od_calibration.json` and `od_blank.json`.
 
 **Temperature data** (`vial00_temp.csv`):
 ```csv
@@ -765,9 +799,14 @@ Saved when experiment is created. Serves as a complete record of parameters used
         "od_led_power": 2125,
         "efflux_extra_seconds": 0
     },
+    "od_csv_schema": 2,
     "calibration": {
-        "temp_cal_file": "temp_calibration.txt",
-        "od_cal_file": "OD_cal.txt",
+        "od": "2026-10-01T120000Z",
+        "od_profile": "escherichia-coli-k-12",
+        "od_organism": "Escherichia coli K-12",
+        "od_dark_subtracted": true,
+        "od_vials_measured": [0, 1, 2, 3, 4, 5, 6, 7],
+        "temperature": "2026-08-20T134535Z",
         "pump_flow_rates": [
             0.95, 1.1, 0.975, 0.85, 0.95, 1.05, 1.05, 1.05,
             1.025, 1.125, 1.0, 1.0, 1.05, 1.15, 1.1, 1.025,
@@ -778,6 +817,11 @@ Saved when experiment is created. Serves as a complete record of parameters used
     "notes": "Replicate adaptation experiment in LB, 8 vials"
 }
 ```
+
+The `od*` keys of `calibration` are **server-owned** (§19.7): they pin the organism profile
+version the designer chose, and a create body that supplies any of them is refused (400).
+`experiments/{name}/od_calibration.json` is a copy of that envelope, so the run's OD can be
+rebuilt from its own directory.
 
 ### 8.1 Every read path is bounded by the request, not by the run
 
@@ -2059,9 +2103,11 @@ one.
   cadence this file is one row per OD row; before the cadence change it was ~1/6 of the OD
   file. `flags` is **pipe-separated**, because `data_export`'s readers split on commas.
 
-  `vialNN_OD.csv`'s header is deliberately untouched. `data_export.py` carries no version
-  or schema marker at all, so any positional parser — including the lab's own analysis
-  scripts — would break silently on an inserted column. (An earlier version of this section
+  Growth stays out of `vialNN_OD.csv`: it is derived, on its own cadence, and does not
+  belong in the raw sensor record. When that file did gain columns (schema 2, §8 — the raw
+  counts, 2026-09-29) they were **appended**, never inserted, and `config.json` gained an
+  `od_csv_schema` marker, because a positional parser — including the lab's own analysis
+  scripts — breaks silently on an inserted column. (An earlier version of this section
   and of `ROADMAP.md` Session N both described a `growth_rate_per_hour` column as already
   existing in the per-vial CSV. It exists only in `escalation_log.csv`, which is written in
   morbidostat mode alone.)
@@ -2165,7 +2211,8 @@ tab with the OD-blank, pump and reconciliation wizards. **§19.5's software ship
 live calibration reload, and the dark-subtraction switch; see §19.5. The software is
 bench-ready; **Tier 2 gravimetric calibration, the first real blank and both Tier 3
 procedures have not yet been run**, so the numeric caveats below still stand until they
-are.
+are. **§19.7 — per-organism OD profiles, the raw-count OD log and post-hoc recalibration —
+shipped 2026-09-29 (`ROADMAP.md` Session AG).**
 
 > **The bench protocol is `CALIBRATION_PROTOCOL.md`.** Part I is the tiered SOP the lab
 > actually follows (Tier 0 pre-flight → Tier 1 per-run → Tier 2 per-campaign pumps → Tier 3
@@ -2282,6 +2329,10 @@ it; a dark-subtracted curve with a non-dark-subtracted blank is as wrong as the 
 **Since Session AA the switch is automatic** (§19.5): the blank re-anchors on blank − dark,
 new experiments default to `dark_subtract` (written into `config.json`), idle reads subtract
 the dark, and a blank taken on a replaced curve is refused at start (`stale_od_blank`).
+**Since §19.7 it is per vial:** each vial follows its own curve's flag (an organism profile's,
+or the default's), and a blank re-anchors the run's **pinned organism curve**: it is stale
+unless taken on exactly that profile version, and the campaign drift check compares only
+blanks taken on the same profile.
 
 Per-run blanks are written to the **experiment directory**
 (`experiments/{name}/od_blank.json`), not the global calibration directory, because they
@@ -2392,6 +2443,76 @@ off convexly from OD 0 — so the requirement would have refused every ordinary 
 §19.2's dark read graduate from diagnostic to correction. Use a non-growing turbidity source
 (killed cells, heat-fixed cells, or beads) so the series does not drift over the two hours
 it takes to measure 16 vials.
+
+### 19.7 Per-organism OD profiles and post-hoc recalibration — IMPLEMENTED 2026-09-29
+
+OD is light scattering, and cells scatter by their size, shape and contents: the curve that
+maps photodiode counts to OD600 for *E. coli* is not the curve for *Pichia*. So the OD
+calibration is **per organism**, and an organism comes into existence **only by being
+calibrated** — never by being typed into the experiment designer.
+
+**Profiles in the store** (`server/calibration_service.py`).
+
+- An OD envelope carries a top-level `profile: {id, organism}`; `calibration/current.json`
+  gains `od_profiles: {id: {version, organism}}` for the named organisms.
+- The **default slot** is `current["od"]` — the curve `OD_cal.txt` views and idle reads use.
+  Its id is `legacy-2016` while it is the 2016 import (labelled *"Unknown organism — 2016
+  inherited curve (unverified)"*, selectable, and warned about at create), otherwise
+  `machine-default`. Profile-less envelopes are assigned **by source**, never all to legacy.
+  Nothing is written at boot: the mapping is derived.
+- The default slot is **not an organism** and is never recalibrated by a series. Installing a
+  profile version leaves `current["od"]` and the `.txt` views byte-identical.
+
+**Only the OD dilution series makes or changes an organism** (§19.5, `CALIBRATION_PROTOCOL.md`
+§8.2). `series/start` takes exactly one of `profile` (recalibrate a named organism) or
+`new_organism` (a name → slug id; refused if the slug or the name, case-folded, exists).
+Vials the series does not measure carry the profile's own previous curve, or the default's
+for a new organism; `fit.per_vial_profile` records which, and `od_vials_measured` reports it.
+
+**A run pins its profile version at create.** The designer names an organism
+(`od_profile`; omitted = the default slot); create resolves it (unknown → 400 listing the
+profiles), writes `od`, `od_profile`, `od_organism`, `od_dark_subtracted`,
+`od_vials_measured` into `config.json`'s `calibration` block, snapshots the envelope to
+`od_calibration.json`, and warns about the run's vials the profile never measured. The run
+reads on **that version** for its whole life, restarts included; a newer version of the
+profile is an info alert on resume, applied afterwards by recalibration. A recorded version
+that has vanished **quarantines** the run's vials (NaN curve → `out_of_range`, no OD-driven
+control) with a critical alert, and start refuses with `od_pin_missing`. A config from before
+provenance existed pins nothing and reads on the default slot, as it always did.
+
+**The live curve is composed per vial** (`serial_manager.OdCurveMixin`). One lit read and one
+dark read serve all sixteen vials, so two organisms share a tick only this way:
+`assign_od_curve(vials, rows, dark_subtracted)` writes a profile's columns over its run's
+vials, `release_od_curve(vials)` gives them back, the blank still re-anchors row 2 only, and
+dark subtraction is decided per vial. The curve and the blank go live **before the run can be
+ticked** — at create, before `start_experiment`, and on resume through the supervisor's
+`prepare` hook (before the engine is registered) — and are released on the `stopped` event,
+which every unload path emits. The supervisor no longer requires runs to agree on
+`dark_subtract`, so an *E. coli* run and a *Pichia* run can be loaded together.
+
+**Post-hoc recalibration** (`server/od_recalibrate.py`) pushes a finished run's logged counts
+through another curve and writes `experiments/{name}/recalibrated/<profile>__<version>/` —
+per-vial `vialNN_OD.csv` (the live file's first seven columns and meanings, then `signal`,
+`dark_used`, `original_od`, `original_flag`), `recalibration.json` and the applied
+`od_calibration.json`. The run's own files are never touched.
+
+- The signal is rebuilt in the **target curve's** space (`lit − dark` or `lit`), replaying the
+  live dark fallback (this row's dark → the `dark_used` the reader used → the last dark in the
+  file → `dropped`).
+- The target is **re-anchored at the run's own blank**, recomputed in the target's signal
+  space; re-applying the run's pinned curve therefore reproduces its logged OD (row 2 to
+  1e-12, OD to the log's 4 dp, identical flags). Without a blank, or for an excluded vial,
+  the report says the OD carries the target's own offset.
+- Schema-1 files are reconstructed from the rounded signal per row; a dark-subtracted target
+  is refused per vial, with the reason, when no dark was ever logged.
+- CLI: `python server/od_recalibrate.py <run> --profile <id> [--version V] [--vials 0,1]
+  [--no-reanchor]`, or `--envelope <json>` for a curve from anywhere. `replay_growth.py
+  --od-dir <id>` replays growth from the result.
+- API: a background job, refused while the run is CREATED or RUNNING (below).
+
+Every step is in the run's `events.csv`: `created`/`started`/`resumed` name the organism,
+profile and version; `calibration_installed` names the organism and whether it is new;
+`od_recalibrated` records each recalibration.
 
 ### 19.6 Cross-cutting requirements
 
