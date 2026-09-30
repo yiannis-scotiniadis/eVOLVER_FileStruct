@@ -264,7 +264,9 @@ def test_the_cli_and_replay_growth_read_a_recalibration():
         assert R.main(args + ["--profile", "e-coli", "--vials", "0,1"]) == 0
         out = exp / "recalibrated" / "e-coli__2026-10-01T000000Z"
         assert sorted(p.name for p in out.iterdir()) == [
-            "recalibration.json", "vial00_OD.csv", "vial01_OD.csv"]
+            "od_calibration.json", "recalibration.json", "vial00_OD.csv", "vial01_OD.csv"]
+        assert json.loads((out / "od_calibration.json").read_text())["version"] == \
+            "2026-10-01T000000Z"
         series = replay_growth.load_od_series(exp, 1, out)
         assert abs(series[1][1] - TRUE_ODS[2]) < 1e-3
         assert abs(replay_growth.load_od_series(exp, 1)[1][1] - TRUE_ODS[2]) > 0.05
@@ -286,3 +288,122 @@ def test_recalibration_ids_cannot_escape_the_run():
             R.recalibration_dir(exp, "e-coli__2027-01-01T000000Z")
         assert not any(p.name.startswith(".") for p in (exp / "recalibrated").iterdir())
         assert math.isfinite(R.list_recalibrations(exp)[0]["vials"]["0"]["c"])
+
+
+# ---------------------------------------------------------------------------
+# Over HTTP, on a live run (Phase 6)
+# ---------------------------------------------------------------------------
+
+def _wait_job(client, name, timeout=10.0):
+    import time
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        d = client.get(f"/api/experiments/{name}/recalibrations").get_json()
+        if d["job"] and d["job"]["status"] != "running":
+            return d
+        time.sleep(0.02)
+    raise AssertionError("recalibration job did not finish")
+
+
+def test_a_live_run_on_the_wrong_curve_is_recalibrated_over_http():
+    import io
+    import threading
+    import time
+    import zipfile
+
+    import app as A
+    from test_calibration_api import _experiment_body, _make_app, _state, _warm_thermal_tracker
+    saved = (A.SENSOR_LOOP_INTERVAL_SECONDS, A.OD_INTERVAL_SECONDS)
+    threads_before = set(threading.enumerate())
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        A.SENSOR_LOOP_INTERVAL_SECONDS = A.OD_INTERVAL_SECONDS = 0.05
+        flask_app = _make_app(tmp)
+        try:
+            state = _state(flask_app)
+            store = state.cal_service.store
+            store.save_od_profile_version("wrong", "Wrong organism",
+                                          _env(RUN_CURVE, True, "2026-09-01T000000Z"))
+            store.save_od_profile_version("e-coli", "E. coli",
+                                          _env(TRUTH, True, "2026-10-01T000000Z"))
+            profiles = {p["id"]: p for p in flask_app.test_client()
+                        .get("/api/calibration/od/profiles").get_json()["profiles"]}
+            assert profiles["e-coli"]["organism"] == "E. coli"
+            assert profiles["legacy-2016"]["is_default"] is True
+
+            state.manager.set_true_od_curve(TRUTH, dark_counts=DARK)
+            state.manager.set_true_od([0], 0.0)
+            c = flask_app.test_client()
+            body = _experiment_body("live")
+            body["od_profile"] = "wrong"
+            assert c.post("/api/experiments/create", json=body).status_code == 200
+            r = c.post("/api/experiments/live/recalibrate_od", json={"profile": "e-coli"})
+            assert r.status_code == 409 and r.get_json()["code"] == "run_not_finished"
+
+            _warm_thermal_tracker(state, [0])
+            sid = c.post("/api/calibration/od/blank/start", json={}).get_json()["session"]
+            c.post("/api/calibration/od/blank/dark", json={"session": sid})
+            c.post("/api/calibration/od/blank/measure", json={"session": sid})
+            _warm_thermal_tracker(state, [0])
+            assert c.post("/api/calibration/od/blank/commit",
+                          json={"session": sid, "operator": "t"}).status_code == 200
+            state.manager.set_true_od([0], 0.6)
+            assert c.post("/api/experiments/live/start").status_code == 200
+            path = tmp / "experiments" / "live" / "vial00_OD.csv"
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and len(_csv(path)) < 5:
+                time.sleep(0.05)
+            assert c.post("/api/experiments/live/recalibrate_od",
+                          json={"profile": "e-coli"}).status_code == 409
+            assert c.post("/api/experiments/live/stop").status_code == 200
+            logged = _csv(path)
+            assert abs(float(logged[-1]["calibrated_od"]) - 0.6) > 0.05   # the wrong curve
+
+            # Its own pinned curve: the logged OD back.
+            r = c.post("/api/experiments/live/recalibrate_od", json={"profile": "wrong"})
+            assert r.status_code == 202, r.get_json()
+            d = _wait_job(c, "live")
+            assert d["job"]["status"] == "done", d
+            own = _csv(tmp / "experiments" / "live" / "recalibrated" / d["job"]["id"] / "vial00_OD.csv")
+            for lo, re_ in zip(logged, own):
+                assert re_["flag"] == lo["flag"]
+                if lo["flag"] == "ok":
+                    assert abs(float(re_["calibrated_od"]) - float(lo["calibrated_od"])) <= 5e-5 + 1e-9
+
+            # The organism's true curve: the true OD.
+            assert c.post("/api/experiments/live/recalibrate_od",
+                          json={"profile": "e-coli"}).status_code == 202
+            d = _wait_job(c, "live")
+            rid = d["job"]["id"]
+            assert rid == "e-coli__2026-10-01T000000Z"
+            true_rows = _csv(tmp / "experiments" / "live" / "recalibrated" / rid / "vial00_OD.csv")
+            assert abs(float(true_rows[-1]["calibrated_od"]) - 0.6) < 0.01, true_rows[-1]
+            assert [x["id"] for x in d["recalibrations"]][:1] == [rid]
+            events = (tmp / "experiments" / "live" / "events.csv").read_text()
+            assert "recalibrated onto E. coli" in events
+            assert "OD through Wrong organism" in events
+
+            z = c.get(f"/api/experiments/live/recalibrations/{rid}/download")
+            assert z.status_code == 200
+            names = zipfile.ZipFile(io.BytesIO(z.data)).namelist()
+            assert f"{rid}/recalibration.json" in names and f"{rid}/vial00_OD.csv" in names
+
+            # Refusals.
+            assert c.get("/api/experiments/live/recalibrations/..%2F..%2Fx/download").status_code in (400, 404)
+            assert c.get("/api/experiments/live/recalibrations/E-COLI__x/download").status_code == 400
+            assert c.get("/api/experiments/live/recalibrations/e-coli__2027/download").status_code == 404
+            assert c.post("/api/experiments/nope/recalibrate_od",
+                          json={"profile": "e-coli"}).status_code == 404
+            r = c.post("/api/experiments/live/recalibrate_od", json={"profile": "pichia"})
+            assert r.status_code == 400 and r.get_json()["code"] == "unknown_od_profile"
+            assert c.post("/api/experiments/live/recalibrate_od",
+                          json={"profile": "e-coli", "vials": [5]}).status_code == 400
+            assert c.post("/api/experiments/live/recalibrate_od",
+                          json={"profile": "e-coli", "version": "2026-09-01T000000Z"}
+                          ).status_code == 400
+        finally:
+            _state(flask_app).sensor_thread_stop.set()
+            for t in set(threading.enumerate()) - threads_before:
+                if t.name in ("sensor-loop", "od-recalibrate"):
+                    t.join(timeout=5)
+            A.SENSOR_LOOP_INTERVAL_SECONDS, A.OD_INTERVAL_SECONDS = saved

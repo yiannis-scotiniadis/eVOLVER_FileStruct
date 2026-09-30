@@ -745,6 +745,11 @@
     .exp-bar-text { flex: 1; color: var(--text); }
     .exp-bar-text strong { font-weight: 600; }
     .exp-bar-text .muted { color: var(--text-muted); }
+    .organism-tag {
+      display: inline-block; padding: 0 6px; margin-left: 4px;
+      border: 1px solid var(--border); border-radius: 999px;
+      font-size: 12px; font-style: italic; color: var(--text-muted);
+    }
     .exp-bar-text .pump-count {
       font-family: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
       font-variant-numeric: tabular-nums;
@@ -1128,6 +1133,7 @@
       line-height: 1.7;
     }
     .review-block dt { font-weight: 600; }
+    .review-warn { color: var(--status-warn); font-size: 12px; margin-top: 2px; }
     .review-block dt::after { content: ":"; }
     .review-block dl {
       margin: 0;
@@ -1543,6 +1549,14 @@
       color: var(--text-muted);
     }
     .cal-reasons li { margin-bottom: 3px; }
+    .od-profile-list { list-style: none; margin: 0 0 10px; padding: 0; }
+    .od-profile-list li { padding: 6px 0; border-top: 1px solid var(--border); }
+    .od-profile-list li:first-child { border-top: 0; }
+    .od-profile-head {
+      display: flex; justify-content: space-between; align-items: baseline;
+      gap: 8px; font-size: 13px;
+    }
+    .od-profile-list .cal-meta { margin: 2px 0 0; }
     .cal-hint {
       font-size: 12px;
       color: var(--text-muted);
@@ -1622,7 +1636,7 @@
       font-size: 13px;
       margin-bottom: 10px;
     }
-    .cal-form-grid input, .recon-grid input, .recon-grid select {
+    .cal-form-grid input, .cal-form-grid select, .recon-grid input, .recon-grid select {
       padding: 6px 8px;
       border: 1px solid var(--border-strong);
       border-radius: 6px;
@@ -2170,6 +2184,10 @@
                   title="OD dilution series, all four sigmoid parameters (Tier 3 §8.2) — reserves the whole machine">
             OD series (Tier 3)
           </button>
+          <button id="cal-open-recal" class="range-btn" type="button"
+                  title="Apply another organism's OD curve to a finished run's logged counts">
+            Recalibrate a run's OD
+          </button>
           <button id="cal-refresh" class="range-btn" type="button">Refresh</button>
         </div>
       </div>
@@ -2389,6 +2407,17 @@
                    maxlength="64">
             <span class="field-help">
               Letters, numbers, hyphens, and underscores only. Used as the directory name.
+            </span>
+          </div>
+          <div class="field-row">
+            <label class="field-label" for="exp-organism">Organism</label>
+            <select id="exp-organism">
+              <option value="">Loading OD calibrations…</option>
+            </select>
+            <span class="field-help" id="exp-organism-help">
+              OD is read through this organism's calibration curve — cells of
+              different shape and size scatter differently. A new organism is
+              added by calibrating it (Calibration → OD dilution series).
             </span>
           </div>
           <div class="field-row">
@@ -2695,6 +2724,48 @@
         <span class="wizard-footer-right">
           <button class="btn" id="recon-cancel" type="button">Close</button>
           <button class="btn btn-primary" id="recon-submit" type="button">Reconcile</button>
+        </span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ---------- Post-hoc OD recalibration (od_recalibrate.py) ---------- -->
+  <div class="modal-backdrop" id="recal-modal" hidden>
+    <div class="modal" role="dialog" aria-modal="true"
+         aria-labelledby="recal-modal-title">
+      <div class="modal-header">
+        <h2 id="recal-modal-title">Recalibrate a finished run's OD</h2>
+        <button class="modal-close" id="recal-modal-close"
+                type="button" aria-label="Close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p class="cal-hint">
+          Pushes a stopped run's logged photodiode counts through another
+          organism's calibration curve — one calibrated after the run, say.
+          The run's own files are never changed: the result is saved beside
+          them (<code>recalibrated/</code>) and can be downloaded here.
+          Re-anchoring at the run's own blank removes the machine and medium
+          offset, as the blank did live.
+        </p>
+        <div class="recon-grid">
+          <label for="recal-exp">Experiment</label>
+          <select id="recal-exp" class="plots-select"></select>
+          <label for="recal-profile">Organism</label>
+          <select id="recal-profile" class="plots-select"></select>
+          <label for="recal-version">Version</label>
+          <select id="recal-version" class="plots-select"></select>
+          <label for="recal-vials">Vials</label>
+          <input id="recal-vials" type="text" placeholder="blank = all the run's vials">
+          <label for="recal-reanchor">Re-anchor at the run's blank</label>
+          <input id="recal-reanchor" type="checkbox" checked style="justify-self: start;">
+        </div>
+        <div id="recal-result"></div>
+      </div>
+      <div class="modal-footer wizard-footer">
+        <span></span>
+        <span class="wizard-footer-right">
+          <button class="btn" id="recal-cancel" type="button">Close</button>
+          <button class="btn btn-primary" id="recal-submit" type="button">Recalibrate</button>
         </span>
       </div>
     </div>
@@ -3700,6 +3771,9 @@
       groups: [],        // [{name, mode, vials}] -- vial groups (one implicit group when not grouped)
       grouped: false,    // true when the experiment has explicit groups
       preconditioned: false, // CREATED run holding its vials at run conditions
+      organism: null,    // the organism whose OD calibration profile the run pinned
+      odProfile: null,
+      odVersion: null,
     };
 
     // Vials the engine is driving right now: a RUNNING experiment's, or a
@@ -3774,8 +3848,10 @@
         chip.innerHTML = `<span class="swatch" style="background:${_runColor(r.name)}"></span>`
           + `<strong>${escapeHtml(r.name)}</strong>`
           + (r.operator ? ` <span class="who">· ${escapeHtml(r.operator)}</span>` : "")
+          + (r.organism ? ` <span class="who">· <em>${escapeHtml(r.organism)}</em></span>` : "")
           + ` <span class="st">${escapeHtml(r.status)}${r.preconditioned ? " · held" : ""}</span>`;
         chip.title = `Vials ${(r.vials || []).join(", ")}`
+          + (r.organism ? ` · OD through ${r.organism} (${r.od_profile})` : "")
           + (r.expected_end ? ` · expected end ${r.expected_end}` : "");
         chip.addEventListener("click", () => selectRun(r.name));
         runRowEl.appendChild(chip);
@@ -3853,6 +3929,10 @@
       const name = expState.name
         ? `<strong>${escapeHtml(expState.name)}</strong>`
           + (expState.operator ? ` <span class="muted">(${escapeHtml(expState.operator)})</span>` : "")
+          + (expState.organism
+            ? ` <span class="organism-tag" title="OD calibration profile ${escapeHtml(expState.odProfile || "")}`
+              + ` @ ${escapeHtml(expState.odVersion || "")}">${escapeHtml(expState.organism)}</span>`
+            : "")
         : "";
       // Vial groups: name each group with its mode and colour so the bar
       // reads as the legend for the card chips.
@@ -4476,11 +4556,16 @@
               expState.grouped = !!s.grouped;
               expState.preconditioned = !!s.preconditioned;
               expState.operator = s.operator || "";
+              expState.organism = s.organism || null;
+              expState.odProfile = s.od_profile || null;
+              expState.odVersion = s.od_version || null;
             } else {
               expState.name = loaded.name;
               expState.status = loaded.status;
               expState.mode = loaded.mode || null;
               expState.vials = loaded.vials || [];
+              expState.organism = loaded.organism || null;
+              expState.odProfile = loaded.od_profile || null;
               expState.elapsed_hours = null;
               expState.media = null;
               expState.maintenance = null;
@@ -4502,6 +4587,8 @@
             expState.groups = [];
             expState.grouped = false;
             expState.preconditioned = false;
+            expState.organism = loaded.organism || null;
+            expState.odProfile = loaded.od_profile || null;
           }
         } else {
           expState.name = null;
@@ -4516,6 +4603,9 @@
           expState.groups = [];
           expState.grouped = false;
           expState.preconditioned = false;
+          expState.organism = null;
+          expState.odProfile = null;
+          expState.odVersion = null;
         }
         renderExpBar();
         applyVialLocks();
@@ -4729,6 +4819,7 @@
       wizardState.step = 1;
       wizardState.name = "";
       wizardState.notes = "";
+      wizardState.odProfile = "";
       wizardState.groups = [];
       wizardState.vialGroup = {};
       wizardState.nextGid = 1;
@@ -4755,11 +4846,85 @@
       buildVialBottleGrid();
       renderGroupUI();
       loadShareableVessels();
+      loadOdProfilesForWizard();
       gotoStep(1);
       expModal.hidden = false;
       requestAnimationFrame(() => expModal.classList.add("open"));
       document.getElementById("exp-name").focus();
     }
+
+    // ---- Organism (per-organism OD calibration profiles) ----
+    // The designer can only pick an organism that has been calibrated: a new
+    // one comes into existence through the OD dilution series, never here.
+    const expOrganismEl = document.getElementById("exp-organism");
+    const expOrganismHelp = document.getElementById("exp-organism-help");
+    const ORGANISM_HELP = expOrganismHelp.textContent.trim();
+    wizardState.odProfiles = [];
+
+    function _odProfileOptionText(p) {
+      if (p.id === "legacy-2016") return p.organism;
+      const when = p.version ? p.version.slice(0, 10) : "?";
+      const measured = (p.vials_measured || []).length;
+      return `${p.organism} — calibrated ${when} · ${measured}/16 vials measured`;
+    }
+    function _selectedOdProfile() {
+      return (wizardState.odProfiles || []).find(p => p.id === wizardState.odProfile) || null;
+    }
+    // The review step's warnings for the chosen organism on these vials.
+    function _odProfileWarnings(p, vials) {
+      if (!p) return [];
+      const out = [];
+      if (p.id === "legacy-2016") {
+        out.push("never verified against a spectrophotometer, organism unknown — "
+          + "calibrate this organism before relying on absolute OD");
+      } else {
+        const measured = new Set(p.vials_measured || []);
+        const carried = vials.filter(v => !measured.has(v));
+        if (carried.length) {
+          out.push(`vials [${carried.join(", ")}] were never measured for this organism: `
+            + "they carry the default curve");
+        }
+        // Only the age: the profile-wide list of carried vials is replaced
+        // by the per-run one above.
+        (p.age_reasons || []).forEach(r => out.push(r));
+      }
+      return out;
+    }
+    async function loadOdProfilesForWizard() {
+      try {
+        const res = await fetch("/api/calibration/od/profiles");
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        wizardState.odProfiles = data.profiles || [];
+      } catch (err) {
+        wizardState.odProfiles = [];
+        expOrganismEl.innerHTML = `<option value="">Could not load OD calibrations</option>`;
+        return;
+      }
+      // Named organisms first (alphabetical), the unverified 2016 curve last.
+      const named = wizardState.odProfiles.filter(p => p.id !== "legacy-2016")
+        .sort((a, b) => a.organism.localeCompare(b.organism));
+      const legacy = wizardState.odProfiles.filter(p => p.id === "legacy-2016");
+      expOrganismEl.innerHTML = `<option value="">— choose the organism —</option>`
+        + [...named, ...legacy].map(p =>
+          `<option value="${escapeHtml(p.id)}">${escapeHtml(_odProfileOptionText(p))}</option>`
+        ).join("");
+      expOrganismEl.value = wizardState.odProfile || "";
+      _renderOrganismHelp();
+    }
+    function _renderOrganismHelp() {
+      const p = _selectedOdProfile();
+      if (!p) { expOrganismHelp.textContent = ORGANISM_HELP; return; }
+      const warn = p.id === "legacy-2016"
+        ? " This curve has never been checked against a spectrophotometer."
+        : (p.stale ? ` ${(p.reasons || []).join("; ")}.` : "");
+      expOrganismHelp.textContent = `Profile ${p.id}, version ${p.version}`
+        + (p.dark_subtracted ? ", dark-subtracted" : "") + "." + warn;
+    }
+    expOrganismEl.addEventListener("change", () => {
+      wizardState.odProfile = expOrganismEl.value;
+      _renderOrganismHelp();
+    });
 
     // ---- Shared vessels (parallel experiments) ----
     // A bottle or carboy another experiment uses can be shared: one level,
@@ -4889,6 +5054,12 @@
         }
         if (runsState.list.some(r => r.name === wizardState.name)) {
           showToast(`An experiment named "${wizardState.name}" is already loaded.`, "error");
+          return false;
+        }
+        wizardState.odProfile = expOrganismEl.value;
+        if (!wizardState.odProfile) {
+          showToast("Choose the organism: its OD calibration is what turns the "
+            + "photodiode counts into OD.", "error");
           return false;
         }
         wizardState.operator = document.getElementById("exp-operator").value.trim();
@@ -5381,10 +5552,17 @@
             return `<div><span class="swatch" style="background:${color};width:10px;height:10px;border-radius:50%;display:inline-block;margin-right:6px;vertical-align:-1px;"></span>${escapeHtml(b.name)} — ${b.initial_volume_ml} mL → vials [${vs.join(", ") || "(none)"}]</div>`;
           }).join("");
       const w = wizardState.media.waste;
+      const prof = _selectedOdProfile();
+      const organismRow = prof
+        ? `${escapeHtml(prof.organism)} <span class="muted">(OD profile ${escapeHtml(prof.id)} @ ${escapeHtml(prof.version)})</span>`
+          + _odProfileWarnings(prof, vials).map(x =>
+            `<div class="review-warn">⚠ ${escapeHtml(x)}</div>`).join("")
+        : "<span class='muted'>—</span>";
       const sharedRows = `
         <dt>Name</dt><dd>${escapeHtml(wizardState.name)}</dd>
         <dt>Operator</dt><dd>${escapeHtml(wizardState.operator || "")}${
           wizardState.expectedEnd ? ` <span class="muted">· until ${escapeHtml(new Date(wizardState.expectedEnd).toLocaleString())}</span>` : ""}</dd>
+        <dt>Organism</dt><dd>${organismRow}</dd>
         <dt>Notes</dt><dd>${escapeHtml(wizardState.notes) || "<span class='muted'>—</span>"}</dd>
         <dt>Vials</dt><dd>${vials.join(", ")}
                           <span class="muted">(${vials.length})</span></dd>
@@ -5431,6 +5609,9 @@
         vials: _derivedVials(),
         operator: wizardState.operator || "",
         expected_end: wizardState.expectedEnd || null,
+        // The organism's OD calibration profile; the server pins its
+        // current version into the run (never sent as calibration.od*).
+        od_profile: wizardState.odProfile,
         media: {
           bottles: wizardState.media.bottles.map(b => (b.vessel
             // Shared: the vessel id; the server fills in its size.
@@ -5473,7 +5654,10 @@
       const original = wizardNext.textContent;
       wizardNext.textContent = "Creating…";
       try {
-        await postJson("/api/experiments/create", body);
+        const created = await postJson("/api/experiments/create", body);
+        if ((created.warnings || []).length) {
+          showToast(created.warnings.join(" · "), "warn");
+        }
         // The new experiment becomes the lens.
         runsState.selected = wizardState.name;
         try { localStorage.setItem("evolver.lens", wizardState.name); } catch (_e) { /* ignore */ }
@@ -6272,7 +6456,7 @@
       const stale = idx.staleness || {};
       const subs = idx.subsystems || {};
       const TITLES = {
-        od: "OD curve (4-parameter sigmoid)",
+        od: "OD curve — machine default (idle reads; not an organism)",
         temperature: "Temperature (thermistor slope/intercept)",
         pump: "Pump flow rates (32 pumps, gravimetric)",
         stir: "Stir PWM → RPM",
@@ -6322,6 +6506,27 @@
           ${(blankStale.reasons || []).length
             ? `<ul class="cal-reasons">${blankStale.reasons.map(r =>
                 `<li>${escapeHtml(r)}</li>`).join("")}</ul>` : ""}
+        </div>
+      `);
+
+      // Organism OD profiles: what the designer offers, one per experiment.
+      const profs = idx.od_profiles || [];
+      cards.push(`
+        <div class="cal-card">
+          <h3>OD organism profiles</h3>
+          <p class="cal-meta">The experiment designer picks one per experiment and the run
+            keeps that version. New organisms are added by the OD series (Tier 3).</p>
+          <ul class="od-profile-list">${profs.map(p => `
+            <li title="${escapeHtml((p.reasons || []).join("; "))}">
+              <div class="od-profile-head"><strong>${escapeHtml(p.organism)}</strong>
+                ${p.stale ? '<span class="cal-badge stale">stale</span>'
+                          : '<span class="cal-badge ok">current</span>'}</div>
+              <div class="cal-meta">${p.is_default ? "machine default · " : ""}${
+                escapeHtml(p.version)} · ${(p.vials_measured || []).length}/16 vials measured${
+                p.dark_subtracted ? " · dark-subtracted" : ""}</div>
+            </li>`).join("")}</ul>
+          <button class="btn card-action" type="button" data-open-recal>
+            Recalibrate a finished run…</button>
         </div>
       `);
 
@@ -7007,6 +7212,129 @@
     // The server is the source of truth; these screens render its session
     // and never compute a fit themselves.
 
+    // ------------------------------------------------------------
+    //  Organism OD profiles; post-hoc recalibration of a finished run
+    // ------------------------------------------------------------
+
+    async function loadCalOdProfiles() {
+      try {
+        const res = await fetch("/api/calibration/od/profiles");
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        calState.odProfiles = (await res.json()).profiles || [];
+      } catch (err) {
+        console.warn("loading OD profiles failed:", err.message);
+        calState.odProfiles = calState.odProfiles || [];
+      }
+    }
+
+    const recalModal = document.getElementById("recal-modal");
+    let recalPollTimer = null;
+
+    async function openRecalModal() {
+      _openModal(recalModal);
+      document.getElementById("recal-result").innerHTML = "";
+      await loadCalOdProfiles();
+      const sel = document.getElementById("recal-exp");
+      sel.innerHTML = "";
+      try {
+        const d = await (await fetch("/api/experiments")).json();
+        // Only finished runs: a running one's data is still arriving.
+        const list = (d.experiments || []).filter(e => e.status === "stopped" || e.status === "error");
+        sel.innerHTML = list.length
+          ? list.map(e => `<option value="${escapeHtml(e.name)}">${escapeHtml(e.name)}${
+              e.organism ? ` — read as ${escapeHtml(e.organism)}` : ""}</option>`).join("")
+          : "<option value=''>No stopped experiments</option>";
+      } catch (_e) { sel.innerHTML = "<option value=''>—</option>"; }
+      const psel = document.getElementById("recal-profile");
+      psel.innerHTML = (calState.odProfiles || []).map(p =>
+        `<option value="${escapeHtml(p.id)}">${escapeHtml(p.organism)}</option>`).join("");
+      _recalFillVersions();
+      await renderRecalExisting();
+    }
+
+    function closeRecalModal() {
+      if (recalPollTimer) { clearTimeout(recalPollTimer); recalPollTimer = null; }
+      _closeModal(recalModal);
+    }
+
+    function _recalFillVersions() {
+      const pid = document.getElementById("recal-profile").value;
+      const p = (calState.odProfiles || []).find(x => x.id === pid);
+      const versions = (p && p.versions) || [];
+      document.getElementById("recal-version").innerHTML = versions.map((v, i) =>
+        `<option value="${escapeHtml(v)}">${escapeHtml(v)}${i === 0 ? " (current)" : ""}</option>`).join("");
+    }
+
+    function _recalReportHtml(r) {
+      const rows = Object.entries(r.vials || {}).sort((a, b) => a[0] - b[0]).map(([v, e]) => e.refused
+        ? `<tr><td>${v}</td><td colspan="4" class="bad">refused — ${escapeHtml(e.refused)}</td></tr>`
+        : `<tr><td>${v}</td><td>${e.ok}</td><td>${e.out_of_range}</td><td>${e.dropped}</td>
+             <td>${e.reanchored ? "at the run's blank" : `<span class="muted">${escapeHtml(e.offset_note || "no")}</span>`}</td></tr>`
+      ).join("");
+      const name = encodeURIComponent(r.experiment);
+      return `
+        <p class="cal-meta"><strong>${escapeHtml(r.target.organism || r.target.profile)}</strong>
+          ${escapeHtml(r.target.version)} · run read as ${escapeHtml(r.run.organism || r.run.od_profile || "(unrecorded)")}
+          · ${escapeHtml(r.created)}
+          · <a href="/api/experiments/${name}/recalibrations/${encodeURIComponent(r.id)}/download">download</a></p>
+        <table class="cal-table"><thead><tr><th>Vial</th><th>ok</th><th>out of range</th>
+          <th>dropped</th><th>re-anchored</th></tr></thead><tbody>${rows}</tbody></table>
+        ${(r.warnings || []).length ? `<ul class="cal-reasons">${r.warnings.map(w =>
+          `<li>⚠ ${escapeHtml(w)}</li>`).join("")}</ul>` : ""}`;
+    }
+
+    async function renderRecalExisting() {
+      const name = document.getElementById("recal-exp").value;
+      const out = document.getElementById("recal-result");
+      if (!name) { out.innerHTML = ""; return null; }
+      try {
+        const res = await fetch(`/api/experiments/${encodeURIComponent(name)}/recalibrations`);
+        const d = await res.json();
+        const job = d.job;
+        const running = job && job.status === "running";
+        const head = running
+          ? `<p class="blank-status wait">Recalibrating onto ${escapeHtml(job.od_profile)} — vial ${
+              job.progress[0]} of ${job.progress[1]}…</p>`
+          : (job && job.status === "failed"
+            ? `<p class="blank-status bad">Last recalibration failed: ${escapeHtml(job.error || "?")}</p>` : "");
+        const list = d.recalibrations || [];
+        out.innerHTML = head + (list.length
+          ? list.map(_recalReportHtml).join("<hr>")
+          : (running ? "" : '<p class="muted">No recalibrations of this run yet.</p>'));
+        return d;
+      } catch (err) {
+        out.innerHTML = `<p class="blank-status bad">${escapeHtml(err.message)}</p>`;
+        return null;
+      }
+    }
+
+    async function submitRecal() {
+      const name = document.getElementById("recal-exp").value;
+      if (!name) { showToast("Choose a stopped experiment", "warn"); return; }
+      const body = {
+        profile: document.getElementById("recal-profile").value,
+        version: document.getElementById("recal-version").value || null,
+        reanchor: document.getElementById("recal-reanchor").checked,
+      };
+      const vials = _t3Vials(_t3Val("recal-vials"));
+      if (vials) body.vials = vials;
+      try {
+        await postJson(`/api/experiments/${encodeURIComponent(name)}/recalibrate_od`, body);
+      } catch (err) {
+        showToast(err.message, err.status === 409 ? "warn" : "error");
+        return;
+      }
+      const poll = async () => {
+        const d = await renderRecalExisting();
+        if (d && d.job && d.job.status === "running" && !recalModal.hidden) {
+          recalPollTimer = setTimeout(poll, 500);
+        } else if (d && d.job && d.job.status === "done") {
+          showToast(`OD of "${name}" recalibrated`, "ok");
+        }
+      };
+      await poll();
+    }
+
     function _openModal(el) {
       el.hidden = false;
       requestAnimationFrame(() => el.classList.add("open"));
@@ -7570,7 +7898,7 @@
       const o = calState.odseries;
       o.review = null; o.installed = null; o.needOverride = false;
       _openModal(odSeriesModal);
-      await odSeriesRefresh();
+      await Promise.all([odSeriesRefresh(), loadCalOdProfiles()]);
       o.step = (o.session && o.session.active) ? 2 : 1;
       renderOdSeries();
     }
@@ -7611,6 +7939,12 @@
       document.getElementById("odseries-abort").hidden = !s || !!o.installed;
       next.disabled = false;
       stateEl.innerHTML = s ? _t3StateBanner(s, "Re-apply conditions") : "";
+      if (s && s.config && s.config.organism && !o.installed) {
+        stateEl.innerHTML += `<p class="cal-meta">${s.config.new_profile
+          ? "Introducing a new organism" : "Recalibrating"}: <strong>${
+          escapeHtml(s.config.organism)}</strong> <span class="muted">(profile ${
+          escapeHtml(s.config.profile_id)})</span></p>`;
+      }
       if (s && s.thermal && o.step === 2) {
         stateEl.innerHTML += `<p class="blank-status ${s.thermal.settled ? "ok" : "wait"}">${
           s.thermal.settled ? `Held at ${_fmt(s.config.target_temp_c, 1)} °C.`
@@ -7620,22 +7954,42 @@
       if (o.installed) {
         const r = o.installed;
         body.innerHTML = `
-          <p class="blank-status ok">Installed as version ${escapeHtml(r.version)}, dark-subtracted,
-          and live. Measured: ${escapeHtml((r.measured_vials || []).join(", ") || "none")}.
+          <p class="blank-status ok">Installed version ${escapeHtml(r.version)} of
+          <strong>${escapeHtml(r.organism || "?")}</strong>${r.new_profile ? " (new organism)" : ""},
+          dark-subtracted. Measured: ${escapeHtml((r.measured_vials || []).join(", ") || "none")}.
           ${(r.converted_vials || []).length ? `Converted to dark-subtracted signal: ${escapeHtml(r.converted_vials.join(", "))}.` : ""}
-          New experiments now read OD dark-subtracted; take a fresh per-run blank.</p>
+          Experiments created for this organism from now on read through it; runs already
+          created keep the version they pinned (Recalibrate a finished run applies it afterwards).
+          The machine's default curve is unchanged.</p>
           ${_t3QcLists(r.qc)}`;
         next.textContent = "Done";
         return;
       }
       if (o.step === 1) {
+        // Only named organisms can be recalibrated; the default slot (the
+        // 2016 curve) is not an organism.
+        const named = (calState.odProfiles || []).filter(p => !p.is_default);
         body.innerHTML = `
+          <p class="cal-hint">An organism exists only once it has been calibrated here: recalibrate
+          one, or introduce a new one by name. Vials this series does not measure keep the
+          organism's previous curve (or, for a new organism, the machine's default).</p>
           <p class="cal-hint">Tier 3 §8.2. Prepare ≥ 8 dilutions of a <strong>non-growing</strong>
           turbidity standard (killed cells, heat-fixed cells or beads) in the run's medium, from
           a blank to above the highest OD you will run. The series fits all four sigmoid
           parameters on <strong>dark-subtracted</strong> signal and installs the sidecar that makes
           the dark read a correction. It reserves the whole machine and survives a restart.</p>
           <div class="cal-form-grid">
+            <label>Organism</label>
+            <div>
+              <label><input type="radio" name="os-target" value="existing" ${named.length ? "checked" : "disabled"}>
+                Recalibrate</label>
+              <select id="os-profile" ${named.length ? "" : "disabled"}>${named.map(p =>
+                `<option value="${escapeHtml(p.id)}">${escapeHtml(p.organism)} (${escapeHtml(p.version)})</option>`).join("")
+                || "<option>no organisms calibrated yet</option>"}</select><br>
+              <label><input type="radio" name="os-target" value="new" ${named.length ? "" : "checked"}>
+                New organism</label>
+              <input id="os-new-organism" type="text" maxlength="80" placeholder="e.g. Pichia pastoris GS115">
+            </div>
             <label for="os-operator">Operator</label><input id="os-operator" type="text">
             <label for="os-standard">Turbidity standard</label>
             <input id="os-standard" type="text" placeholder="e.g. heat-killed E. coli">
@@ -7850,6 +8204,13 @@
           stir_pwm: _t3Num("os-stir") ?? 8,
           target_temp_c: _t3Num("os-temp"),
         };
+        const target = document.querySelector('input[name="os-target"]:checked');
+        if (target && target.value === "existing") {
+          body.profile = _t3Val("os-profile");
+        } else {
+          body.new_organism = _t3Val("os-new-organism");
+          if (!body.new_organism) { showToast("Name the new organism", "warn"); return; }
+        }
         const vials = _t3Vials(_t3Val("os-vials"));
         if (vials) body.vials = vials;
         const started = await _t3Post("/api/calibration/od/series/start", body);
@@ -7871,7 +8232,7 @@
         try {
           o.installed = await postJson("/api/calibration/od/series/finish", payload);
           o.session = { active: false };
-          showToast(`OD calibration installed (${o.installed.version}) — dark-subtracted`, "ok");
+          showToast(`OD calibration for ${o.installed.organism} installed (${o.installed.version})`, "ok");
           refreshCalibration();
         } catch (err) {
           if (err.code === "qc_refused") {
@@ -7946,6 +8307,19 @@
       document.getElementById("recon-submit")
         .addEventListener("click", submitReconciliation);
 
+      document.getElementById("cal-open-recal")
+        .addEventListener("click", () => openRecalModal());
+      document.getElementById("recal-modal-close")
+        .addEventListener("click", closeRecalModal);
+      document.getElementById("recal-cancel")
+        .addEventListener("click", closeRecalModal);
+      document.getElementById("recal-submit")
+        .addEventListener("click", submitRecal);
+      document.getElementById("recal-exp")
+        .addEventListener("change", renderRecalExisting);
+      document.getElementById("recal-profile")
+        .addEventListener("change", _recalFillVersions);
+
       // Tier 3 (Session AA)
       document.getElementById("cal-open-temp")
         .addEventListener("click", openTempCalModal);
@@ -7979,6 +8353,7 @@
       });
       // The open-session card's "Open wizard" button.
       document.getElementById("cal-cards").addEventListener("click", (e) => {
+        if (e.target.closest("[data-open-recal]")) { openRecalModal(); return; }
         const b = e.target.closest("[data-open-t3]");
         if (!b) return;
         if (b.dataset.openT3 === "temperature") openTempCalModal();

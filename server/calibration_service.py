@@ -699,6 +699,7 @@ class CalibrationStore:
                 "legacy_vials": [v for v in range(N_VIALS) if _is_legacy_source(sources[v])],
                 "stale": bool(reasons),
                 "reasons": reasons,
+                "age_reasons": self._od_env_age_reasons(env, entry["version"]),
                 "versions": self.od_profile_versions(pid),
             })
         return out
@@ -715,6 +716,14 @@ class CalibrationStore:
         elif legacy:
             reasons.append(f"vials {legacy} are still on 2016 constants never "
                            "verified against a spectrophotometer")
+        return reasons + self._od_env_age_reasons(env, version)
+
+    @staticmethod
+    def _od_env_age_reasons(env: Optional[dict], version: Optional[str]) -> list[str]:
+        """The age half of :meth:`_od_env_staleness` -- what the designer
+        shows beside its own per-run list of carried vials."""
+        if env is None:
+            return []
         stamps = (env.get("fit") or {}).get("per_vial_version")
         ages = []
         now = _utc_now()
@@ -723,8 +732,8 @@ class CalibrationStore:
             if dt is not None:
                 ages.append((now - dt).total_seconds() / 86400.0)
         if ages and max(ages) > CURVE_STALE_DAYS:
-            reasons.append(f"calibration is {max(ages):.0f} days old (> {CURVE_STALE_DAYS:.0f})")
-        return reasons
+            return [f"calibration is {max(ages):.0f} days old (> {CURVE_STALE_DAYS:.0f})"]
+        return []
 
     def save_od_profile_version(self, profile_id: str, organism: str, envelope: dict) -> str:
         """Install a new version of a NAMED organism profile. Never touches

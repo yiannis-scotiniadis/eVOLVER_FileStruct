@@ -2571,12 +2571,18 @@ class ExperimentEngine:
                             info[key] = s[key]
                 except Exception:
                     log.exception("failed to parse %s", state_path)
-            elif config_path.is_file():
+            if config_path.is_file():
                 try:
                     c = json.loads(config_path.read_text(encoding="utf-8"))
-                    for key in ("mode", "vials", "created"):
-                        if key in c:
-                            info[key] = c[key]
+                    if not state_path.is_file():
+                        for key in ("mode", "vials", "created"):
+                            if key in c:
+                                info[key] = c[key]
+                    # Which organism's OD curve the run was read through.
+                    cal = c.get("calibration") or {}
+                    if cal.get("od_organism"):
+                        info["organism"] = cal["od_organism"]
+                        info["od_profile"] = cal.get("od_profile")
                 except Exception:
                     log.exception("failed to parse %s", config_path)
             if entry.name == loaded_name:

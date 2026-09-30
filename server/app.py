@@ -28,6 +28,7 @@ import signal
 import sys
 import threading
 import time
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -48,6 +49,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import data_export as dx  # noqa: E402
 import fluidics  # noqa: E402
 import growth_rate as growth  # noqa: E402
+import od_recalibrate as odr  # noqa: E402
 import event_log as evlog  # noqa: E402
 from calibration_service import (  # noqa: E402
     CalibrationConflict,
@@ -522,6 +524,10 @@ def _event_message(kind: str, payload: dict) -> str:
         )
         return f"Experiment '{name}' created with groups: {groups}"
     if kind in ("created", "started", "resumed"):
+        organism = payload.get("organism")
+        if organism:
+            return (f"Experiment '{name}' {kind} — OD through {organism} "
+                    f"({payload.get('od_profile')} @ {payload.get('od_version')})")
         return f"Experiment '{name}' {kind}"
     if kind == "preconditioned":
         return (
@@ -557,9 +563,17 @@ def _event_message(kind: str, payload: dict) -> str:
             f"{payload.get('max_offset_removed', '?')} OD removed)"
         )
     if kind == "calibration_installed":
+        organism = payload.get("organism")
         return (
             f"Calibration installed: {payload.get('subsystem', '?')} "
             f"version {payload.get('version', '?')}"
+            + (f" for {organism}" + (" (new organism)" if payload.get("new_profile") else "")
+               if organism else "")
+        )
+    if kind == "od_recalibrated":
+        return (
+            f"OD of '{name}' recalibrated onto {payload.get('organism') or payload.get('od_profile')} "
+            f"version {payload.get('od_version')} -> recalibrated/{payload.get('id')}"
         )
     if kind == "reconciliation":
         ok = payload.get("within_tolerance")
@@ -758,6 +772,7 @@ def create_app(use_mock: bool):
         "od_blank_committed": (evlog.LEVEL_INFO, evlog.CATEGORY_CALIBRATION),
         "calibration_installed": (evlog.LEVEL_INFO, evlog.CATEGORY_CALIBRATION),
         "reconciliation": (evlog.LEVEL_INFO, evlog.CATEGORY_CALIBRATION),
+        "od_recalibrated": (evlog.LEVEL_INFO, evlog.CATEGORY_CALIBRATION),
     }
 
     def _emit_alert(
@@ -2761,6 +2776,135 @@ def create_app(use_mock: bool):
                 dedup_key=("reconcile_failed", name),
             )
         return jsonify(record)
+
+    # ----------------- OD profiles and post-hoc recalibration ----------------
+    # A finished run's OD pushed through another curve (od_recalibrate.py):
+    # its own files are never touched, the output lands in
+    # experiments/<run>/recalibrated/<id>/. One background job per run.
+
+    recal_jobs: dict[str, dict] = {}
+    recal_lock = threading.Lock()
+
+    @flask_app.route("/api/calibration/od/profiles")
+    def api_od_profiles():
+        store = cal_service.store
+        return jsonify(default=store.od_default_profile(),
+                       profiles=store.od_profile_summaries())
+
+    def _finished_experiment(name: str):
+        """None if ``name`` is a run whose data is complete, else an error
+        response: missing (404), or loaded and not yet stopped (409)."""
+        if Path(name).name != name or name.startswith(".") \
+                or _experiment_vials(name) is None:
+            return jsonify(error=f"experiment '{name}' not found"), 404
+        run = state.engine.get_run(name) if state.engine is not None else None
+        if run is not None and run.status().get("status") in (
+                ExperimentStatus.RUNNING, ExperimentStatus.CREATED):
+            return jsonify(
+                error=f"'{name}' has not finished — stop it before recalibrating its OD",
+                code="run_not_finished",
+            ), 409
+        return None
+
+    @flask_app.route("/api/experiments/<name>/recalibrate_od", methods=["POST"])
+    def api_experiment_recalibrate_od(name):
+        refused = _finished_experiment(name)
+        if refused is not None:
+            return refused
+        body = request.get_json(silent=True) or {}
+        profile = body.get("profile")
+        if not profile:
+            return jsonify(error="'profile' is required"), 400
+        try:
+            env = cal_service.store.get_od_profile(str(profile), body.get("version") or None)
+        except ValueError as exc:
+            return jsonify(error=str(exc)), 400
+        if env is None:
+            return jsonify(error=f"unknown organism profile {profile!r}",
+                           code="unknown_od_profile",
+                           profiles=sorted(cal_service.store.od_profiles())), 400
+        exp_vials = _experiment_vials(name)
+        vials = body.get("vials")
+        if vials is not None:
+            try:
+                vials = sorted({int(v) for v in vials})
+            except (TypeError, ValueError):
+                return jsonify(error="'vials' must be a list of integers"), 400
+            stray = [v for v in vials if v not in exp_vials]
+            if stray or not vials:
+                return jsonify(error=f"vials {stray or vials} are not this run's {exp_vials}"), 400
+        reanchor = bool(body.get("reanchor", True))
+        with recal_lock:
+            job = recal_jobs.get(name)
+            if job is not None and job["status"] == "running":
+                return jsonify(error=f"a recalibration of '{name}' is already running",
+                               code="recalibration_in_progress", job=job), 409
+            job = {
+                "status": "running", "od_profile": str(profile),
+                "od_version": env.get("version"), "reanchor": reanchor,
+                "progress": [0, len(vials or exp_vials)], "started": _now_iso(),
+                "id": None, "error": None,
+            }
+            recal_jobs[name] = job
+
+        def work():
+            def progress(done, total):
+                job["progress"] = [done, total]
+            try:
+                report = odr.recalibrate_run(
+                    EXPERIMENTS_DIR / name, env, vials=vials, reanchor=reanchor,
+                    store=cal_service.store, progress=progress,
+                )
+            except Exception as exc:
+                log.exception("OD recalibration of '%s' failed", name)
+                job.update(status="failed", error=str(exc), finished=_now_iso())
+                _emit_alert(
+                    "warning", f"OD recalibration of '{name}' failed: {exc}",
+                    category=evlog.CATEGORY_CALIBRATION,
+                    data={"experiment": name},
+                    dedup_key=("od_recalibration_failed", name),
+                )
+                return
+            job.update(status="done", id=report["id"], finished=_now_iso())
+            _emit_event({
+                "type": "od_recalibrated", "name": name, "experiment": name,
+                "id": report["id"], "od_profile": report["target"]["profile"],
+                "organism": report["target"]["organism"],
+                "od_version": report["target"]["version"], "reanchor": reanchor,
+                "vials": sorted(int(v) for v in report["vials"]),
+                "refused": sorted(int(v) for v, e in report["vials"].items()
+                                  if "refused" in e),
+                "warnings": report["warnings"],
+            })
+
+        threading.Thread(target=work, name="od-recalibrate", daemon=True).start()
+        return jsonify(status="running", job=job), 202
+
+    @flask_app.route("/api/experiments/<name>/recalibrations")
+    def api_experiment_recalibrations(name):
+        if Path(name).name != name or _experiment_vials(name) is None:
+            return jsonify(error=f"experiment '{name}' not found"), 404
+        return jsonify(job=recal_jobs.get(name),
+                       recalibrations=odr.list_recalibrations(EXPERIMENTS_DIR / name))
+
+    @flask_app.route("/api/experiments/<name>/recalibrations/<rid>/download")
+    def api_experiment_recalibration_download(name, rid):
+        if Path(name).name != name or _experiment_vials(name) is None:
+            return jsonify(error=f"experiment '{name}' not found"), 404
+        try:
+            d = odr.recalibration_dir(EXPERIMENTS_DIR / name, rid)
+        except odr.RecalibrationError as exc:
+            return jsonify(error=str(exc)), 400
+        except FileNotFoundError:
+            return jsonify(error=f"no recalibration {rid!r} of '{name}'"), 404
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for f in sorted(d.iterdir()):
+                if f.is_file() and not f.is_symlink():
+                    zf.write(f, arcname=f"{rid}/{f.name}")
+        buf.seek(0)
+        return send_file(buf, mimetype="application/zip", as_attachment=True,
+                         download_name=f"{name}_{rid}.zip")
 
     # --------------------- WebSocket sensor broadcast loop -------------------
 

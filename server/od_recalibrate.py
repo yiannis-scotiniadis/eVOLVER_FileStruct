@@ -12,8 +12,8 @@ files.
     python server/od_recalibrate.py MyRun --envelope my_curve.json --no-reanchor
 
 Output goes to ``experiments/<run>/recalibrated/<profile>__<version>/``:
-one ``vialNN_OD.csv`` per vial and a ``recalibration.json`` saying what was
-done. Each CSV keeps the live file's first seven columns and their meaning
+one ``vialNN_OD.csv`` per vial, a ``recalibration.json`` saying what was
+done, and ``od_calibration.json`` -- the curve that was applied. Each CSV keeps the live file's first seven columns and their meaning
 (``raw_adc`` = the signal fed to the curve, ``calibrated_od`` = the new OD),
 so ``replay_growth.py --od-dir`` and positional parsers read it unchanged.
 
@@ -380,6 +380,8 @@ def recalibrate_run(
             "warnings": warnings,
         }
         (staging / REPORT_NAME).write_text(json.dumps(report, indent=2), encoding="utf-8")
+        (staging / "od_calibration.json").write_text(json.dumps(target_env, indent=2),
+                                                     encoding="utf-8")
         final = out_root / rid
         if final.exists():
             old = out_root / f".{rid}.old-{os.getpid()}"
