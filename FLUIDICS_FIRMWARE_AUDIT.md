@@ -517,7 +517,7 @@ a target and the config is told what the target is.
 ### 7.1 Setup
 
 ```bash
-ssh pi@192.168.1.2
+ssh pi@evolver-001
 sudo systemctl stop evolver
 sudo fuser /dev/ttyAMA0                      # must print nothing
 cd /home/pi/evolver-gui

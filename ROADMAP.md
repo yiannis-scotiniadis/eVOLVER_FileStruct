@@ -1079,9 +1079,10 @@ daily heartbeat summary for running experiments (silence should not be ambiguous
 
 **Two constraints to resolve before building:**
 
-- **Egress.** The Pi sits behind a dedicated Netgear router. Tailscale is deployed
-  (`deploy/ts-keepalive/`), so outbound connectivity may already exist — verify before
-  assuming, and fail gracefully with a queued-notification buffer when offline.
+- **Egress.** ~~The Pi sits behind a dedicated Netgear router.~~ That router is now
+  decommissioned; the rig is reached day-to-day at `pi@evolver-001` over Tailscale
+  (`deploy/ts-keepalive/`), which confirms outbound connectivity exists. Still fail
+  gracefully with a queued-notification buffer when offline.
 - **Email is harder than it looks.** Yale's SMTP relay will likely require authenticated
   submission and may reject a headless device. Do Slack first; add email only if someone
   actually needs it, and consider a webhook-to-email bridge rather than SMTP on the Pi.

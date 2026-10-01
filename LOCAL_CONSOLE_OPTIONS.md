@@ -136,7 +136,7 @@ Worth it only if something in the GUI turns out to need Blink specifically. Noth
 
 The cleanest architectural answer: **the instrument controller should not also be the
 workstation.** Leave the Pi doing exactly what it does today and hang the display off something
-else pointed at `http://192.168.1.2:5000`:
+else pointed at `http://evolver-001:5000`:
 
 - **An old tablet or laptop** on a stand — free, full browser, zero cost to the instrument.
 - **A second Pi (Zero 2 W / Pi 4) as a dedicated panel** — £15–£60, and its problems are its own.

@@ -1,1 +1,40 @@
 * text=auto eol=lf
+
+# --- Runtime footprint (`git archive`, wrapped by deploy.sh — see DEPLOY.md P3.3) ---
+#
+# `deploy.sh` builds the Pi's runtime directory with `git archive <tag>`, which honors
+# `export-ignore` below to leave out everything that isn't needed to actually run the
+# server: docs, the pytest suite, dev-only benchmarking/verification scripts, and the
+# frozen 2016 reference implementations. This has NO effect on `git clone`/`git checkout` —
+# a normal dev checkout still gets everything — it only shapes what the archive contains.
+# Adding a new dev-only file to the repo means adding a line here, or it ships to the Pi.
+
+# Claude/session docs and specs — read by developers, never by the running server.
+*.md export-ignore
+
+# deploy.sh runs against the source clone (evolver-src) to build the runtime directory;
+# it has no reason to exist inside the runtime directory it produces.
+/deploy.sh export-ignore
+
+# Editor config.
+.vscode/ export-ignore
+
+# Reference-only legacy code (2016 Mac/RPi scripts) — never imported by server/.
+mac_original/ export-ignore
+rpi_original/ export-ignore
+
+# Optional headless console (LOCAL_CONSOLE_OPTIONS.md) — an alternative to the browser
+# GUI, not the GUI itself, and needs extra deps (textual, python-socketio[client],
+# plotext) that aren't in requirements.txt. Copy it over by hand if you want it.
+evolver_console.py export-ignore
+
+# Dev/test tooling — pytest suite, benchmarks, verification/replay scripts, none of
+# which app.py imports or the running server touches.
+pytest.ini export-ignore
+requirements-dev.txt export-ignore
+server/test_*.py export-ignore
+server/conftest.py export-ignore
+server/bench_*.py export-ignore
+server/verify_*.py export-ignore
+server/capture_fluidics_ack.py export-ignore
+server/replay_growth.py export-ignore

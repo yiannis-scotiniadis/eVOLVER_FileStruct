@@ -126,7 +126,7 @@ All members of the Isaacs Lab at Yale, ranging from undergraduate researchers wi
      |
      | HTTP (pages, API) + WebSocket (live data)
      |
-[Flask server on RPi (192.168.1.2:5000)]
+[Flask server on RPi (pi@evolver-001:5000 over Tailscale)]
      |
      |--- SerialManager (or MockSerialManager)
      |        |
@@ -1501,7 +1501,7 @@ class MockSerialManager:
 
 ```bash
 # SSH into RPi
-ssh pi@192.168.1.2
+ssh pi@evolver-001
 
 # Stop old system
 sudo supervisorctl stop all
@@ -1523,7 +1523,7 @@ cp /home/pi/eVOLVER_UDP/temp_data.txt calibration/  # if needed
 # Start server
 python3 server/app.py
 
-# Access from any browser: http://192.168.1.2:5000
+# Access from any browser: http://evolver-001:5000
 ```
 
 ### Auto-start on boot
@@ -1550,7 +1550,7 @@ WantedBy=multi-user.target
 ### Update procedure
 
 ```bash
-ssh pi@192.168.1.2
+ssh pi@evolver-001
 cd /home/pi/evolver-gui
 # DO NOT update while an experiment is running
 git pull origin main
@@ -1571,7 +1571,7 @@ These decisions can be deferred but should be resolved before Phase 2:
 
 4. **Heater stuck-on issue:** Diagnosis in progress. If MOSFETs are failed-on, hardware repair is needed before temperature-controlled experiments. OD and stir experiments can proceed independently. **Note:** the inverted `xr` setpoint convention (see §10 "Heater control convention") was discovered while debugging this issue — any prior code or operator command that sent `xr=0` "to turn the heaters off" was actually requesting ~82 °C, which would explain stuck-on behaviour even with healthy MOSFETs. Before concluding hardware is at fault, verify the heaters do turn off when sent `xr=4095` (or `set_temperature_celsius` with ambient target).
 
-5. **Network access:** Currently the eVOLVER is on a dedicated Netgear router (192.168.1.x). For remote monitoring, the router could be connected to Yale's network, or a VPN tunnel could be set up. This is a Phase 4 concern.
+5. **Network access:** ~~Currently the eVOLVER is on a dedicated Netgear router (192.168.1.x).~~ **Overtaken by events:** that router is now decommissioned. The rig is reached at `pi@evolver-001` over Tailscale (`deploy/ts-keepalive/`), which is the VPN-tunnel option this question was asking about — it's done, not a Phase 4 concern anymore.
 
 6. **Concurrent experiments:** Phase 2 allows multiple experiment groups, but the RS485 bus is shared. The serial manager must ensure commands for different experiments don't interfere. Since all 16 vials are always read in a single command, this is primarily a software isolation concern, not a hardware one. **Answered (2026-09-24):** both shipped. Vial groups (§9.1) serve one operator running several arms inside one experiment; parallel experiments (§9.2) give two operators independent lifecycles, as a single-threaded supervisor over one engine per experiment — not concurrent engine threads.
 
@@ -1583,7 +1583,7 @@ These decisions can be deferred but should be resolved before Phase 2:
 
 9. ~~**What growth-rate estimate does the lab consider authoritative?**~~ **ANSWERED (2026-08-23, `GROWTH_RATE_METHOD.md` §0).** The Isaacs Lab algorithm — windowed log-linear regression within inter-dilution segments — is *the* growth rate, singly. The dilution-rate calculation survives only as a gated diagnostic and is never reported as a μ. Implemented in `server/growth_rate.py`. One question remains open but is not a software question: whether the doubling times already published from that script were intended as μ_max. They are not — the range gate makes them growth rates at the operating density, ~15 % below μ_max for a K ≈ 1.5 culture (`GROWTH_RATE_METHOD.md` §2 #2, §9).
 
-10. **Does the Pi have outbound internet?** Notifications (§22) and off-box backup (§24) both need egress. The Pi sits behind a dedicated Netgear router; Tailscale is deployed (`deploy/ts-keepalive/`), which suggests egress exists, but this has not been verified for arbitrary outbound HTTPS. Confirm before building either feature.
+10. **Does the Pi have outbound internet?** Notifications (§22) and off-box backup (§24) both need egress. **Answered:** yes — the dedicated Netgear router this question referred to is gone, and the Pi is reached day-to-day via Tailscale (`pi@evolver-001`, `deploy/ts-keepalive/`), which requires outbound egress to work at all. Arbitrary outbound HTTPS beyond Tailscale's own traffic still hasn't been separately verified — confirm before building either feature.
 
 11. **Who performs the bench calibration work?** §19 needs roughly 40 minutes of gravimetric pump work; §25 needs about two hours of stir RPM measurement; full OD/temperature recalibration (Phase 4) needs several more. None of it is software effort, and all of it blocks software accuracy. Assign an owner.
 

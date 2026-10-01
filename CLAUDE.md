@@ -11,7 +11,7 @@ This project modernizes the control software for a 2016-era eVOLVER continuous c
         |
         | HTTP / WebSocket
         v
-[Raspberry Pi (192.168.1.2)]  ← runs the new Flask server
+[Raspberry Pi (pi@evolver-001 over Tailscale)]  ← runs the new Flask server
         |
         | RS485 serial (/dev/ttyAMA0, 9600 baud)
         |
@@ -28,7 +28,10 @@ This project modernizes the control software for a 2016-era eVOLVER continuous c
 ### Raspberry Pi
 - Model: Raspberry Pi (B8:27:EB MAC prefix)
 - OS: Raspbian (Python 2.7 environment)
-- Static IP: 192.168.1.2
+- Network identity: **`pi@evolver-001` over Tailscale** — the dedicated Netgear N300 LAN
+  router this rig once sat behind is decommissioned, and the `192.168.1.2` static IP it
+  handed out no longer resolves to anything. Whatever LAN the Pi's Ethernet is plugged into
+  now is only there to give Tailscale egress; nothing should address the rig by LAN IP.
 - Serial port: /dev/ttyAMA0 (hardware UART, directly wired to RS485 transceiver)
 - SSH access: user `pi`
 - Process manager: supervisor
@@ -394,7 +397,7 @@ three differences into any new work:
 
 **Phase 1 shipped and is deployed.** The Flask server replaces all 5 legacy supervisor
 processes, owns `/dev/ttyAMA0` directly, and serves the dashboard at
-`http://192.168.1.2:5000`. Most of Phase 2 is done as well.
+`http://evolver-001:5000`. Most of Phase 2 is done as well.
 
 | Subsystem | Status | Where |
 |---|---|---|
@@ -409,6 +412,7 @@ processes, owns `/dev/ttyAMA0` directly, and serves the dashboard at
 | Data export (ZIP), exports browser, disk monitoring | Built | `server/data_export.py` |
 | Crash recovery / resume from `state.json` | Built | `experiment_engine.py` |
 | Deployment: systemd unit, `install.sh`, Tailscale keepalive | Built | `DEPLOY.md`, `deploy/` |
+| Minimal runtime export: `.gitattributes` `export-ignore` + `deploy.sh` build the Pi's runtime directory via `git archive`, so docs/tests/dev tooling/legacy reference code never land there | Built | `.gitattributes`, `deploy.sh`, `DEPLOY.md` P3.3 |
 | Consumables safety interlock (reserve/waste hard stop, auto-maintenance) | Built | `experiment_engine.py` |
 | Volume-based fluidics (mL manual pumping, quantisation preview) | Built | `experiment_engine.py`, `/api/actuators/pump` |
 | Concurrent dilution schedules (influx+efflux together, all vials in parallel, efflux overrun kept) | Built | `server/fluidics.py`, `app.py:_dispatch_dilutions` |
@@ -686,13 +690,13 @@ backup, multi-phase protocols, and authentication.
 - The 2016 Arduino firmware is not being changed. The new server must speak the exact same serial protocol.
 - Calibration files must remain compatible with the existing format.
 - The lab Mac Mini runs macOS 10.12.6 (Sierra) with Python 2.7, but it only needs to run a browser to access the new web GUI.
-- The router is a Netgear N300 at 192.168.1.1. The RPi is at 192.168.1.2. The Mac gets its IP via DHCP (typically 192.168.1.3).
+- **The dedicated Netgear N300 router (and the `192.168.1.x` addressing it handed out) is defunct.** Reach the rig at `pi@evolver-001` over Tailscale, not by LAN IP — see "Network identity" above.
 
 ## Stopping the old system before running the new one
 
 ```bash
 # SSH into RPi
-ssh pi@192.168.1.2
+ssh pi@evolver-001
 
 # Stop all old processes
 sudo supervisorctl stop all
@@ -725,14 +729,20 @@ eVOLVER_FileStruct/
   FLUIDICS_FIRMWARE_AUDIT.md # Measured fluidics firmware behaviour (bench, Sep 2026)
   SESSION_MASTER_PLAN.md     # Original Session A-J plan; see its status header
   DEPLOY.md                  # RPi operator runbook
+  .gitattributes             # `export-ignore` rules: what `git archive`/deploy.sh leave
+                             #   off the Pi (this file, every doc, tests, dev tooling,
+                             #   rpi_original/mac_original) — see DEPLOY.md P3.3
+  deploy.sh                  # builds/updates the Pi's runtime dir from a tag via
+                             #   `git archive`; run from the source clone (`evolver-src`
+                             #   on the Pi), never copied into the runtime dir itself
 
-  rpi_original/              # Original RPi scripts (reference only, do not modify)
-    evolver_UPD.py
+  rpi_original/              # Original RPi scripts (reference only, do not modify) —
+    evolver_UPD.py           #   never imported by server/; export-ignored, dev-tree only
     UDP_TEMP.py  UDP_OD.py  UDP_FAN.py  UDP_FLUIDICS.py
     RS485_TEST.py
     extras/
-  mac_original/              # Original Mac client scripts (reference only)
-    eVOLVER_module.py  main_eVOLVER.py  custom_script.py
+  mac_original/              # Original Mac client scripts (reference only) — same:
+    eVOLVER_module.py  main_eVOLVER.py  custom_script.py   #   export-ignored, dev-tree only
 
   calibration/               # Versioned calibration store (Session O / SPEC §19.1)
     current.json             # pointer: subsystem -> active version; "od" is the machine

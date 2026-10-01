@@ -6,9 +6,10 @@ exists — validation, pilot procedure, updating between tags. This one covers t
 flashed a clean headless Raspberry Pi OS onto a new microSD card, and you need to get from
 that to an operational eVOLVER.**
 
-Target: **eVOLVER-001** — Raspberry Pi 3 Model B Rev 1.2, aarch64, 905 MB RAM, static
-`192.168.1.2` on the Netgear N300, `/dev/ttyAMA0` wired to the RS485 transceiver, 4 × SAMD21,
-16 smart sleeves, 32 pumps. Deploying `pilot-v0.1.5`.
+Target: **eVOLVER-001** — Raspberry Pi 3 Model B Rev 1.2, aarch64, 905 MB RAM, reachable at
+`pi@evolver-001` over Tailscale (the Netgear N300 it used to sit behind, and the static
+`192.168.1.2` it handed out, are both retired — see Stage 3), `/dev/ttyAMA0` wired to the
+RS485 transceiver, 4 × SAMD21, 16 smart sleeves, 32 pumps. Deploying `pilot-v0.1.5`.
 
 **`DEPLOY.md`'s "Prerequisites — Python 3.11 on Raspbian Jessie" (N1–N5) does not apply here.**
 That is the source-build escape path for the ancient card. Bookworm ships Python 3.11 and
@@ -43,7 +44,7 @@ and pulling the card is the moment you can lose it. Stage 0 is not optional.
 ### 0.1 Confirm nothing is running
 
 ```bash
-ssh pi@192.168.1.2
+ssh pi@evolver-001
 curl -s localhost:5000/api/health | head -c 400; echo
 sudo systemctl status evolver --no-pager
 ```
@@ -85,7 +86,7 @@ Pull it **off the Pi** — the point of the exercise is to not depend on this ca
 
 ```powershell
 # from the Windows dev machine
-scp pi@192.168.1.2:/home/pi/evolver-001-card-*.tar.gz `
+scp pi@evolver-001:/home/pi/evolver-001-card-*.tar.gz `
     "C:\Research\BIOLOGY\PersonalResearch\EVOLVER_GUI_DEV\_card_backup\"
 ```
 
@@ -127,7 +128,7 @@ You have already flashed. Confirm these, because two of them are expensive to fi
 | Hostname | match the old card (Stage 0.3) | It is the Tailscale/MagicDNS name. |
 | SSH | enabled, **public-key** auth | Paste the same key that is in the harvested `authorized_keys`. |
 | Locale / timezone | **match the old card** | Experiment CSV timestamps are wall-clock. A timezone change makes the notebook discontinuous across the rebuild. |
-| Wi-Fi | optional | The rig is reachable at `192.168.1.2` over the lab router. Wired Ethernet is strictly better here — it removes the symmetric NAT that `deploy/ts-keepalive/` exists to work around. |
+| Wi-Fi | optional | The rig is reachable at `pi@evolver-001` over Tailscale, not by LAN address. Wired Ethernet is still strictly better here — it removes the symmetric NAT that `deploy/ts-keepalive/` exists to work around. |
 
 If you got the username wrong, reflash. It is five minutes now against edits to two files plus
 every path in `DEPLOY.md` forever.
@@ -162,34 +163,32 @@ aarch64 wheels and this is not worth fighting.
 
 ---
 
-## Stage 3 — Network identity (static `192.168.1.2`)
+## Stage 3 — Network identity (DHCP is enough now; Tailscale carries the real address)
 
-Bookworm and Trixie use **NetworkManager**, not `dhcpcd`. `DEPLOY.md`'s `/etc/dhcpcd.conf`
-instruction is the Jessie-era path and editing that file on a modern card does nothing.
-
-```bash
-nmcli con show                                   # find the profile name, usually "Wired connection 1"
-
-sudo nmcli con mod "Wired connection 1" \
-    ipv4.method manual \
-    ipv4.addresses 192.168.1.2/24 \
-    ipv4.gateway 192.168.1.1 \
-    ipv4.dns "192.168.1.1 8.8.8.8"
-
-sudo nmcli con up "Wired connection 1"
-```
-
-Verify — and note you will lose the `.local` SSH session at this point, so reconnect on the
-new address:
+The dedicated Netgear N300 this rig used to sit behind is retired, and the static
+`192.168.1.2` it handed out no longer resolves to anything. Nothing downstream —
+`DEPLOY.md`, the rest of this document, the systemd unit — addresses the rig by LAN IP
+anymore; everything uses `pi@evolver-001` over Tailscale (MagicDNS) instead. This stage's
+only job is to get the Pi *some* network path with internet egress, long enough to install
+Tailscale below. Bookworm and Trixie use **NetworkManager**, not `dhcpcd` (`DEPLOY.md`'s
+`/etc/dhcpcd.conf` instruction is the Jessie-era path and editing that file on a modern card
+does nothing), but you no longer need to touch either — plain DHCP is sufficient:
 
 ```bash
-ip -4 addr show                                  # 192.168.1.2/24 on eth0
-ping -c 3 192.168.1.1                            # router
+nmcli con show                                   # confirm a profile is up (usually "Wired connection 1")
+ip -4 addr show                                  # note the DHCP-assigned address — informational only, not durable
 ping -c 3 8.8.8.8                                # internet (needed for apt, pip, Tailscale)
 ```
 
-Do the same for the Wi-Fi profile if the rig is on Wi-Fi, so the static address is bound to
-whichever interface actually comes up.
+Once Tailscale is installed (below) and this card rejoins the tailnet as `evolver-001` (same
+node name as the old card, so MagicDNS resolves it identically), stop using any LAN address
+entirely: `ssh pi@evolver-001`, same as every other document in this repo.
+
+If you ever want a static LAN IP for some other reason (e.g. bench access with Tailscale
+down), `sudo nmcli con mod "Wired connection 1" ipv4.method manual ipv4.addresses
+<ip>/24 ipv4.gateway <gw> ipv4.dns "<gw> 8.8.8.8"` still works — it's just no longer part of
+the standard rebuild, since there is no longer a dedicated router with a fixed gateway to
+point it at.
 
 ---
 
@@ -372,7 +371,7 @@ Fallback with no network path to GitHub — rsync from the dev machine:
 ```powershell
 rsync -avz --exclude='.git' --exclude='.venv' --exclude='__pycache__' --exclude='experiments/' `
     "C:\Research\BIOLOGY\PersonalResearch\EVOLVER_GUI_DEV\eVOLVER_FileStruct\" `
-    pi@192.168.1.2:/home/pi/evolver-gui/
+    pi@evolver-001:/home/pi/evolver-gui/
 ```
 
 This loses the git history, and with it `git describe` and one-command rollback. Use it only
@@ -455,7 +454,8 @@ chmod 600 ~/.ssh/authorized_keys
 ```
 
 Your laptop will warn about a changed host key on the next connect — expected, it is a new
-card. Clear the old entry: `ssh-keygen -R 192.168.1.2`.
+card. Clear the old entry: `ssh-keygen -R evolver-001` (and clear any `.local` or DHCP-IP
+entries from earlier in the rebuild too, if you connected by those in the meantime).
 
 ---
 
@@ -480,7 +480,7 @@ Then log out and back in so `dialout` takes effect:
 
 ```bash
 exit
-ssh pi@192.168.1.2
+ssh pi@evolver-001
 id                          # must list dialout
 ls -l /home/pi/evolver-gui/.venv/bin/python*
 ```
@@ -545,7 +545,7 @@ cd /home/pi/evolver-gui
 .venv/bin/python server/app.py --mock
 ```
 
-From a browser at `http://192.168.1.2:5000`, confirm:
+From a browser at `http://evolver-001:5000`, confirm:
 
 - the 4×4 vial grid renders
 - temperature updates ~every 10 s, OD ~every 60 s (the OD tile shows its own age)
@@ -631,7 +631,7 @@ sudo journalctl -u evolver -f
 ```bash
 sudo reboot
 # wait ~60 s
-curl -s http://192.168.1.2:5000/api/health | head -c 400; echo
+curl -s http://evolver-001:5000/api/health | head -c 400; echo
 ```
 
 The dashboard must come back on its own. This is the last thing that distinguishes "it ran once
@@ -758,7 +758,7 @@ Stop and reassess on any of these:
 [ ]  0.4  old card labelled and shelved as rollback
 [ ]  1    Lite 64-bit, >=32 GB, username `pi`, hostname + timezone match old card
 [ ]  2    apt full-upgrade; git + python3-venv installed; python3 >= 3.10; aarch64
-[ ]  3    static 192.168.1.2 via nmcli; router and internet reachable
+[ ]  3    DHCP network path confirmed, internet reachable (no static IP needed — Tailscale carries the real address)
 [ ]  4.1  serial hardware ON, serial login console OFF
 [ ]  4.2  config.txt has enable_uart=1 AND dtoverlay=disable-bt; no miniuart-bt
 [ ]  4.3  cmdline.txt has no console=serial0

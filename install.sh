@@ -1,5 +1,9 @@
 #!/bin/bash
 # eVOLVER pilot installer — run as the `pi` user from /home/pi/evolver-gui
+#
+# This directory is a runtime export, not a git checkout: `deploy.sh` (run from the
+# `evolver-src` source clone) builds it via `git archive`, so it never contains docs, tests,
+# or DEPLOY.md itself — see DEPLOY.md in evolver-src, or on GitHub, for the full procedure.
 set -euo pipefail
 
 REPO_DIR="/home/pi/evolver-gui"
@@ -22,7 +26,7 @@ elif [[ -x /opt/python3.11/bin/python3.11 ]]; then
 else
     echo "ERROR: need Python 3.10+ and none was found." >&2
     echo "Modern Raspberry Pi OS (Bookworm/Trixie) ships it as python3." >&2
-    echo "On an ancient OS, build /opt/python3.11 per DEPLOY.md Addendum 1 (N3-N5)." >&2
+    echo "On an ancient OS, build /opt/python3.11 per DEPLOY.md Addendum 1 (N3-N5) in evolver-src." >&2
     exit 1
 fi
 
@@ -69,12 +73,12 @@ Next steps (do NOT skip the ordering — old supervisor processes hold /dev/ttyA
 
   2. Log out and back in so the dialout group membership takes effect:
        exit
-       ssh pi@192.168.1.2
+       ssh pi@evolver-001
 
   3. Verify install with the mock first (does not touch serial):
        cd /home/pi/evolver-gui
        .venv/bin/python server/app.py --mock
-       # In a browser: http://192.168.1.2:5000
+       # In a browser: http://evolver-001:5000
        # Ctrl+C to stop.
 
   4. First real-hardware boot, foreground (still not systemd):
@@ -88,5 +92,6 @@ Next steps (do NOT skip the ordering — old supervisor processes hold /dev/ttyA
        sudo systemctl status evolver
        sudo journalctl -u evolver -f
 
-See DEPLOY.md for the full validation + pilot procedure.
+See DEPLOY.md in evolver-src (or on GitHub) for the full validation + pilot procedure —
+it isn't in this directory on purpose; see the comment at the top of this script.
 EOF

@@ -1,6 +1,8 @@
 # eVOLVER Pilot Deployment Runbook
 
-This is the operator runbook for deploying the eVOLVER Phase 1 MVP to the lab hardware (Raspberry Pi at `192.168.1.2`, four SAMD21 Arduinos on RS485, 16 smart sleeves). It covers RPi install, hardware validation on water, and the first live-culture pilot.
+This is the operator runbook for deploying the eVOLVER Phase 1 MVP to the lab hardware (Raspberry Pi reachable at `pi@evolver-001` over Tailscale, four SAMD21 Arduinos on RS485, 16 smart sleeves). It covers RPi install, hardware validation on water, and the first live-culture pilot.
+
+**Addressing note:** every `pi@evolver-001` and `evolver-001:5000` below is the Tailscale MagicDNS name. The dedicated Netgear N300 LAN router this rig used to sit behind, and the static `192.168.1.2` it handed out, are decommissioned — do not address the rig by LAN IP.
 
 The runbook assumes Phases 0–2 of the deployment plan are already complete (tests passing, artifacts created, work committed and tagged). For full context see `SPEC.md`, `CLAUDE.md`, and the plan file under `~/.claude/plans/`.
 
@@ -12,15 +14,17 @@ The legacy RPi ships Python 3.4.2 (Jessie); the new server requires 3.10+ (Flask
 
 ### N1. Bring the RPi online via Ethernet
 
-Plug a LAN cable from the RPi's Ethernet port into the Netgear N300 router (WiFi is currently unavailable). SSH in over the wired link:
+This section is the ancient-Jessie-card escape path (see `SETUP_FROM_SCRATCH.md` — it does
+not apply on a modern Bookworm/Trixie card). It predates Tailscale: the dedicated Netgear
+N300 it originally described is now decommissioned, so if you're actually on this path, plug
+the RPi's Ethernet port into *whatever* network gives it internet egress and SSH in on
+whatever address DHCP hands it (or the `.local` mDNS name) — not a static `192.168.1.2`.
+Once Tailscale is installed, switch to `ssh pi@evolver-001` for everything from here on:
 
 ```bash
-ssh pi@192.168.1.2
-ping -c 3 8.8.8.8        # need internet for apt + source downloads
-ping -c 3 192.168.1.1    # need the router
+ssh pi@<dhcp-or-.local-address>   # temporary, first-boot only
+ping -c 3 8.8.8.8                 # need internet for apt + source downloads
 ```
-
-If the static IP `192.168.1.2` is only bound to the WiFi interface, edit `/etc/dhcpcd.conf` or `/etc/network/interfaces` to bind it to `eth0` too, then `sudo systemctl restart networking`.
 
 ### N2. Stop the legacy supervisor processes
 
@@ -93,7 +97,7 @@ Expected: `Python 3.11.9` and `OpenSSL 1.1.1w  11 Sep 2023`.
 ### P3.1 SSH in and stop the old system
 
 ```bash
-ssh pi@192.168.1.2
+ssh pi@evolver-001
 sudo supervisorctl stop all
 sudo supervisorctl status      # confirm all STOPPED
 sudo fuser /dev/ttyAMA0        # must print nothing
@@ -113,20 +117,35 @@ If `/opt/python3.11/bin/python3.11` is missing, complete the Prerequisites secti
 
 ### P3.3 Get the code onto the RPi
 
+The Pi keeps two directories. `evolver-src` is a full git clone — history, docs, tests,
+tags — and is never run directly. `evolver-gui` is the runtime directory that `install.sh`
+and `evolver.service` actually use, and holds nothing but what a tag of `evolver-src`
+actually needs to run: `deploy.sh` builds/updates it via `git archive`, which honors the
+`export-ignore` rules in `.gitattributes` that mark everything else (docs, tests,
+`mac_original/`/`rpi_original/` reference code, dev tooling) as not part of that archive.
+This is what keeps the box that's actually running the server free of files it never reads.
+
 ```bash
 cd /home/pi
-git clone <repo-url> evolver-gui
-cd evolver-gui
+git clone <repo-url> evolver-src
+cd evolver-src
 git checkout pilot-v0.1.0
+./deploy.sh pilot-v0.1.0        # builds /home/pi/evolver-gui from that tag
 ```
 
-If no remote exists, `rsync` from the dev machine:
+`deploy.sh` never touches `evolver-gui/{calibration,experiments,logs,machine,exports,.venv}`
+— that's the rig's persistent state, lives only under `evolver-gui`, and is never part of
+`evolver-src`'s working tree. Re-running `deploy.sh` (for an update, or after editing
+`.gitattributes`) is always safe for exactly that reason — see "Installing updates" below.
+
+If no remote exists, `rsync` the dev tree into `evolver-src` (not into `evolver-gui`
+directly — `deploy.sh` still does the export step) and run `deploy.sh` from there:
 
 ```powershell
-# From the Windows dev machine
+# From the Windows dev machine — this seeds evolver-src, not evolver-gui directly
 rsync -avz --exclude='.git' --exclude='__pycache__' --exclude='experiments/' `
     "c:\Research\BIOLOGY\PersonalResearch\EVOLVER_GUI_DEV\eVOLVER_FileStruct\" `
-    pi@192.168.1.2:/home/pi/evolver-gui/
+    pi@evolver-001:/home/pi/evolver-src/
 ```
 
 ### P3.4 Run the installer
@@ -164,7 +183,7 @@ cd /home/pi/evolver-gui
 
 `.venv/bin/python` is a symlink to `/opt/python3.11/bin/python3.11` — verify with `ls -l .venv/bin/python*` if anything looks wrong.
 
-Hit `http://192.168.1.2:5000` from the lab Mac. Confirm:
+Hit `http://evolver-001:5000` from the lab Mac. Confirm:
 - Dashboard renders the 4×4 vial grid.
 - Sensor values update every ~10 s (temperature and OD together).
   A fresh page load paints the last known values immediately rather than waiting.
@@ -192,7 +211,7 @@ If the log says `calibration files not found`, **abort** — the relative path i
 
 ### P4.2 Sensor sanity check (read-only)
 
-From the lab Mac browser at `http://192.168.1.2:5000`:
+From the lab Mac browser at `http://evolver-001:5000`:
 
 - All 16 temperatures should be in [18, 30] °C (room temp range), not all identical, not NaN.
 - All 16 OD values should be near 0 with empty vials (within a few hundredths of OD600).
@@ -269,7 +288,7 @@ sudo systemctl status evolver
 sudo journalctl -u evolver -f
 ```
 
-The dashboard should be reachable at `http://192.168.1.2:5000`. Reboot the RPi:
+The dashboard should be reachable at `http://evolver-001:5000`. Reboot the RPi:
 
 ```bash
 sudo reboot
@@ -370,9 +389,9 @@ smaller than the largest bolus the controller can request.**
 Future versions ship as git tags (`pilot-v0.1.2`, then `v0.2.0`, …). Follow this protocol to move the rig to a new version.
 
 **Principles**
-- **Deploy by tag, never a moving branch.** Always `git checkout <tag>`, never `git pull` on `main` — tags are reproducible and give a clean rollback target.
+- **Deploy by tag, never a moving branch.** Always check out a tag in `evolver-src`, never `git pull` on `main` — tags are reproducible and give a clean rollback target.
 - **Updates end the running experiment.** Stopping the service to apply an update fires the SIGTERM handler, which calls `stop_experiment` and marks the run STOPPED (it cannot be re-`start`ed — you'd create a fresh experiment). **Update between experiments, not mid-run.**
-- **Back up first, off the Pi.** SD cards fail; an update is a natural checkpoint.
+- **`deploy.sh` cannot touch state, by construction.** `calibration/`, `experiments/`, `logs/`, `machine/`, `exports/` and `.venv/` exist only under `evolver-gui` and are excluded from every sync it does — an update cannot alter or lose them. The backup-before-update ritual this section used to require is gone; it's still wise to back up `experiments/` off-Pi periodically (SD cards fail), just not *because of* the update.
 - **Test the new tag before it touches the live rig** — run the test suite on a dev machine and/or boot the new tag in `--mock` mode first.
 
 ### Update an existing Pi to a new version
@@ -380,24 +399,21 @@ Future versions ship as git tags (`pilot-v0.1.2`, then `v0.2.0`, …). Follow th
 ```bash
 # 0. Pre-flight — confirm no experiment is running (or accept that it ends).
 #    Read the new tag's notes for state.json / calibration / requirements changes.
-cd /home/pi/evolver-gui
+cd /home/pi/evolver-src
 git describe --tags                               # record CURRENT tag (rollback target)
-mkdir -p ~/backups/$(date +%F)
-cp -r experiments ~/backups/$(date +%F)/          # back up data
-cp -r calibration ~/backups/$(date +%F)/          # back up calibration (all of it)
 
 # 1. Stop the service (ends any running experiment, zeros actuators).
 sudo systemctl stop evolver
 
-# 2. Move to the new version.
+# 2. Build the new tag into evolver-gui.
 git fetch origin --tags
-git checkout <new-tag>
+./deploy.sh <new-tag>
 
 # 3. Apply it. install.sh is idempotent: it updates the venv from
 #    requirements.txt and re-registers the systemd unit. For a major
 #    dependency jump (e.g. a numpy major version), rebuild the venv
-#    first: rm -rf .venv
-./install.sh
+#    first: rm -rf /home/pi/evolver-gui/.venv
+cd /home/pi/evolver-gui && ./install.sh
 
 # 4. Restart and verify.
 sudo systemctl start evolver
@@ -411,16 +427,16 @@ If `install.sh` fails at the pip step (e.g. an unresolvable dependency), the ser
 
 ### Rollback
 
-Symmetric, because you deploy by tag:
+Symmetric, because you deploy by tag, and just as safe for `calibration/`/`experiments/` as the forward update:
 
 ```bash
 sudo systemctl stop evolver
-cd /home/pi/evolver-gui && git checkout <previous-tag>
-./install.sh
+cd /home/pi/evolver-src && ./deploy.sh <previous-tag>
+cd /home/pi/evolver-gui && ./install.sh
 sudo systemctl start evolver
 ```
 
-Restore `experiments/` and `calibration/` from your backup if a bad version altered them.
+No `experiments/`/`calibration/` restore step needed — `deploy.sh` never touched them going forward, so there's nothing to undo.
 
 ### Clean re-install (new SD card / new Pi)
 
@@ -432,25 +448,42 @@ NetworkManager rather than `dhcpcd`, the `disable-bt` UART configuration and how
 identity, and which parts of Phase 4 a rebuild may skip.
 
 The shape of it: flash Raspberry Pi OS Lite (64-bit, ≥32 GB, username `pi`) → harvest the old
-card → static IP → UART (`enable_uart=1` + `dtoverlay=disable-bt`, serial console off) →
-`apt install python3-venv python3-pip git` → `git clone` → `git checkout <tag>` → restore
-`experiments/` + calibration runtime state → `./install.sh` → Tailscale → mock test → Phase 4
-hardware validation → `systemctl enable --now evolver`.
+card → DHCP network path (no static IP needed — Tailscale carries the real address) → UART
+(`enable_uart=1` + `dtoverlay=disable-bt`, serial console off) →
+`apt install python3-venv python3-pip git` → `git clone` into `evolver-src` →
+`git checkout <tag>` → `./deploy.sh <tag>` to build `evolver-gui` → restore `experiments/` +
+calibration runtime state into `evolver-gui` → `cd evolver-gui && ./install.sh` → Tailscale
+(rejoin as `evolver-001`) → mock test → Phase 4 hardware validation →
+`systemctl enable --now evolver`.
 
 On a modern OS the N1–N5 Python-build prerequisites do **not** apply — those exist only for the
 legacy Jessie escape path.
 
-### ⚠ Calibration is not update-safe yet
+### Calibration: update-safe now, but provenance needs a manual step
 
-`calibration/temp_calibration.txt` and `OD_cal.txt` are **tracked in git**. A `git checkout <tag>` will overwrite them if a future commit ever changes those files — and this rig's calibration is hardware-specific (*calibration is law*). Conversely, re-calibrating on the Pi without committing will make git **block** the next checkout. Until calibration is moved out of version control:
-- **Always** back up `calibration/*.txt` before an update (step 0 above).
-- **After** every update, confirm the values are still this rig's: `head -1 calibration/temp_calibration.txt` — the slopes must be the negative values for this hardware, not something a checkout swapped in.
+The `evolver-src`/`evolver-gui` split (P3.3) resolves the failure mode this section used to
+warn about: `git checkout <tag>` only ever runs inside `evolver-src`, which is not where the
+live rig reads calibration from, so a checkout can no longer silently overwrite this rig's
+`temp_calibration.txt`/`OD_cal.txt`/`current.json`, and re-calibrating on the Pi (a Tier 2/3
+session, or a per-run OD blank) can no longer block the next update either. `evolver-gui`'s
+`calibration/` is not git-managed at all — it starts as a copy of whatever `evolver-src`
+tracked at the tag you deployed, then diverges as the wizards install new versions, exactly
+like `experiments/`.
 
-**Organism OD profiles make this sharper (2026-09-29).** Every OD dilution series installs a new envelope under `calibration/od/` and rewrites `calibration/current.json` — and `current.json` is tracked. So after the first organism is calibrated on the Pi, `git status` there shows `current.json` modified and new `od/*.json` files, and a checkout of a tag that changes `current.json` is **blocked** (or, forced, would drop every organism profile from the pointer while leaving their envelopes orphaned). Before an update:
-- back up the whole `calibration/` directory, not just the `.txt` files (step 0 above does);
-- `git stash` is **not** the answer — it would take the profiles offline for the duration. Copy `current.json` aside, `git checkout -- calibration/current.json`, update, then copy it back and restart; confirm with `curl -s localhost:5000/api/calibration/od/profiles` that every organism is still listed.
+The tradeoff: that divergence is real calibration history (gravimetric pump runs, OD dilution
+series, thermistor two-point sessions) that no longer lands in git automatically, so it isn't
+backed up by `git push` the way it used to be intended to. After any bench calibration
+session, copy the new envelopes back into the source tree and commit, so they're preserved:
 
-The durable fix is to stop tracking `calibration/` (gitignore it and treat it as on-Pi config like the secret and `experiments/`). Do that deliberately as its own change, not as part of a routine update.
+```bash
+rsync -a /home/pi/evolver-gui/calibration/ /home/pi/evolver-src/calibration/
+cd /home/pi/evolver-src
+git add calibration/ && git commit -m "calibration: pull in <what you just ran>"
+```
+
+This is a manual, deliberate step (do it after a calibration session, not as part of a
+routine code update) rather than something `deploy.sh` does for you — going the other
+direction automatically is exactly the overwrite hazard this section used to describe.
 
 ## Remote access keepalive (Tailscale)
 
