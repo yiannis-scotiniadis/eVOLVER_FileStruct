@@ -66,6 +66,7 @@ from experiment_engine import (
     od_curve_dark_subtracted,
 )
 from vessels import VesselRegistry
+from vial_override import OverrideError
 
 log = logging.getLogger(__name__)
 
@@ -680,6 +681,79 @@ class ExperimentSupervisor:
         engine = self.owner_engine(vial)
         return None if engine is None else engine.vial_group(vial)
 
+    # ------------------------------------------------------------------
+    # Supervised per-vial override (SPEC §21) -- routed to the vial's owner
+    # ------------------------------------------------------------------
+
+    def _override_engine(self, vial: Any) -> ExperimentEngine:
+        try:
+            v = int(vial)
+        except (TypeError, ValueError):
+            raise ValueError("vial must be an integer") from None
+        if not (0 <= v < N_VIALS):
+            raise ValueError(f"vial must be in 0..{N_VIALS - 1}")
+        engine = self.owner_engine(v)
+        if engine is None:
+            raise OverrideError(
+                f"vial {v} belongs to no experiment -- use manual control",
+                "not_owner", 404,
+            )
+        return engine
+
+    def grant_override(self, vial: int, operator: str, reason: str,
+                       duration_minutes: float) -> dict:
+        """Unlock one vial of its owner. A dilution the machine hold is
+        holding for that vial is dropped: it was decided before the operator
+        took the vial, and control is paused from here."""
+        with self._lock:
+            engine = self._override_engine(vial)
+            result = engine.grant_override(vial, operator, reason, duration_minutes)
+            held = self._held.pop(int(vial), None)
+        if held is not None:
+            self._event({
+                "type": "override_pump_cancelled", "vial": int(vial),
+                "experiment": held[0], "override": "pump_cancelled",
+                "operator": result.get("operator"), "reason": result.get("reason"),
+                "detail": "a dilution held by the machine hold was dropped: "
+                          "control is paused by the override",
+            })
+        return {"experiment": engine.loaded_experiment, **result}
+
+    def release_override(self, vial: int, operator: str = "") -> dict:
+        with self._lock:
+            engine = self._override_engine(vial)
+            return {"experiment": engine.loaded_experiment,
+                    **engine.release_override(vial, operator)}
+
+    def override_pump_preview(self, vial: int, action: str, volume_ml: float) -> dict:
+        with self._lock:
+            return self._override_engine(vial).override_pump_preview(vial, action, volume_ml)
+
+    def override_pump(self, vial: int, action: str, volume_ml: float) -> dict:
+        with self._lock:
+            engine = self._override_engine(vial)
+            # The engine learns of the hold only on a tick; refuse up front.
+            engine.machine_held = self._machine_hold is not None
+            return engine.override_pump(vial, action, volume_ml)
+
+    def override_temperature(self, vial: int, celsius: float, keep: bool = False) -> dict:
+        with self._lock:
+            return self._override_engine(vial).override_temperature(vial, celsius, keep)
+
+    def override_stir(self, vial: int, value: int, keep: bool = False) -> dict:
+        with self._lock:
+            return self._override_engine(vial).override_stir(vial, value, keep)
+
+    def overrides_status(self) -> dict[str, dict]:
+        """Every loaded experiment's active overrides, keyed by vial (vials
+        are disjoint across experiments)."""
+        with self._lock:
+            out: dict[str, dict] = {}
+            for name, engine in self._runs.items():
+                for v, entry in engine.overrides_status().items():
+                    out[v] = {"experiment": name, **entry}
+            return out
+
     def growth_snapshot(self) -> dict:
         """Every experiment's per-vial growth reports, keyed by vial (vials
         are disjoint across experiments)."""
@@ -736,7 +810,11 @@ class ExperimentSupervisor:
         heater safety for every experiment after it."""
         actions: list[tuple[int, PumpAction]] = []
         with self._lock:
+            held = self._machine_hold is not None
             for name, engine in list(self._runs.items()):
+                # An override pump must be cancelled, not fired into -- nor
+                # held behind -- a hold someone with the machine open set.
+                engine.machine_held = held
                 try:
                     actions.extend(engine.run_cycle(
                         timestamp_iso, temperature_calibrated, od_calibrated,
@@ -1091,6 +1169,7 @@ class ExperimentSupervisor:
                 "grouped": bool(s.get("grouped")),
                 "preconditioned": bool(s.get("preconditioned")),
                 "maintenance": s.get("maintenance"),
+                "overrides": s.get("overrides") or {},
             })
         return out
 

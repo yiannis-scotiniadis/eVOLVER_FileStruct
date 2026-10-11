@@ -279,11 +279,19 @@ Each function:
 > in memory for that run only — see `CALIBRATION_PROTOCOL.md` §5.4/§10.1.
 >
 > **Since Session AA (2026-09-28):** the Tier 3 wizards install new versions and
-> `app._reload_calibration` makes them live without a restart. An OD dilution series always
-> installs a **dark-subtracted** curve (`OD_cal.meta.json` → `true`), and from then on the
-> blank, idle reads and new experiments all use LED-on minus LED-off signal; a mismatch in
-> either direction is refused at create, and a blank taken on the previous curve is refused
-> at start (`stale_od_blank`).
+> `app._reload_calibration` makes them live without a restart. A blank taken on the
+> previous curve is refused at start (`stale_od_blank`).
+>
+> **The OD photodiode front end inverts — measured 2026-10-11.** With the LED off (`we0`)
+> every vial reads **~64 100–65 000, near the ADC rail, above every LED-on read** (blank
+> medium 64 485 lit vs 64 987 dark; a dense vial 26 884 lit vs 64 653 dark). Counts fall as
+> light reaches the photodiode. So "LED-on minus LED-off" is *negative*, and the Session AA
+> series — which fitted on it and installed dark-subtracted curves — rejected every point
+> on the rig. **The OD series fits and installs on the raw LED-on signal**
+> (`dark_subtracted: false`), the space every working curve on this rig uses; the LED-off
+> read is recorded on each point and in `vialNN_OD.csv` as a diagnostic only. Do not
+> reintroduce `lit − dark` anywhere: if an offset correction is ever wanted it is
+> `dark − lit`, and its curve shape is untested.
 >
 > **Since Session AG (2026-09-29):** OD calibration is **per organism**. `current.json`'s
 > `"od"` is the machine *default* (what `OD_cal.txt` views and idle reads use — currently the
@@ -305,7 +313,7 @@ Each function:
 ```python
 OD = od_cal[2,vial] - (log10((od_cal[1,vial] - od_cal[0,vial]) / (raw_adc - od_cal[0,vial]) - 1)) / od_cal[3,vial]
 ```
-- Row 0: dark reading — ADC value when LEDs are off (lower asymptote of the sigmoid)
+- Row 0: lower asymptote of the sigmoid — a fitted parameter, **not** the LED-off reading (LED-off reads near the ADC rail, ~64 500, the *top* of the range; see the note above)
 - Row 1: saturation reading — ADC value with LEDs on and no culture present (upper asymptote)
 - Row 2: OD value at the sigmoid inflection point (the centre of the calibration curve)
 - Row 3: Hill coefficient — slope/steepness of the logistic (larger = sharper transition)
@@ -430,6 +438,7 @@ processes, owns `/dev/ttyAMA0` directly, and serves the dashboard at
 | Live calibration reload; machine-reserving Tier 3 sessions with their own heater watchdog | Built | `app.py:_reload_calibration`, `_calibration_tick`, `_cal_route(idle=…)` |
 | Per-organism OD profiles (series creates/recalibrates; designer picks; run pins; per-vial live curve) | Built | `calibration_service.py`, `serial_manager.OdCurveMixin`, `app._experiment_od_setup`, SPEC §19.7 |
 | `vialNN_OD.csv` schema 2 (raw lit/dark counts appended) and post-hoc OD recalibration (CLI, API, GUI) | Built | `data_logger.py`, `server/od_recalibrate.py`, `/api/experiments/{name}/recalibrate_od`, SPEC §8 |
+| Supervised per-vial override (hold-to-unlock, time-limited, control paused, dilute/spike/drain + temp/stir pushed into controller state, plot markers); `vialNN_pump_log.csv` schema 2 (`source` column) | Built (software) | `server/vial_override.py`, `/api/vials/{vial}/override*`, SPEC §21 |
 
 **Session N shipped 2026-08-23** — the per-vial growth-rate service: the estimator, the
 engine-owned OD history and dilution boundaries, `status()` / WebSocket / API / CSV
@@ -441,6 +450,8 @@ gravimetric wizard, reconciliation, and the 32-flow-rate engine plumbing. The so
 bench-ready but **no Tier 1/Tier 2 procedure has yet been run on the bench**, so the
 inherited-constant caveats below still stand.
 
+**Session S shipped 2026-10-11** — the supervised per-vial override and pump-log schema 2.
+Software only: exercised against the mock and a live mock server, not yet on the rig.
 **Session AG shipped 2026-09-29** — per-organism OD calibration profiles, the raw-count OD
 log (schema 2) and post-hoc recalibration. Software only: no organism has been calibrated
 on the rig, so every run still reads through the 2016 curve until one is.
@@ -450,7 +461,7 @@ the thermistor wizard's cold phase is.
 
 **Not yet built** (in rough priority order — see `ROADMAP.md`):
 stir RPM calibration (`/api/calibration/stir/*`, Session AC), hygiene/sterilisation records, experiment
-templates, supervised per-vial override, anomaly detection, notifications, off-box
+templates, anomaly detection, notifications, off-box
 backup, multi-phase protocols, and authentication.
 
 ### Where to look for what
@@ -482,7 +493,7 @@ backup, multi-phase protocols, and authentication.
   and how to verify `/dev/ttyAMA0` is the PL011, restoring the state git does not carry,
   Tailscale identity, and which parts of `DEPLOY.md` Phase 4 a rebuild may skip.
 
-### Twelve facts worth carrying into any new work
+### Fourteen facts worth carrying into any new work
 
 1. **`xr` is a closed-loop setpoint, not a PWM, and the slope is negative.** The Arduino
    already closes the temperature loop. `xr=0` requests ~82 °C. See the Testing warning
@@ -679,14 +690,58 @@ backup, multi-phase protocols, and authentication.
       curve reproduces its OD. Output goes to `experiments/{name}/recalibrated/`, never over
       the run's files.
 
+13. **A frame to a different Arduino needs a quiet bus first, and the stir firmware has no
+    ceiling.** Measured 2026-10-11 by replaying the 10 s tick on the rig: an `xr` sent
+    straight behind a `zv` went unanswered **85/100** times; with 100 ms of quiet first,
+    **0/100**. Back-to-back `we` reads to the OD Arduino never failed. All four Arduinos hear
+    all traffic, and one still digesting the last frame loses bytes of the next.
+    `SerialManager._wait_inter_command` waits `ADDRESS_CHANGE_QUIET_SECONDS` (100 ms) before
+    any frame whose prefix differs from the previous frame's, measured from the end of that
+    frame or of its reply, and `_write` drains the UART (`flush()`) so every spacing counts
+    from the end of transmission rather than from when the bytes were queued. Two
+    consequences:
+
+    - **A damaged write-only frame fails silently.** The stir firmware does not clamp: on the
+      bench 88 and 888 spun visibly faster and louder than 8, and `STIR_MAX = 15` in software
+      is the only ceiling. A `zv10,10,…` frame that loses a comma runs one vial at 1010 until
+      the next good frame — the most likely cause of the loud, self-ending runaway stir seen
+      in Oct 2026. The same loss in an `st` mask shifts every higher bit down one pump. The
+      temperature timeouts in the Pi's `logs/evolver.log` (395 on 2026-10-11, in streaks on
+      consecutive ticks) are this failure on the one frame that has a reply.
+    - **The bus is nearly saturated.** The OD Arduino starts replying ~1.1 s after a `we`
+      (~1.35 s per read), so the 3 dark + 5 lit reads fill ~9.4 s of the 10 s tick and the
+      loop runs back to back. Anything added to the tick pushes it past 10 s. Never win
+      that time back by removing the quiet gap.
+
+14. **An operator's action on a running vial goes through the override, and is booked like
+    the controller's own.** `/api/actuators/*` keeps refusing a driven vial; the only door
+    is `/api/vials/{vial}/override*` (SPEC §21, `server/vial_override.py`). While a vial is
+    unlocked its automatic control is **paused** (OD still pushed, `decide()` not called).
+    An override pump is queued and **booked in `run_cycle` on the tick it fires** —
+    interlock re-checked, `record_manual_dilution` pushed into the controller, a growth
+    boundary spanning the real interval, media/waste moved — then rides that tick's one
+    schedule as an `OverridePumpAction` (`fluidics.plan_pump_schedule`). Three rules for
+    new work:
+
+    - **A new control mode must implement `record_manual_dilution(now, influx_ml)` and
+      `rebaseline(now)`** if it has any timing state, or a manual dilution will be followed
+      by an automatic one. Both are optional (`getattr`), so forgetting is silent.
+    - **Never resolve a vial's temperature or stir target from groups alone.** Pass
+      `vial_targets` (`run_config.normalise_vial_targets(config["vial_targets"])`) — an
+      operator's "keep for the run" lives there, and a resolution that skips it silently
+      reverts it.
+    - **`vialNN_pump_log.csv` is append-only too** (schema 2 added `source` at the end;
+      `config.json` carries `pump_csv_schema`). Tag every new pump-log writer with its
+      `source`.
+
 
 ## Technical constraints
 
 - RPi runs Python 2.7 (Raspbian). The new server should use Python 3 if available, falling back to Python 2.7 if needed. Check with `python3 --version`.
 - Serial port /dev/ttyAMA0 can only be opened by one process at a time. The new server must be the sole serial user — the old supervisor processes must be stopped first.
-- RS485 is half-duplex: you send a command, then wait for a response. Commands and responses are newline-terminated (`ser.readline()`).
+- RS485 is half-duplex: you send a command, then wait for a response. Commands end with ` !`; replies end exactly at `end` with **no newline** (measured 2026-10-11). Read to `end`, never `readline()`, which waits out the full 5 s timeout — as the 2016 loop did on every reply.
 - Serial timeout is 5 seconds. If an Arduino doesn't respond, the system should log the failure and continue, not hang.
-- The RS485 bus is shared — all 4 Arduinos hear all messages but only respond to their address prefix. Do not send commands faster than the Arduinos can process them (50ms minimum between commands).
+- The RS485 bus is shared — all 4 Arduinos hear all messages but only respond to their address prefix. Do not send commands faster than the Arduinos can process them: 50 ms between frames to the same Arduino and 100 ms of quiet bus before a frame to a different one, both measured from the end of transmission (fact 13).
 - The 2016 Arduino firmware is not being changed. The new server must speak the exact same serial protocol.
 - Calibration files must remain compatible with the existing format.
 - The lab Mac Mini runs macOS 10.12.6 (Sierra) with Python 2.7, but it only needs to run a browser to access the new web GUI.
@@ -713,7 +768,7 @@ python3 app.py  # or python app.py
 
 > ⚠ **Heater control convention is inverted.** The `xr` value is **not a raw PWM** — it is a setpoint that the temperature Arduino's closed loop drives the thermistor ADC reading toward. The calibration slope is **negative**, so **lower `xr` = hotter target**. `xr=0` requests ~82 °C (heater pinned to MAX); `xr=4095` is unreachably cold and is the only definitive "off." Any code or doc that treats `xr` like a PWM (where 0 means off) is wrong.
 
-- Stir: send address `zv` + 16 comma-separated PWM values + ` !`. Values 0-15 typical. 0=off (this one really is a raw PWM).
+- Stir: send address `zv` + 16 comma-separated PWM values + ` !`. Values 0-15 typical; the firmware does **not** clamp (88 and 888 spin faster and louder — fact 13). 0=off (this one really is a raw PWM).
 - Temperature: send address `xr` + 16 setpoint integers + ` !`. Practical operating range ≈ 400 (≈ 37 °C) to 700 (≈ 14 °C); 4095 = off; 0 = drive heater to ~82 °C (avoid). Read response with prefix `temp` (16 raw thermistor ADC values).
 - OD: send address `we` + 16 LED power values + ` !`. 2125 is standard. Read response with prefix `turb` (16 raw photodiode ADC values).
 - Fluidics: send address `st` + pump binary code + ` !`. Verify water flows. OR bits together to run several pumps at once (influx vial N = bit N, efflux vial N = bit N+16). See "Fluidics sub-protocol"; only the single-fire form works, and there is **no way to stop a running pump** — bench with lines looped into one water beaker so nothing can overflow or run dry.
@@ -768,6 +823,8 @@ eVOLVER_FileStruct/
     mock_serial_manager.py   # Simulated hardware — run app.py --mock
     experiment_engine.py     # Lifecycle, run_cycle, media tracking, maintenance, resume
     fluidics.py              # pump frame scheduler (audit §4.1-4.2) — pure, I/O-free
+    vial_override.py         # supervised per-vial override (SPEC §21): engine mixin, pump plan,
+                             #   events.csv reader for the plot markers
     run_config.py            # vial groups: normalise/validate, per-vial targets — pure (SPEC §9.1)
     supervisor.py            # parallel experiments: one engine per experiment, one tick (SPEC §9.2)
     vessels.py               # machine-scoped bottle/carboy levels, shareable across experiments
@@ -794,6 +851,8 @@ eVOLVER_FileStruct/
     test_parallel_runs.py    #   parallel experiments: supervisor + API (SPEC §9.2)
     test_od_profiles.py      #   organism profiles, per-vial curves, OD CSV schema 2, wiring
     test_od_recalibrate.py   #   post-hoc recalibration: identity, true curve, schema 1, HTTP
+    test_vial_override.py    #   override: grant/expiry, controller coherence, books, holds,
+                             #   restart, parallel runs, and the HTTP path to the wire
     test_calibration_tier3*.py, test_od_curve_fit.py
                              #   Tier 3 wizards against a mock whose TRUE thermistor/OD
                              #   response differs from the installed curve (SPEC §19.5)

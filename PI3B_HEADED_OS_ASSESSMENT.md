@@ -131,6 +131,9 @@ round trips plus a temperature read — roughly **2.3 s of the 10 s tick spent b
 UART with the GIL released**, against ~15 ms of actual CPU. That is an unusually good property
 for the question being asked: the control loop coexists with a busy browser far better than its
 CPU share alone would suggest, because it is asleep on a serial port for most of its period.
+*(Corrected 2026-10-11: measured on the rig, the OD Arduino takes ~1.1 s to begin each reply,
+so the eight reads alone fill ~9.4 s of the tick — `CLAUDE.md` fact 13. The bus, not the CPU,
+is what is nearly saturated; the I/O-bound conclusion only gets stronger.)*
 
 **The read-path optimisation in SPEC §8.1 is real.** On a 7-day file, `get_data` with a 1 h
 window is **19.6 ms / 0.3 MB** and flat in run length, against ~2.2 s for the same file read

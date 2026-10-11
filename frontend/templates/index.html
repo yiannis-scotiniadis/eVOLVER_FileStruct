@@ -1793,14 +1793,77 @@
       display: none;
     }
     .locked-note.show { display: block; }
-    .locked-note.show + .control-block .control-actions .btn,
-    .locked-note.show + .control-block + .control-block .control-actions .btn,
-    .locked-note.show + .control-block + .control-block + .control-block .pump-buttons .btn,
-    .locked-note.show + .control-block + .control-block + .control-block input,
-    .locked-note.show + .control-block input,
-    .locked-note.show + .control-block + .control-block input {
+    /* Dim the manual controls of a locked vial. Targeted by class, not by
+       sibling position: the positional selectors this replaced dimmed the
+       Trends block's "Pump markers" checkbox and missed the pump block. */
+    #vial-modal .modal-body.locked .manual-control input,
+    #vial-modal .modal-body.locked .manual-control select,
+    #vial-modal .modal-body.locked .manual-control .btn {
       pointer-events: none;
       opacity: 0.6;
+    }
+
+    /* ---------- Supervised per-vial override (SPEC §21) ---------- */
+    .override-only { display: none; }
+    #vial-modal .modal-body.overridden .override-only { display: revert; }
+    #vial-modal .modal-body.overridden .manual-only { display: none; }
+    .override-unlock-row {
+      display: none;
+      align-items: center;
+      gap: 12px;
+      margin: -6px 0 14px;
+      flex-wrap: wrap;
+    }
+    .override-unlock-row.show { display: flex; }
+    .override-unlock-row .field-help { flex: 1 1 220px; margin: 0; }
+    .hold-btn {
+      position: relative;
+      overflow: hidden;
+      user-select: none;
+      -webkit-user-select: none;
+      touch-action: none;
+    }
+    .hold-btn .hold-fill {
+      position: absolute;
+      inset: 0;
+      width: 0;
+      background: rgba(249, 115, 22, 0.25);
+      pointer-events: none;
+    }
+    .hold-btn.holding .hold-fill {
+      width: 100%;
+      transition: width 2s linear;
+    }
+    .hold-btn .hold-label { position: relative; }
+    .override-banner {
+      display: none;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+      background: rgba(249, 115, 22, 0.1);
+      border: 1px solid var(--status-warn);
+      color: var(--text);
+      padding: 10px 12px;
+      border-radius: 6px;
+      font-size: 13px;
+      margin-bottom: 14px;
+    }
+    .override-banner.show { display: flex; }
+    .override-banner .text { flex: 1 1 240px; }
+    .override-banner .countdown {
+      font-family: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+      font-variant-numeric: tabular-nums;
+      font-weight: 600;
+      color: var(--status-warn);
+    }
+    .override-banner .muted { display: block; font-size: 12px; margin-top: 2px; }
+    .reason-chips { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+    .reason-chips .btn { padding: 2px 8px; font-size: 12px; }
+    .vial.overridden { border-color: var(--status-warn); }
+    .vial.overridden::after {
+      content: "override " attr(data-override);
+      color: var(--status-warn);
+      background: rgba(249, 115, 22, 0.12);
     }
 
     /* ---------- View navigation (Dashboard / Plots) ---------- */
@@ -2252,7 +2315,32 @@
           </div>
         </section>
 
-        <section class="control-block">
+        <div class="override-unlock-row" id="override-unlock-row">
+          <button class="btn hold-btn" id="override-unlock" type="button"
+                  aria-describedby="override-unlock-help">
+            <span class="hold-fill"></span>
+            <span class="hold-label">Hold 2 s to unlock this vial</span>
+          </button>
+          <p class="field-help" id="override-unlock-help">
+            A time-limited, recorded intervention: automatic control pauses on
+            this vial until you release it or it re-locks.
+          </p>
+        </div>
+
+        <div class="override-banner" id="override-banner" role="status">
+          <span class="text">
+            <strong>Unlocked</strong> by <span id="override-who"></span> —
+            <span id="override-why"></span>
+            <span class="muted" id="override-detail">
+              Automatic control is paused. Every action is recorded and drawn on the plots.
+            </span>
+          </span>
+          <span class="countdown" id="override-countdown"></span>
+          <button class="btn" id="override-extend" type="button">+10 min</button>
+          <button class="btn btn-primary" id="override-release" type="button">Release &amp; re-lock</button>
+        </div>
+
+        <section class="control-block manual-control">
           <h3>Temperature setpoint</h3>
           <div class="slider-row">
             <input type="range"
@@ -2262,12 +2350,16 @@
             <span class="slider-value" id="temp-slider-value">37.0 °C</span>
           </div>
           <span class="slider-meta" id="temp-slider-meta">xr setpoint: 0 (currently off)</span>
+          <label class="chk override-only">
+            <input type="checkbox" id="temp-keep">
+            Keep for the rest of the run (otherwise reverts when the vial re-locks)
+          </label>
           <div class="control-actions">
             <button class="btn btn-primary" id="apply-temp" type="button">Apply Temperature</button>
           </div>
         </section>
 
-        <section class="control-block">
+        <section class="control-block manual-control">
           <h3>Stir speed</h3>
           <div class="slider-row">
             <input type="range"
@@ -2277,29 +2369,116 @@
             <span class="slider-value" id="stir-slider-value">0</span>
           </div>
           <span class="slider-meta" id="stir-slider-meta">currently 0</span>
+          <label class="chk override-only">
+            <input type="checkbox" id="stir-keep">
+            Keep for the rest of the run (otherwise reverts when the vial re-locks)
+          </label>
           <div class="control-actions">
             <button class="btn btn-primary" id="apply-stir" type="button">Apply Stir</button>
           </div>
         </section>
 
-        <section class="control-block">
+        <section class="control-block manual-control">
           <h3>Pumps</h3>
           <div class="pump-row">
+            <label class="override-only" for="pump-override-action">Action</label>
+            <select id="pump-override-action" class="override-only">
+              <option value="dilute">Dilute (influx + efflux together, with overrun)</option>
+              <option value="influx">Influx only (spike: raises the level above the straw)</option>
+              <option value="efflux">Efflux only (drain back down to the straw)</option>
+            </select>
             <label for="pump-volume" id="pump-input-label">Volume (mL)</label>
             <input type="number"
                    id="pump-volume"
                    min="0.1" step="0.1" value="5">
             <span class="pump-preview" id="pump-preview-text"></span>
-            <label class="chk pump-advanced-toggle">
+            <label class="chk pump-advanced-toggle manual-only">
               <input type="checkbox" id="pump-advanced-seconds">
               Advanced: enter seconds directly
             </label>
-            <div class="pump-buttons">
+            <div class="pump-buttons manual-only">
               <button class="btn" id="pump-influx" type="button">Run Influx</button>
               <button class="btn" id="pump-efflux" type="button">Run Efflux</button>
             </div>
+            <div class="pump-buttons override-only">
+              <button class="btn btn-primary" id="pump-override-fire" type="button">Queue for next cycle</button>
+            </div>
           </div>
         </section>
+      </div>
+    </div>
+  </div>
+
+  <!-- ---------- Supervised per-vial override: unlock dialog (SPEC §21) ---------- -->
+  <div class="modal-backdrop" id="override-modal" hidden>
+    <div class="modal"
+         role="dialog"
+         aria-modal="true"
+         aria-labelledby="override-modal-title">
+      <div class="modal-header">
+        <h2 id="override-modal-title">Unlock vial</h2>
+        <button class="modal-close" id="override-modal-close" type="button"
+                aria-label="Close unlock form">×</button>
+      </div>
+      <div class="modal-body">
+        <p class="field-help" style="margin: 0 0 12px;" id="override-modal-summary"></p>
+        <div class="field-row">
+          <label class="field-label" for="override-operator">Operator</label>
+          <input type="text" id="override-operator" maxlength="64" autocomplete="name">
+        </div>
+        <div class="field-row">
+          <label class="field-label" for="override-reason">Reason (recorded with every action)</label>
+          <input type="text" id="override-reason" maxlength="200"
+                 placeholder="e.g. rescue a stalled culture">
+          <div class="reason-chips" id="override-reason-chips">
+            <button class="btn" type="button" data-reason="Pull a sample">Sample</button>
+            <button class="btn" type="button" data-reason="Spike the vial">Spike</button>
+            <button class="btn" type="button" data-reason="Rescue a stalled culture">Rescue</button>
+            <button class="btn" type="button" data-reason="Adjust conditions">Adjust conditions</button>
+          </div>
+        </div>
+        <div class="field-row">
+          <label class="field-label" for="override-duration">Re-lock automatically after</label>
+          <select id="override-duration">
+            <option value="5">5 min</option>
+            <option value="10" selected>10 min</option>
+            <option value="15">15 min</option>
+            <option value="30">30 min</option>
+          </select>
+        </div>
+        <div class="refill-actions">
+          <button class="btn" id="override-cancel" type="button">Cancel</button>
+          <span class="right">
+            <button class="btn btn-primary" id="override-grant" type="button">Unlock</button>
+          </span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ---------- Typed confirmation (destructive override actions) ---------- -->
+  <div class="modal-backdrop" id="typed-confirm-modal" hidden>
+    <div class="modal"
+         role="dialog"
+         aria-modal="true"
+         aria-labelledby="typed-confirm-title">
+      <div class="modal-header">
+        <h2 id="typed-confirm-title">Confirm</h2>
+        <button class="modal-close" id="typed-confirm-close" type="button"
+                aria-label="Cancel">×</button>
+      </div>
+      <div class="modal-body">
+        <p style="margin: 0 0 12px;" id="typed-confirm-message"></p>
+        <div class="field-row">
+          <label class="field-label" for="typed-confirm-input" id="typed-confirm-label"></label>
+          <input type="text" id="typed-confirm-input" autocomplete="off" inputmode="numeric">
+        </div>
+        <div class="refill-actions">
+          <button class="btn" id="typed-confirm-cancel" type="button">Cancel</button>
+          <span class="right">
+            <button class="btn btn-danger" id="typed-confirm-ok" type="button" disabled>Confirm</button>
+          </span>
+        </div>
       </div>
     </div>
   </div>
@@ -2916,6 +3095,16 @@
     const pumpInfluxBtn = document.getElementById("pump-influx");
     const pumpEffluxBtn = document.getElementById("pump-efflux");
     const modalCloseBtn = document.getElementById("modal-close");
+    const modalBodyEl = document.querySelector("#vial-modal .modal-body");
+    const overrideUnlockRow = document.getElementById("override-unlock-row");
+    const overrideUnlockBtn = document.getElementById("override-unlock");
+    const pumpOverrideActionEl = document.getElementById("pump-override-action");
+    const pumpOverrideFireBtn = document.getElementById("pump-override-fire");
+    const tempKeepEl = document.getElementById("temp-keep");
+    const stirKeepEl = document.getElementById("stir-keep");
+    // Buttons with a request in flight. updateModalLockedState consults it so
+    // a re-lock arriving mid-request is not undone by the request's finally.
+    const _busy = new Set();
 
     // --- Build cards ---
     for (let i = 0; i < N_VIALS; i++) {
@@ -3570,7 +3759,12 @@
       if (e.target === modalEl) closeVialModal();
     });
     document.addEventListener("keydown", (e) => {
-      if (e.key === "Escape" && modalState.vial !== null) closeVialModal();
+      if (e.key !== "Escape" || modalState.vial === null) return;
+      // A dialog stacked over the vial modal (unlock, typed confirm) takes
+      // the Escape for itself.
+      if (!document.getElementById("override-modal").hidden
+          || !document.getElementById("typed-confirm-modal").hidden) return;
+      closeVialModal();
     });
     tempSlider.addEventListener("input", updateTempSliderDisplay);
     stirSlider.addEventListener("input", updateStirSliderDisplay);
@@ -3597,6 +3791,7 @@
       const i = modalState.vial;
       if (i === null) return;
       const c = parseFloat(tempSlider.value);
+      if (overrideFor(i)) { await overrideApply(i, "temperature", c, tempKeepEl, applyTempBtn); return; }
       // Slider is the source of truth; the server converts °C -> raw via
       // its loaded calibration. We build a 16-element values_c payload
       // by reading back each vial's current setpoint as Celsius.
@@ -3613,6 +3808,7 @@
       );
       values_c[i] = c;
       applyTempBtn.disabled = true;
+      _busy.add(applyTempBtn);
       const original = applyTempBtn.textContent;
       applyTempBtn.textContent = "Applying…";
       try {
@@ -3626,8 +3822,9 @@
       } catch (err) {
         showToast(`Set temperature failed: ${err.message}`, "error");
       } finally {
-        applyTempBtn.disabled = false;
+        _busy.delete(applyTempBtn);
         applyTempBtn.textContent = original;
+        updateModalLockedState();
       }
     });
 
@@ -3635,9 +3832,11 @@
       const i = modalState.vial;
       if (i === null) return;
       const v = parseInt(stirSlider.value, 10);
+      if (overrideFor(i)) { await overrideApply(i, "stir", v, stirKeepEl, applyStirBtn); return; }
       const next = actuatorState.stir.slice();
       next[i] = v;
       applyStirBtn.disabled = true;
+      _busy.add(applyStirBtn);
       const original = applyStirBtn.textContent;
       applyStirBtn.textContent = "Applying…";
       try {
@@ -3648,13 +3847,16 @@
       } catch (err) {
         showToast(`Set stir failed: ${err.message}`, "error");
       } finally {
-        applyStirBtn.disabled = false;
+        _busy.delete(applyStirBtn);
         applyStirBtn.textContent = original;
+        updateModalLockedState();
       }
     });
 
     // --- Pump volume/seconds mode (SPEC §16) ---
     function isPumpAdvancedSeconds() {
+      // An override pump is always by volume: the preview names both sides.
+      if (modalState.vial !== null && overrideFor(modalState.vial)) return false;
       return pumpAdvancedToggle.checked;
     }
 
@@ -3683,6 +3885,10 @@
         return;
       }
       clearTimeout(pumpPreviewTimer);
+      if (overrideFor(i)) {
+        pumpPreviewTimer = setTimeout(() => overridePumpPreview(i, volume), 200);
+        return;
+      }
       pumpPreviewTimer = setTimeout(async () => {
         try {
           const data = await postJson("/api/actuators/pump/preview", {
@@ -3729,6 +3935,7 @@
       const btn = direction === "influx" ? pumpInfluxBtn : pumpEffluxBtn;
       const original = btn.textContent;
       btn.disabled = true;
+      _busy.add(btn);
       btn.textContent = "Running…";
       try {
         const data = await postJson("/api/actuators/pump", body);
@@ -3739,8 +3946,9 @@
       } catch (err) {
         showToast(`Pump failed: ${err.message}`, "error");
       } finally {
-        btn.disabled = false;
+        _busy.delete(btn);
         btn.textContent = original;
+        updateModalLockedState();
       }
     }
     pumpInfluxBtn.addEventListener("click", () => firePump("influx"));
@@ -4012,6 +4220,10 @@
       for (let i = 0; i < N_VIALS; i++) {
         const card = document.getElementById(`vial-${i}`);
         if (!card) continue;
+        const ov = overrideFor(i);
+        card.classList.toggle("overridden", !!ov);
+        if (ov) card.dataset.override = _mmss(ov.expires_in_seconds);
+        else card.removeAttribute("data-override");
         if (lockedSet.has(i)) {
           card.classList.add("locked");
           card.dataset.exp = (_ownerRun(i) || expState).name || "";
@@ -4494,10 +4706,14 @@
     function updateModalLockedState() {
       const i = modalState.vial;
       const lockedSet = _engineDrivenVials();
-      const isLocked = i !== null && lockedSet.has(i);
+      const driven = i !== null && lockedSet.has(i);
+      // SPEC §21: an unlocked vial is still the experiment's, but its manual
+      // controls are live and talk to the /api/vials/<v>/override/* routes.
+      const ov = i !== null ? overrideFor(i) : null;
+      const isLocked = driven && !ov;
+      const run = driven ? (_ownerRun(i) || expState) : null;
       const note = document.getElementById("locked-note");
       if (isLocked) {
-        const run = _ownerRun(i) || expState;
         const gi = run.grouped ? _groupIndexOfVial(i, run) : -1;
         const groupStr = gi >= 0
           ? ` (group "${run.groups[gi].name}", ${run.groups[gi].mode})` : "";
@@ -4507,20 +4723,372 @@
             `"${run.name}"${who} for its OD blank. Start or stop the experiment ` +
             `to change it.`
           : `Vial ${i}${groupStr} is controlled by experiment "${run.name}"${who}. ` +
-            `Stop the experiment to take manual control.`;
+            `To intervene without stopping it, unlock this vial below.`;
         note.classList.add("show");
       } else {
         note.classList.remove("show");
       }
-      // Disable input affordances when locked.
+      modalBodyEl.classList.toggle("locked", isLocked);
+      modalBodyEl.classList.toggle("overridden", !!ov);
+      overrideUnlockRow.classList.toggle(
+        "show", isLocked && run && run.status === "running");
+      renderOverrideBanner(ov);
+      // Disable input affordances when locked (and while a request is in
+      // flight -- see _busy; a lock that lands mid-request must win).
       tempSlider.disabled = isLocked;
       stirSlider.disabled = isLocked;
       pumpVolumeEl.disabled = isLocked;
       pumpAdvancedToggle.disabled = isLocked;
-      applyTempBtn.disabled = isLocked;
-      applyStirBtn.disabled = isLocked;
-      pumpInfluxBtn.disabled = isLocked;
-      pumpEffluxBtn.disabled = isLocked;
+      applyTempBtn.disabled = isLocked || _busy.has(applyTempBtn);
+      applyStirBtn.disabled = isLocked || _busy.has(applyStirBtn);
+      pumpInfluxBtn.disabled = isLocked || _busy.has(pumpInfluxBtn);
+      pumpEffluxBtn.disabled = isLocked || _busy.has(pumpEffluxBtn);
+      pumpOverrideFireBtn.disabled = !ov || _busy.has(pumpOverrideFireBtn)
+        || !!(ov && ov.pending_pump);
+      pumpOverrideActionEl.disabled = !ov;
+    }
+
+    // =================================================================
+    // Supervised per-vial override (SPEC §21)
+    // =================================================================
+    // The server is authoritative: every sensor_update carries each run's
+    // `overrides` ({vial: {operator, reason, expires_in_seconds,
+    // pending_pump, transient}}), and a 1 s client tick fills the countdown
+    // between pushes -- the maintenance banner's pattern.
+    function overrideFor(vial) {
+      for (const r of runsState.list) {
+        const o = r && r.overrides && r.overrides[String(vial)];
+        if (o) return o;
+      }
+      return null;
+    }
+
+    function _mmss(seconds) {
+      const s = Math.max(0, Math.floor(Number(seconds) || 0));
+      return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+    }
+
+    function renderOverrideBanner(ov) {
+      const banner = document.getElementById("override-banner");
+      if (!ov) { banner.classList.remove("show"); return; }
+      banner.classList.add("show");
+      document.getElementById("override-who").textContent = ov.operator || "?";
+      document.getElementById("override-why").textContent = ov.reason || "";
+      document.getElementById("override-countdown").textContent =
+        `re-locks in ${_mmss(ov.expires_in_seconds)}`;
+      const p = ov.pending_pump;
+      document.getElementById("override-detail").textContent = p
+        ? `Pump queued (${p.action}) — it fires on the next cycle, inside that ` +
+          `cycle's pump schedule. Automatic control is paused.`
+        : "Automatic control is paused. Every action is recorded with your " +
+          "name and reason and drawn on this vial's plots.";
+    }
+
+    // Reflect a grant/extend/release locally at once, rather than waiting up
+    // to a tick for the next sensor_update to say so.
+    function _setLocalOverride(vial, entry) {
+      const run = _ownerRun(vial);
+      if (run) {
+        run.overrides = run.overrides || {};
+        if (entry) run.overrides[String(vial)] = entry;
+        else delete run.overrides[String(vial)];
+      }
+      applyVialLocks();
+      if (modalState.vial === vial) {
+        syncModalFromState(vial);
+        updateModalLockedState();
+      }
+    }
+
+    setInterval(() => {
+      let any = false;
+      for (const r of runsState.list) {
+        for (const o of Object.values((r && r.overrides) || {})) {
+          if (typeof o.expires_in_seconds === "number" && o.expires_in_seconds > 0) {
+            o.expires_in_seconds -= 1;
+            any = true;
+          }
+        }
+      }
+      if (any) applyVialLocks();
+    }, 1000);
+
+    // --- The unlock gesture: press and hold ~2 s ---
+    let _holdTimer = null;
+    let _holdFired = false;
+    function _holdStart(e) {
+      if (e.type === "keydown") {
+        if (e.repeat || (e.key !== "Enter" && e.key !== " ")) return;
+        e.preventDefault();
+      } else if (e.button !== undefined && e.button !== 0) {
+        return;
+      }
+      _holdFired = false;
+      overrideUnlockBtn.classList.add("holding");
+      clearTimeout(_holdTimer);
+      _holdTimer = setTimeout(() => {
+        _holdFired = true;
+        _holdCancel();
+        openOverrideModal(modalState.vial);
+      }, 2000);
+    }
+    function _holdCancel() {
+      clearTimeout(_holdTimer);
+      _holdTimer = null;
+      overrideUnlockBtn.classList.remove("holding");
+    }
+    overrideUnlockBtn.addEventListener("pointerdown", _holdStart);
+    overrideUnlockBtn.addEventListener("keydown", _holdStart);
+    ["pointerup", "pointerleave", "pointercancel", "keyup", "blur"].forEach(
+      (t) => overrideUnlockBtn.addEventListener(t, _holdCancel));
+    overrideUnlockBtn.addEventListener("click", () => {
+      if (!_holdFired) showToast("Press and hold for 2 seconds to unlock", "warn");
+      _holdFired = false;
+    });
+
+    // --- Unlock dialog ---
+    const overrideModal = document.getElementById("override-modal");
+    const overrideOperatorEl = document.getElementById("override-operator");
+    const overrideReasonEl = document.getElementById("override-reason");
+    const overrideDurationEl = document.getElementById("override-duration");
+    const overrideGrantBtn = document.getElementById("override-grant");
+    let _overrideVial = null;
+
+    function openOverrideModal(vial) {
+      if (vial === null || vial === undefined) return;
+      _overrideVial = vial;
+      const run = _ownerRun(vial) || expState;
+      document.getElementById("override-modal-title").textContent = `Unlock vial ${vial}`;
+      document.getElementById("override-modal-summary").textContent =
+        `Vial ${vial} belongs to experiment "${run.name}"` +
+        (run.operator ? ` (${run.operator})` : "") + `. Unlocking pauses its ` +
+        `automatic control until you release it or the timer runs out. Every ` +
+        `action is recorded with your name and reason, and drawn on the ` +
+        `vial's plots.`;
+      let op = "";
+      try { op = localStorage.getItem("evolver.operator") || ""; } catch (_e) { /* private mode */ }
+      overrideOperatorEl.value = op;
+      overrideReasonEl.value = "";
+      overrideDurationEl.value = "10";
+      overrideModal.hidden = false;
+      requestAnimationFrame(() => overrideModal.classList.add("open"));
+      setTimeout(() => (op ? overrideReasonEl : overrideOperatorEl).focus(), 60);
+    }
+    function closeOverrideModal() {
+      overrideModal.classList.remove("open");
+      setTimeout(() => { overrideModal.hidden = true; }, 150);
+      _overrideVial = null;
+    }
+    document.getElementById("override-modal-close").addEventListener("click", closeOverrideModal);
+    document.getElementById("override-cancel").addEventListener("click", closeOverrideModal);
+    overrideModal.addEventListener("click", (e) => { if (e.target === overrideModal) closeOverrideModal(); });
+    overrideModal.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") closeOverrideModal();
+      if (e.key === "Enter" && e.target.tagName === "INPUT") grantOverride();
+    });
+    document.getElementById("override-reason-chips").addEventListener("click", (e) => {
+      const b = e.target.closest("[data-reason]");
+      if (b) { overrideReasonEl.value = b.dataset.reason; overrideReasonEl.focus(); }
+    });
+
+    async function grantOverride() {
+      const vial = _overrideVial;
+      if (vial === null) return;
+      const operator = overrideOperatorEl.value.trim();
+      const reason = overrideReasonEl.value.trim();
+      if (!operator) { showToast("Enter the operator's name.", "error"); overrideOperatorEl.focus(); return; }
+      if (!reason) { showToast("Enter a reason — it is recorded with every action.", "error"); overrideReasonEl.focus(); return; }
+      const minutes = Number(overrideDurationEl.value) || 10;
+      overrideGrantBtn.disabled = true;
+      try {
+        const data = await postJson(`/api/vials/${vial}/override`,
+          { operator, reason, duration_minutes: minutes });
+        try { localStorage.setItem("evolver.operator", operator); } catch (_e) { /* private mode */ }
+        closeOverrideModal();
+        _setLocalOverride(vial, data);
+        showToast(`Vial ${vial} unlocked for ${minutes} min — automatic control paused`, "ok");
+      } catch (err) {
+        showToast(`Unlock failed: ${err.message}`, "error");
+      } finally {
+        overrideGrantBtn.disabled = false;
+      }
+    }
+    overrideGrantBtn.addEventListener("click", grantOverride);
+
+    document.getElementById("override-extend").addEventListener("click", async () => {
+      const i = modalState.vial;
+      const ov = i !== null ? overrideFor(i) : null;
+      if (!ov) return;
+      try {
+        const data = await postJson(`/api/vials/${i}/override`,
+          { operator: ov.operator, reason: ov.reason, duration_minutes: 10 });
+        _setLocalOverride(i, data);
+        showToast(`Vial ${i}: override extended — re-locks in 10:00`, "ok");
+      } catch (err) {
+        showToast(`Extend failed: ${err.message}`, "error");
+      }
+    });
+    document.getElementById("override-release").addEventListener("click", async () => {
+      const i = modalState.vial;
+      const ov = i !== null ? overrideFor(i) : null;
+      if (!ov) return;
+      try {
+        await postJson(`/api/vials/${i}/override/release`, { operator: ov.operator });
+        _setLocalOverride(i, null);
+        fetchActuatorState();   // transient temperature/stir reverted server-side
+        showToast(`Vial ${i} re-locked — automatic control resumed`, "ok");
+      } catch (err) {
+        showToast(`Release failed: ${err.message}`, "error");
+      }
+    });
+
+    // --- Typed confirmation for destructive override actions ---
+    function typedConfirm(message, expected) {
+      return new Promise((resolve) => {
+        const m = document.getElementById("typed-confirm-modal");
+        const input = document.getElementById("typed-confirm-input");
+        const ok = document.getElementById("typed-confirm-ok");
+        document.getElementById("typed-confirm-message").textContent = message;
+        document.getElementById("typed-confirm-label").textContent =
+          `Type the vial number (${expected}) to confirm`;
+        input.value = "";
+        ok.disabled = true;
+        const ac = new AbortController();
+        const done = (answer) => {
+          ac.abort();
+          m.classList.remove("open");
+          setTimeout(() => { m.hidden = true; }, 150);
+          resolve(answer);
+        };
+        const opts = { signal: ac.signal };
+        input.addEventListener("input", () => {
+          ok.disabled = input.value.trim() !== String(expected);
+        }, opts);
+        input.addEventListener("keydown", (e) => {
+          if (e.key === "Enter" && !ok.disabled) done(true);
+          if (e.key === "Escape") done(false);
+        }, opts);
+        ok.addEventListener("click", () => done(true), opts);
+        document.getElementById("typed-confirm-cancel").addEventListener("click", () => done(false), opts);
+        document.getElementById("typed-confirm-close").addEventListener("click", () => done(false), opts);
+        m.addEventListener("click", (e) => { if (e.target === m) done(false); }, opts);
+        m.hidden = false;
+        requestAnimationFrame(() => m.classList.add("open"));
+        setTimeout(() => input.focus(), 60);
+      });
+    }
+
+    // --- Actions under an override ---
+    async function overrideApply(i, kind, value, keepEl, btn) {
+      const keep = !!keepEl.checked;
+      const label = kind === "temperature" ? `${value.toFixed(1)} °C` : `stir ${value}`;
+      if (keep && !(await typedConfirm(
+          `Make ${label} vial ${i}'s target for the REST of the run? It is written ` +
+          `to the experiment's config and survives the override, restarts and ` +
+          `recalibration.`, i))) return;
+      _busy.add(btn);
+      btn.disabled = true;
+      const original = btn.textContent;
+      btn.textContent = "Applying…";
+      try {
+        const body = kind === "temperature" ? { celsius: value, keep } : { value, keep };
+        await postJson(`/api/vials/${i}/override/${kind}`, body);
+        if (kind === "temperature") {
+          actuatorState.temperatureSetpointRaw[i] = clampRaw(celsiusToRaw(i, value));
+          updateTempSliderDisplay();
+        } else {
+          actuatorState.stir[i] = value;
+          updateStirSliderDisplay();
+        }
+        keepEl.checked = false;
+        showToast(`Vial ${i}: ${label} — ` +
+          (keep ? "kept for the rest of the run" : "until the vial re-locks"), "ok");
+      } catch (err) {
+        showToast(`Override failed: ${err.message}`, "error");
+      } finally {
+        _busy.delete(btn);
+        btn.textContent = original;
+        updateModalLockedState();
+      }
+    }
+
+    function _describeOverridePump(d) {
+      const q = d.quantised ? " (quantised — the firmware fires whole seconds)" : "";
+      if (d.action === "dilute") {
+        return `Will dilute ${d.influx_ml.toFixed(2)} mL: influx ${d.influx_s} s and ` +
+          `efflux ${d.efflux_s} s start together${q}`;
+      }
+      if (d.action === "influx") {
+        return `Will add ${d.influx_ml.toFixed(2)} mL (${d.influx_s} s) with no efflux — ` +
+          `the level rises above the straw until the next dilution ` +
+          `(max ${d.max_ml.toFixed(1)} mL)${q}`;
+      }
+      return `Will run efflux ${d.efflux_s} s — removes only liquid above the straw${q}`;
+    }
+
+    async function overridePumpPreview(i, volume) {
+      const action = pumpOverrideActionEl.value;
+      try {
+        const d = await postJson(`/api/vials/${i}/override/pump/preview`,
+          { action, volume_ml: volume });
+        if (modalState.vial !== i) return;
+        pumpPreviewText.textContent = _describeOverridePump(d);
+        pumpPreviewText.classList.toggle("warn", action === "influx");
+      } catch (err) {
+        if (modalState.vial !== i) return;
+        pumpPreviewText.textContent = err.message;
+        pumpPreviewText.classList.add("warn");
+      }
+    }
+    pumpOverrideActionEl.addEventListener("change", updatePumpPreview);
+
+    pumpOverrideFireBtn.addEventListener("click", async () => {
+      const i = modalState.vial;
+      if (i === null || !overrideFor(i)) return;
+      const volume = parseFloat(pumpVolumeEl.value);
+      if (!Number.isFinite(volume) || volume <= 0) {
+        showToast("Pump volume must be > 0", "error");
+        return;
+      }
+      const action = pumpOverrideActionEl.value;
+      if (action === "influx" && !(await typedConfirm(
+          `Add ${volume} mL to vial ${i} with NO efflux? The level rises above the ` +
+          `straw and stays there until the next dilution's overrun drains it.`, i))) return;
+      _busy.add(pumpOverrideFireBtn);
+      pumpOverrideFireBtn.disabled = true;
+      try {
+        const d = await postJson(`/api/vials/${i}/override/pump`, { action, volume_ml: volume });
+        const ov = overrideFor(i);
+        if (ov) ov.pending_pump = { action, influx_s: d.influx_s, efflux_s: d.efflux_s };
+        showToast(`Vial ${i}: ${action} queued — fires on the next cycle`, "ok");
+      } catch (err) {
+        showToast(`Override pump refused: ${err.message}`, "error");
+      } finally {
+        _busy.delete(pumpOverrideFireBtn);
+        updateModalLockedState();
+      }
+    });
+
+    function onOverrideEvent(msg) {
+      if (typeof msg.vial !== "number") return;
+      if (["override_released", "override_expired", "override_revoked"].includes(msg.type)) {
+        _setLocalOverride(msg.vial, null);
+        fetchActuatorState();
+        if (msg.type !== "override_released") {
+          showToast(`Vial ${msg.vial} re-locked (${msg.type === "override_expired"
+            ? "override expired" : `revoked: ${msg.cause || "?"}`})`, "warn");
+        }
+      }
+      if (msg.type === "override_pump" || msg.type === "override_pump_cancelled") {
+        const ov = overrideFor(msg.vial);
+        if (ov) ov.pending_pump = null;
+        if (msg.type === "override_pump_cancelled" && msg.cause) {
+          showToast(`Vial ${msg.vial}: queued pump cancelled (${msg.cause})`, "warn");
+        }
+        if (modalState.vial === msg.vial) updateModalLockedState();
+      }
+      // Redraw this vial's override bands and markers.
+      if (modalState.vial === msg.vial) modalTrendsLoad();
     }
 
     // --- Fetch the current experiment ---
@@ -5749,14 +6317,94 @@
             ctx.moveTo(x, y - r); ctx.lineTo(x + r, y);
             ctx.lineTo(x, y + r); ctx.lineTo(x - r, y);
             ctx.closePath();
-            ctx.fillStyle = m.color;
+            // Hollow = an operator's pump under a supervised override
+            // (pump_log source "override"), so it is never mistaken for the
+            // controller's own dilution.
+            ctx.fillStyle = m.hollow ? "#ffffff" : m.color;
             ctx.fill();
-            ctx.lineWidth = dpr;
-            ctx.strokeStyle = "#ffffff";
+            ctx.lineWidth = (m.hollow ? 2 : 1) * dpr;
+            ctx.strokeStyle = m.hollow ? m.color : "#ffffff";
             ctx.stroke();
           }
           ctx.restore();
         } } };
+    }
+
+    // SPEC §21: override windows as a shaded band BEHIND the trace (drawClear
+    // runs before series are drawn), and each operator action as a tick at
+    // the top of the plot. `which` picks the actions that belong on this
+    // chart: pumps on OD, temperature and stir changes on temperature.
+    // Same init-hook stash as pumpMarkerPlugin, for the same reason.
+    const OVERRIDE_COLOR = "#f97316";
+    function overrideMarkerPlugin(hist0, which) {
+      const kinds = which === "od" ? ["pump"] : ["temperature", "stir"];
+      const clip = (u, fn) => {
+        const { left, top, width, height } = u.bbox;
+        u.ctx.save();
+        u.ctx.beginPath();
+        u.ctx.rect(left, top, width, height);
+        u.ctx.clip();
+        fn(u.ctx, left, top, width, height);
+        u.ctx.restore();
+      };
+      return { hooks: {
+        init: (u) => { u._overrideHist = hist0 || { windows: [], actions: [] }; },
+        drawClear: (u) => {
+          const h = u._overrideHist;
+          if (!h || !(h.windows || []).length) return;
+          clip(u, (ctx, left, top, width, height) => {
+            ctx.fillStyle = "rgba(249, 115, 22, 0.13)";
+            for (const w of h.windows) {
+              const t0 = tsToEpoch(w.start);
+              if (t0 == null) continue;
+              const t1 = w.end ? tsToEpoch(w.end) : Date.now() / 1000;
+              const x0 = u.valToPos(t0, "x", true);
+              const x1 = u.valToPos(t1 == null ? t0 : t1, "x", true);
+              ctx.fillRect(x0, top, Math.max(x1 - x0, 2 * (u.pxRatio || 1)), height);
+            }
+          });
+        },
+        draw: (u) => {
+          const h = u._overrideHist;
+          const acts = ((h && h.actions) || []).filter((a) => kinds.includes(a.kind));
+          if (!acts.length) return;
+          const dpr = u.pxRatio || 1;
+          clip(u, (ctx, left, top, width, height) => {
+            for (const a of acts) {
+              const t = tsToEpoch(a.timestamp);
+              if (t == null) continue;
+              const x = u.valToPos(t, "x", true);
+              if (x < left || x > left + width) continue;
+              ctx.strokeStyle = OVERRIDE_COLOR;
+              ctx.lineWidth = dpr;
+              ctx.setLineDash([3 * dpr, 3 * dpr]);
+              ctx.beginPath();
+              ctx.moveTo(x, top);
+              ctx.lineTo(x, top + height);
+              ctx.stroke();
+              ctx.setLineDash([]);
+              const r = 5 * dpr;
+              ctx.beginPath();
+              ctx.moveTo(x - r, top);
+              ctx.lineTo(x + r, top);
+              ctx.lineTo(x, top + r * 1.4);
+              ctx.closePath();
+              ctx.fillStyle = OVERRIDE_COLOR;
+              ctx.fill();
+            }
+          });
+        } } };
+    }
+
+    async function fetchOverrideHistory(exp, vial) {
+      try {
+        const res = await fetch(
+          `/api/experiments/${encodeURIComponent(exp)}/overrides?vial=${vial}`);
+        if (!res.ok) return { windows: [], actions: [] };
+        return await res.json();
+      } catch (_e) {
+        return { windows: [], actions: [] };
+      }
     }
 
     function makeChart(el, series, data, opts) {
@@ -5980,6 +6628,7 @@
                   od: (r.od_at_pump == null || r.od_at_pump === "")
                     ? null : parseFloat(r.od_at_pump),
                   color: vialColor(v),
+                  hollow: r.source === "override",
                 }));
             } catch (_e) { pumpByVial[v] = []; }
           }
@@ -6085,13 +6734,16 @@
         const od = latest.od[msg.vial];
         const mark = {
           t: epoch, od: Number.isFinite(od) ? od : null, color: vialColor(msg.vial),
+          hollow: msg.source === "override",
         };
         if (!plotsView.classList.contains("view-hidden") && plots.showPump
             && plots.od && plots.vials.has(msg.vial)) {
           (plots.od._pumpMarkers = plots.od._pumpMarkers || []).push(mark);
           plots.od.redraw();
         }
-        if (modalState.vial === msg.vial && modalTrends.od && modalTrends.showPump) {
+        // An override pump reaches the modal through onOverrideEvent's reload.
+        if (modalState.vial === msg.vial && modalTrends.od && modalTrends.showPump
+            && msg.source !== "override") {
           (modalTrends.od._pumpMarkers = modalTrends.od._pumpMarkers || []).push(mark);
           modalTrends.od.redraw();
         }
@@ -6140,16 +6792,19 @@
       tempCard.classList.remove("view-hidden");
       const hours = RANGE_TO_HOURS[modalTrends.range];
       try {
-        const [od, tp] = await Promise.all([
+        const [od, tp, ovHist] = await Promise.all([
           fetchPlotData(exp, vial, "od", hours),
           fetchPlotData(exp, vial, "temp", hours),
+          fetchOverrideHistory(exp, vial),
         ]);
         let pumpMarks = [];
         if (modalTrends.showPump) {
           try {
             const pd = await fetchPlotData(exp, vial, "pump", hours);
+            // The controller's dilutions only: an override pump is drawn by
+            // overrideMarkerPlugin, with its operator's window around it.
             pumpMarks = (pd.rows || [])
-              .filter((r) => r.direction !== "efflux")
+              .filter((r) => r.direction !== "efflux" && r.source !== "override")
               .map((r) => ({
                 t: tsToEpoch(r.timestamp),
                 od: (r.od_at_pump == null || r.od_at_pump === "")
@@ -6167,13 +6822,15 @@
            { label: `Vial ${vial}`, stroke: vialColor(vial), width: 1.5,
              spanGaps: false, points: { show: false } }],
           odData, { height: 170, legend: false,
-                    plugins: [pumpMarkerPlugin(pumpMarks)] });
+                    plugins: [pumpMarkerPlugin(pumpMarks),
+                              overrideMarkerPlugin(ovHist, "od")] });
         modalTrends.temp = makeChart(
           document.getElementById("modal-temp-chart"),
           [{ label: "Time" },
            { label: `Vial ${vial}`, stroke: "#dc2626", width: 1.5,
              spanGaps: false, points: { show: false } }],
-          tpData, { height: 150, legend: false });
+          tpData, { height: 150, legend: false,
+                    plugins: [overrideMarkerPlugin(ovHist, "temp")] });
       } catch (err) {
         if (token !== modalTrendsToken) return;
         empty.hidden = false;
@@ -7956,8 +8613,8 @@
         body.innerHTML = `
           <p class="blank-status ok">Installed version ${escapeHtml(r.version)} of
           <strong>${escapeHtml(r.organism || "?")}</strong>${r.new_profile ? " (new organism)" : ""},
-          dark-subtracted. Measured: ${escapeHtml((r.measured_vials || []).join(", ") || "none")}.
-          ${(r.converted_vials || []).length ? `Converted to dark-subtracted signal: ${escapeHtml(r.converted_vials.join(", "))}.` : ""}
+          on raw LED-on signal. Measured: ${escapeHtml((r.measured_vials || []).join(", ") || "none")}.
+          ${(r.converted_vials || []).length ? `Converted back to raw signal: ${escapeHtml(r.converted_vials.join(", "))}.` : ""}
           Experiments created for this organism from now on read through it; runs already
           created keep the version they pinned (Recalibrate a finished run applies it afterwards).
           The machine's default curve is unchanged.</p>
@@ -7976,8 +8633,8 @@
           <p class="cal-hint">Tier 3 §8.2. Prepare ≥ 8 dilutions of a <strong>non-growing</strong>
           turbidity standard (killed cells, heat-fixed cells or beads) in the run's medium, from
           a blank to above the highest OD you will run. The series fits all four sigmoid
-          parameters on <strong>dark-subtracted</strong> signal and installs the sidecar that makes
-          the dark read a correction. It reserves the whole machine and survives a restart.</p>
+          parameters on the <strong>raw LED-on</strong> signal (the LED-off read is recorded as a
+          diagnostic only). It reserves the whole machine and survives a restart.</p>
           <div class="cal-form-grid">
             <label>Organism</label>
             <div>
@@ -8121,7 +8778,7 @@
         5 %), ≥ 8 levels, then monotone · lower-asymptote margin · inflection in range (warning) ·
         upper asymptote measured (warning). "Old OD at blank" is what the previous curve reported
         for this series' blank — the offset every run carried. ${
-          (r.fit.converted_vials || []).length ? `Vials ${escapeHtml(r.fit.converted_vials.join(", "))} keep their previous curve, converted exactly to dark-subtracted signal.` : ""}
+          (r.fit.converted_vials || []).length ? `Vials ${escapeHtml(r.fit.converted_vials.join(", "))} keep their previous curve, converted back to raw signal.` : ""}
         Click a row to plot it; tick to exclude.</p>
         <table class="cal-table"><thead><tr><th>Vial</th><th>a</th><th>b</th><th>c</th><th>d</th>
           <th>R²</th><th>max |res|</th><th>levels</th><th>checks</th><th>old OD at blank</th><th>excl.</th>
@@ -8165,7 +8822,7 @@
         [{ label: `vial ${v} measured`, color: vialColor(v), pts: e.points.map(p => [p.true_od600, p.signal]) }],
         [
           { label: "new fit", color: vialColor(v), fn: logistic(e.a, e.b, e.c, e.d) },
-          { label: "previous (dark-subtracted)", color: "#94a3b8", dash: [6, 4], fn: logistic(pa, pb, pc, pd) },
+          { label: "previous curve", color: "#94a3b8", dash: [6, 4], fn: logistic(pa, pb, pc, pd) },
         ],
         { xRange: [0, maxOd], xLabel: "true OD600" });
     }
@@ -8374,6 +9031,11 @@
     socket.on("sensor_update", updateVials);
     socket.on("sensor_update", (msg) => { plotsOnSensorUpdate(msg); modalTrendsAppend(msg); });
     socket.on("experiment_event", plotsOnExperimentEvent);
+    socket.on("experiment_event", (msg) => {
+      if (msg && typeof msg.type === "string" && msg.type.startsWith("override_")) {
+        onOverrideEvent(msg);
+      }
+    });
     socket.on("alert", (msg) => {
       // Three distinct levels. NEVER map an alert to "ok" -- that is the
       // success colour, and it is what made warnings invisible (SPEC §20.4).

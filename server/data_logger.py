@@ -6,7 +6,7 @@ vial, three append-only CSV files::
     config.json
     vial00_OD.csv          # timestamp,elapsed_hours,raw_adc,calibrated_od,n_valid,flag,dark
     vial00_temp.csv        # timestamp,elapsed_hours,raw_adc,calibrated_temp_c
-    vial00_pump_log.csv    # timestamp,elapsed_hours,direction,duration_seconds,od_at_pump
+    vial00_pump_log.csv    # timestamp,elapsed_hours,direction,duration_seconds,od_at_pump,source
     vial00_growth.csv      # SPEC §17 growth estimates, written at the engine's
                            # 60 s recompute cadence (not the 10 s sensor tick)
     ...
@@ -76,13 +76,22 @@ OD_HEADER = OD_HEADER_V1 + (
 # Written into every new experiment's config.json; absent = 1.
 OD_CSV_SCHEMA = 2
 TEMP_HEADER = ("timestamp", "elapsed_hours", "raw_adc", "calibrated_temp_c")
-PUMP_HEADER = (
+PUMP_HEADER_V1 = (
     "timestamp",
     "elapsed_hours",
     "direction",
     "duration_seconds",
     "od_at_pump",
 )
+# Schema 2 appends ``source`` -- who fired the pump: "auto" (a control mode),
+# "manual" (the manual actuator route, free or stopped-run vials) or
+# "override" (a supervised per-vial override, SPEC §21) -- so an operator's
+# intervention is distinguishable from the controller's in the raw record.
+# Appended at the END, never inserted: same rule as OD_HEADER (fact 6).
+PUMP_HEADER = PUMP_HEADER_V1 + ("source",)
+PUMP_SOURCES = ("auto", "manual", "override")
+# Written into every new experiment's config.json; absent = 1.
+PUMP_CSV_SCHEMA = 2
 # SPEC §17 / GROWTH_RATE_METHOD.md §7.7 — a PARALLEL file, not new columns
 # in vial{NN}_OD.csv: growth estimates are derived, on their own cadence,
 # and do not belong in the raw sensor record. (That file only ever gains
@@ -201,7 +210,7 @@ def _deep_merge(base: dict, overlay: dict) -> dict:
 class _ActiveRun:
     """One experiment the logger is writing rows for."""
 
-    __slots__ = ("name", "dir", "start", "vials", "od_v1_vials")
+    __slots__ = ("name", "dir", "start", "vials", "od_v1_vials", "pump_v1_vials")
 
     def __init__(self, name: str, directory: Path, start: datetime, vials: list[int]):
         self.name = name
@@ -211,6 +220,8 @@ class _ActiveRun:
         # Vials whose vialNN_OD.csv predates schema v2: a run resumed across
         # the upgrade keeps writing 7-column rows under its 7-column header.
         self.od_v1_vials: set[int] = set()
+        # Same for vialNN_pump_log.csv: a pre-schema-2 file keeps 5 columns.
+        self.pump_v1_vials: set[int] = set()
 
 
 class DataLogger:
@@ -359,6 +370,8 @@ class DataLogger:
             "notes": notes or "",
             # vialNN_OD.csv layout (OD_HEADER); absent in older configs = 1.
             "od_csv_schema": OD_CSV_SCHEMA,
+            # vialNN_pump_log.csv layout (PUMP_HEADER); absent = 1.
+            "pump_csv_schema": PUMP_CSV_SCHEMA,
         }
         if media is not None:
             config["media"] = media
@@ -431,9 +444,29 @@ class DataLogger:
             self._check_can_activate_locked(name, vials)
             run = _ActiveRun(name, exp_dir, start or datetime.now(timezone.utc), vials)
             run.od_v1_vials = self._od_v1_vials(exp_dir, vials)
+            run.pump_v1_vials = self._v1_vials(
+                exp_dir, vials, "pump_log", PUMP_HEADER_V1,
+            )
             self._active[name] = run
         log.info("experiment '%s' activated (start=%s)", name, run.start)
         return config
+
+    @staticmethod
+    def _v1_vials(
+        exp_dir: Path, vials: list[int], kind: str, v1_header: tuple,
+    ) -> set[int]:
+        """Vials whose ``vialNN_<kind>.csv`` carries ``v1_header`` exactly."""
+        out: set[int] = set()
+        for v in vials:
+            path = exp_dir / f"vial{v:02d}_{kind}.csv"
+            try:
+                with path.open("r", encoding="utf-8") as f:
+                    header = f.readline().strip().split(",")
+            except OSError:
+                continue
+            if header == list(v1_header):
+                out.add(v)
+        return out
 
     @staticmethod
     def _od_v1_vials(exp_dir: Path, vials: list[int]) -> set[int]:
@@ -681,16 +714,21 @@ class DataLogger:
         direction: str,
         duration_seconds: float,
         od_at_pump: Optional[float] = None,
+        source: str = "auto",
     ) -> None:
         """Append a pump event for ``vial`` to its pump log CSV.
 
         Silently skipped if no experiment is running or if ``vial`` is
         not part of the active experiment (e.g. a manual pump of a
-        non-experiment vial — fire the pump, just don't log it here)."""
+        non-experiment vial — fire the pump, just don't log it here).
+        ``source`` is written only to a schema-2 file; a file created before
+        it keeps its five columns."""
         if direction not in ("influx", "efflux"):
             raise ValueError(
                 f"direction must be 'influx' or 'efflux'; got {direction!r}"
             )
+        if source not in PUMP_SOURCES:
+            raise ValueError(f"source must be one of {PUMP_SOURCES}; got {source!r}")
         with self._lock:
             run = self._owner_locked(vial)
             if run is None:
@@ -700,16 +738,16 @@ class DataLogger:
             if od_at_pump is None and self._latest_od is not None:
                 od_at_pump = self._latest_od[vial]
             path = exp_dir / f"vial{vial:02d}_pump_log.csv"
-            self._append_row(
-                path,
-                [
-                    timestamp_iso,
-                    f"{elapsed_h:.4f}",
-                    direction,
-                    _format_number(duration_seconds, 2),
-                    _format_number(od_at_pump, 4),
-                ],
-            )
+            row = [
+                timestamp_iso,
+                f"{elapsed_h:.4f}",
+                direction,
+                _format_number(duration_seconds, 2),
+                _format_number(od_at_pump, 4),
+            ]
+            if vial not in run.pump_v1_vials:
+                row.append(source)
+            self._append_row(path, row)
 
     def log_growth(
         self,

@@ -294,21 +294,58 @@ def _per_vial_value(value: Any, vial: int, default: Any) -> Any:
     return value
 
 
-def stir_by_vial(groups: Iterable[Group]) -> dict[int, int]:
-    """Each grouped vial's stir PWM (``stir_rate``, scalar or 16-list)."""
+VIAL_TARGET_KEYS: frozenset[str] = frozenset({"temperature_c", "stir_rate"})
+
+
+def normalise_vial_targets(raw: Any) -> dict[int, dict[str, Any]]:
+    """The ``vial_targets`` config key as ``{vial: {key: value}}`` with int
+    vials (JSON gives string keys). A target an operator kept for the rest of
+    the run through a supervised override (SPEC §21) -- the top layer of
+    actuator-target resolution, above the vial's group. Unknown keys and
+    malformed entries are dropped rather than raised: this is read on every
+    resume and a bad entry must not strand a run."""
+    out: dict[int, dict[str, Any]] = {}
+    if not isinstance(raw, Mapping):
+        return out
+    for k, entry in raw.items():
+        try:
+            vial = int(k)
+        except (TypeError, ValueError):
+            continue
+        if not (0 <= vial < N_VIALS) or not isinstance(entry, Mapping):
+            continue
+        kept = {key: entry[key] for key in VIAL_TARGET_KEYS if entry.get(key) is not None}
+        if kept:
+            out[vial] = kept
+    return out
+
+
+def stir_by_vial(
+    groups: Iterable[Group],
+    vial_targets: Optional[Mapping[int, Mapping[str, Any]]] = None,
+) -> dict[int, int]:
+    """Each grouped vial's stir PWM (``stir_rate``, scalar or 16-list), with
+    any kept per-vial override target on top."""
     out: dict[int, int] = {}
     for g in groups:
         raw = g.parameters.get("stir_rate")
         for v in g.vials:
             out[v] = int(_per_vial_value(raw, v, DEFAULT_STIR_RATE))
+    for v, entry in (vial_targets or {}).items():
+        if v in out and entry.get("stir_rate") is not None:
+            out[v] = int(entry["stir_rate"])
     return out
 
 
-def temperature_c_by_vial(groups: Iterable[Group]) -> dict[int, float]:
+def temperature_c_by_vial(
+    groups: Iterable[Group],
+    vial_targets: Optional[Mapping[int, Mapping[str, Any]]] = None,
+) -> dict[int, float]:
     """Each grouped vial's target temperature in °C.
 
-    ``temperature_c`` (scalar or 16-list) wins; the legacy scalar
-    ``temperature`` is the fallback, then 37 °C -- the same precedence
+    A kept per-vial override target (``vial_targets``) wins; then
+    ``temperature_c`` (scalar or 16-list); the legacy scalar ``temperature``
+    is the fallback, then 37 °C -- the same precedence
     ``ExperimentEngine._apply_initial_actuators_locked`` always used.
     """
     out: dict[int, float] = {}
@@ -323,14 +360,23 @@ def temperature_c_by_vial(groups: Iterable[Group]) -> dict[int, float]:
         raw = p.get("temperature_c")
         for v in g.vials:
             out[v] = float(_per_vial_value(raw, v, fallback))
+    for v, entry in (vial_targets or {}).items():
+        if v in out and entry.get("temperature_c") is not None:
+            out[v] = float(entry["temperature_c"])
     return out
 
 
 def config_stir_by_vial(config: Mapping) -> dict[int, int]:
     """:func:`stir_by_vial` straight from a config dict (calibration layer)."""
-    return stir_by_vial(groups_from_config(config))
+    return stir_by_vial(
+        groups_from_config(config),
+        normalise_vial_targets(config.get("vial_targets")),
+    )
 
 
 def config_temperature_c_by_vial(config: Mapping) -> dict[int, float]:
     """:func:`temperature_c_by_vial` straight from a config dict."""
-    return temperature_c_by_vial(groups_from_config(config))
+    return temperature_c_by_vial(
+        groups_from_config(config),
+        normalise_vial_targets(config.get("vial_targets")),
+    )

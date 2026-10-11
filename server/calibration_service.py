@@ -3232,7 +3232,8 @@ class CalibrationService:
                 if preview and len(levels) >= od_curve_fit.MIN_OD_LEVELS:
                     try:
                         f = od_curve_fit.fit_logistic4(
-                            [p["true_od600"] for p in pts], [p["signal"] for p in pts],
+                            [p["true_od600"] for p in pts],
+                            [self._series_signal(p) for p in pts],
                         )
                         entry["preview"] = {k: f[k] for k in (
                             "a", "b", "c", "d", "r2", "rmse", "b_at_bound", "residuals",
@@ -3337,11 +3338,19 @@ class CalibrationService:
                         and math.isfinite(lm) and math.isfinite(dm)):
                     rejected.append({"vial": v, "reason": "dropped read — repeat"})
                     continue
-                signal = float(lm) - float(dm)
+                # The fit signal is the RAW LED-on reading -- the signal every
+                # curve that has worked on this rig was fitted on (the 2016
+                # constants, the live loop's default). Measured on the rig
+                # 2026-10-11: the photodiode front end inverts, so LED-off
+                # (``we0``) reads ~64 500, near the ADC rail, ABOVE every
+                # LED-on reading; "LED-on minus LED-off" is negative on every
+                # vial and rejected them all. The LED-off read is kept on the
+                # point as a diagnostic only.
+                signal = float(lm)
                 if signal <= 0:
                     rejected.append({
                         "vial": v,
-                        "reason": f"LED-on {lm:.0f} is not above the dark {dm:.0f}",
+                        "reason": f"LED-on reading {lm:.0f} is not positive",
                     })
                     continue
                 flags = []
@@ -3371,6 +3380,13 @@ class CalibrationService:
                 raise ValueError(f"no point recorded: {rejected}")
             return {"captured": captured, "rejected": rejected,
                     "session": self.series_session()}
+
+    @staticmethod
+    def _series_signal(point: dict) -> float:
+        """A captured point's fit signal: its raw LED-on median. Points taken
+        before 2026-10-11 stored ``signal = lit - dark``; re-deriving it from
+        ``lit_median`` keeps one session consistent across that change."""
+        return float(point["lit_median"])
 
     def series_discard(self, point_id) -> dict:
         with self._lock:
@@ -3414,28 +3430,24 @@ class CalibrationService:
         warnings_: list[str] = []
         dark = np.array([s.dark_median(v) for v in range(N_VIALS)])
 
-        # The previous curve in dark-subtracted terms. Exact: with a' = a-D
-        # and b' = b-D, (b'-a')/((S-D)-a') == (b-a)/(S-a), so the shifted
-        # curve reads the same OD from dark-subtracted signal as the old one
-        # did from raw -- as long as the dark offset is this session's.
-        prev_ds_rows = prev_rows.copy()
+        # The previous curve in RAW LED-on terms, the space the series now
+        # fits in. A raw curve (the 2016 default, any series since
+        # 2026-10-11) carries as-is. A dark-subtracted one -- installed by
+        # the earlier software -- is converted back exactly: a = a'+D and
+        # b = b'+D undo the a-D, b-D it was installed with.
+        prev_raw_rows = prev_rows.copy()
         converted: list[int] = []
-        if not prev_ds:
+        if prev_ds:
             for v in range(N_VIALS):
                 if not math.isfinite(dark[v]):
                     failures.append(
-                        f"vial {v}: no dark reading to convert its previous curve "
-                        "to dark-subtracted signal"
+                        f"vial {v}: no LED-off reading to convert its previous "
+                        "dark-subtracted curve back to raw signal"
                     )
                     continue
-                prev_ds_rows[0, v] -= dark[v]
-                prev_ds_rows[1, v] -= dark[v]
-                if prev_ds_rows[0, v] <= 0:
-                    failures.append(
-                        f"vial {v}: its previous lower asymptote does not clear "
-                        f"the dark ({prev_rows[0, v]:.0f} vs {dark[v]:.0f})"
-                    )
-        rows = prev_ds_rows.copy()
+                prev_raw_rows[0, v] += dark[v]
+                prev_raw_rows[1, v] += dark[v]
+        rows = prev_raw_rows.copy()
 
         measured: list[int] = []
         review: dict = {}
@@ -3449,7 +3461,7 @@ class CalibrationService:
                 continue
             pts = s.active_points(v)
             ods = np.array([p["true_od600"] for p in pts], dtype=float)
-            sig = np.array([p["signal"] for p in pts], dtype=float)
+            sig = np.array([self._series_signal(p) for p in pts], dtype=float)
             sds = np.array([p["lit_sd"] for p in pts], dtype=float)
             n_levels = len(set(ods.tolist()))
             if n_levels < od_curve_fit.MIN_OD_LEVELS:
@@ -3545,7 +3557,7 @@ class CalibrationService:
 
             # Review: the new curve against the previous one, both anchored
             # to this session's blank point so the numbers compare.
-            prev = prev_ds_rows[:, v]
+            prev = prev_raw_rows[:, v]
             entry = {
                 "measured": True,
                 "a": f["a"], "b": f["b"], "c": f["c"], "d": f["d"],
@@ -3560,7 +3572,8 @@ class CalibrationService:
                     0.01 * od_curve_fit.counts_per_od(0.3, f["a"], f["b"], f["c"], f["d"])),
                 "criteria": crit,
                 "points": [
-                    {"id": p["id"], "true_od600": p["true_od600"], "signal": p["signal"],
+                    {"id": p["id"], "true_od600": p["true_od600"],
+                     "signal": self._series_signal(p),
                      "residual": float(r)}
                     for p, r in zip(pts, res)
                 ],
@@ -3581,12 +3594,12 @@ class CalibrationService:
 
         if not measured and not failures:
             raise ValueError("no vial was measured — nothing to install")
-        converted = [v for v in range(N_VIALS) if v not in measured and not prev_ds]
+        converted = [v for v in range(N_VIALS) if v not in measured and prev_ds]
         if converted:
             warnings_.append(
-                f"vials {converted} keep their previous curve, converted to "
-                "dark-subtracted signal with this session's dark (a-D, b-D; "
-                "exact while the dark offset holds)"
+                f"vials {converted} keep their previous curve, converted from "
+                "dark-subtracted back to raw signal with this session's LED-off "
+                "read (a+D, b+D)"
             )
         carried_legacy = [v for v in range(N_VIALS)
                           if v not in measured and _is_legacy_source(per_vial_source[v])]
@@ -3598,7 +3611,7 @@ class CalibrationService:
         for v in range(N_VIALS):
             review.setdefault(str(v), {
                 "measured": False,
-                "previous": prev_ds_rows[:, v].tolist(),
+                "previous": prev_raw_rows[:, v].tolist(),
                 "converted_from_raw": v in converted,
                 "source": per_vial_source[v],
             })
@@ -3649,9 +3662,10 @@ class CalibrationService:
         override_reason: Optional[str] = None,
         operator: Optional[str] = None,
     ) -> dict:
-        """Fit, QC, and install a DARK-SUBTRACTED OD version (writes the
-        ``OD_cal.meta.json`` sidecar that lets the dark read graduate from
-        diagnostic to correction). The caller makes it live."""
+        """Fit, QC, and install an OD profile version on RAW LED-on signal
+        (``dark_subtracted: false``): on this rig the LED-off read sits at the
+        ADC rail above every LED-on read, so it cannot be subtracted. The
+        caller makes it live."""
         with self._lock:
             s = self._require_tier3("od_series")
             version = self.store.fresh_version("od")
@@ -3682,7 +3696,7 @@ class CalibrationService:
                     "standard": s.standard or None,
                     "medium": s.medium or None,
                     "spectrophotometer": s.spectrophotometer or None,
-                    "dark_subtracted": True,
+                    "dark_subtracted": False,
                     "vial_map_version": vial_map_version,
                     "settle_overridden_points": [
                         p["id"] for p in s.points if not p.get("settle_checked", True)
@@ -3690,7 +3704,7 @@ class CalibrationService:
                 },
                 data={
                     "rows": rows.tolist(),
-                    "dark_subtracted": True,
+                    "dark_subtracted": False,
                     "points": s.points,
                     "dark_captures": s.dark_captures,
                     "previous_version": prev_version,

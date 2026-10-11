@@ -940,6 +940,17 @@ that is what determines whether someone needs to come in overnight.
 
 ### Session S — Supervised per-vial override
 
+**Status: BUILT 2026-10-11 (software; not yet exercised on the rig).** See `SPEC.md` §21
+for what shipped and `server/vial_override.py`. Three things this entry got wrong, and
+the build corrected: the turbidostat has no deficit accumulator (CONTROL_MODE_AUDIT T-3),
+so the state pushed is `last_pump_time`; a manual dilution cannot reuse the manual pump
+route (single-direction frames serialise — CLAUDE.md fact 8), so override pumps ride the
+tick's one concurrent schedule; and efflux cannot "pull a sample" — it removes only what
+is above the straw. Decided with the operator: automatic control **pauses** while a vial
+is unlocked; temperature/stir changes are transient or kept for the run at the
+operator's choice; the chemostat treats a manual dilution as **additive**; a restart
+revokes the grant. The real effort was well above MEDIUM.
+
 **Effort: MEDIUM (60 min). Depends on: M (audit trail).**
 
 Meeting item 12. Vials in a running experiment are currently hard-locked in the UI
@@ -970,11 +981,12 @@ controller's state**, not merely executed:
 
 **Verification:**
 
-- [ ] Unlock gesture required; vial re-locks on expiry
-- [ ] Manual dilution updates controller state — controller does not immediately re-dilute
-- [ ] Manual actions debit media and credit waste correctly
-- [ ] Every override logged with operator and reason, and marked on plots
-- [ ] Overrides survive a server restart in a defined way (persisted or cleanly reverted)
+- [x] Unlock gesture required; vial re-locks on expiry
+- [x] Manual dilution updates controller state — controller does not immediately re-dilute
+- [x] Manual actions debit media and credit waste correctly
+- [x] Every override logged with operator and reason, and marked on plots
+- [x] Overrides survive a server restart in a defined way (grant revoked, transient
+      changes reverted, kept targets persist — `test_vial_override.py`)
 
 ---
 

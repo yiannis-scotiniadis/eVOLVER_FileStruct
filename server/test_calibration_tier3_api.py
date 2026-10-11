@@ -313,6 +313,7 @@ def test_thermistor_finish_refusal_is_422_with_the_qc_block():
 
 import json  # noqa: E402
 
+import od_curve_fit as F  # noqa: E402
 from test_calibration_tier3 import SERIES_LEVELS, _true_ds_rows  # noqa: E402
 
 
@@ -331,8 +332,8 @@ def _run_http_series(client, mgr, rows, vials):
 
 
 def test_od_series_over_http_creates_an_organism_profile():
-    """A series introduces an organism: a new profile, dark-subtracted, with
-    the machine's default curve -- and so the live reader -- untouched."""
+    """A series introduces an organism: a new profile on raw LED-on signal,
+    with the machine's default curve -- and so the live reader -- untouched."""
     with tempfile.TemporaryDirectory() as tmp:
         flask_app = _make_app(Path(tmp))
         try:
@@ -351,8 +352,18 @@ def test_od_series_over_http_creates_an_organism_profile():
             out = _post(client, "/api/calibration/od/series/finish")
             assert out["profile_id"] == "pichia-pastoris"
             env = state.cal_service.store.get_od_profile("pichia-pastoris")
-            assert np.allclose(env["data"]["rows"], rows, rtol=1e-6)
-            assert env["data"]["dark_subtracted"] is True
+            # The mock's lit read is 1200 + S_true: on raw signal the true
+            # curve is the same one with its asymptotes carried up by 1200.
+            raw_truth = rows.copy()
+            raw_truth[0] += 1200.0
+            raw_truth[1] += 1200.0
+            installed = np.asarray(env["data"]["rows"])
+            ods = np.linspace(0.0, 2.0, 201)
+            for v in range(N_VIALS):
+                back = F.od_from_signal(F.signal_from_od(ods, *raw_truth[:, v]),
+                                        *installed[:, v])
+                assert np.nanmax(np.abs(back - ods)) < 0.01, v
+            assert env["data"]["dark_subtracted"] is False
             # The default curve is not an organism: unchanged, live and on disk.
             assert np.array_equal(mgr.od_cal, default_rows)
             assert mgr.od_cal_dark_subtracted is False

@@ -23,6 +23,7 @@ from serial_manager import (  # noqa: E402
     DEFAULT_RAW_FLOOR,
     HEATER_OFF_SETPOINT,
     MAX_SAFE_TEMP_C,
+    ADDRESS_CHANGE_QUIET_SECONDS,
     MIN_INTER_COMMAND_SECONDS,
     N_VIALS,
     OD_LED_MAX,
@@ -43,6 +44,8 @@ class FakeSerial:
     def __init__(self) -> None:
         self.write_log: list[bytes] = []
         self.read_queue: list[bytes] = []
+        # ("write" | "flush" | "reset") in call order, for ordering assertions.
+        self.events: list[str] = []
         self.flushed = False
         self.closed = False
 
@@ -51,7 +54,16 @@ class FakeSerial:
 
     def write(self, data: bytes) -> int:
         self.write_log.append(bytes(data))
+        self.events.append("write")
         return len(data)
+
+    def flush(self) -> None:
+        # pyserial: block until the output has been transmitted.
+        self.events.append("flush")
+
+    def reset_input_buffer(self) -> None:
+        # Records only: tests pre-queue the replies a request will read.
+        self.events.append("reset")
 
     def readline(self) -> bytes:
         if self.read_queue:
@@ -660,6 +672,93 @@ def test_od_enhanced_inter_command_delay() -> None:
     print(f"PASS  enhanced OD honors {MIN_INTER_COMMAND_SECONDS*1000:.0f} ms delay across reads")
 
 
+def test_frame_to_another_arduino_waits_for_a_quiet_bus() -> None:
+    """Measured 2026-10-11 by replaying the 10 s tick on the rig: an ``xr``
+    sent straight behind a ``zv`` went unanswered 85/100 times, 0/100 with
+    100 ms of quiet first. Every change of addressee waits
+    ADDRESS_CHANGE_QUIET_SECONDS after the last frame or reply; a repeat to
+    the same Arduino keeps the short spacing (back-to-back OD reads never
+    failed)."""
+    sm, fake = fresh(calibrated=False)
+    fake.read_queue.append(_temp_response([550] * N_VIALS))
+    fake.read_queue.append(_od_response([60000] * N_VIALS))
+    fake.read_queue.append(_od_response([60000] * N_VIALS))
+    waits: dict[int, float] = {}  # index of the write about to go out -> slept
+    real_sleep = time.sleep
+
+    def spy_sleep(s: float) -> None:
+        i = len(fake.write_log)
+        waits[i] = waits.get(i, 0.0) + s
+        if s > 0:
+            real_sleep(min(s, 0.001))
+
+    with patch("serial_manager.time.sleep", side_effect=spy_sleep):
+        sm.set_stir([10] * N_VIALS)      # 0 zv
+        sm.read_temperature()            # 1 xr  -- behind a zv
+        sm.read_od(2125)                 # 2 we  -- behind the temp reply
+        sm.read_od(2125)                 # 3 we  -- same Arduino again
+        sm.set_stir([10] * N_VIALS)      # 4 zv  -- behind the turb reply
+        sm.pump_mask_command(1, 2)       # 5 st  -- behind a zv
+        sm.pump_mask_command(2, 2)       # 6 st  -- same Arduino again
+    assert [w[:2] for w in fake.write_log] == [
+        b"zv", b"xr", b"we", b"we", b"zv", b"st", b"st",
+    ], fake.write_log
+    for i in (1, 2, 4, 5):
+        assert waits.get(i, 0.0) >= ADDRESS_CHANGE_QUIET_SECONDS * 0.9, (i, waits)
+    for i in (3, 6):
+        assert waits.get(i, 0.0) <= MIN_INTER_COMMAND_SECONDS + 1e-9, (i, waits)
+    print("PASS  a frame to a different Arduino waits for a quiet bus")
+
+
+def test_write_drains_the_uart_and_requests_discard_stale_input() -> None:
+    """Every frame is drained before it is time-stamped, so spacing counts
+    from the end of transmission; only request frames (xr, we) discard
+    stale input first, so a late reply cannot be read as the next one."""
+    sm, fake = fresh(calibrated=False)
+    fake.read_queue.append(_temp_response([550] * N_VIALS))
+    fake.read_queue.append(_od_response([60000] * N_VIALS))
+    with patch("serial_manager.time.sleep"):
+        sm.set_stir([10] * N_VIALS)
+        sm.read_temperature()
+        sm.read_od(2125)
+        sm.pump_mask_command(1, 2)
+    assert fake.events == [
+        "write", "flush",
+        "reset", "write", "flush",
+        "reset", "write", "flush",
+        "write", "flush",
+    ], fake.events
+    print("PASS  writes drain the UART; requests discard stale input")
+
+
+def test_stir_vector_is_logged_only_when_it_changes() -> None:
+    """The log is the record of every stir vector ever commanded -- what a
+    runaway-stir episode is checked against -- without a line per tick."""
+    import logging
+    sm, _fake = fresh(calibrated=False)
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler()
+    handler.emit = records.append
+    logger = logging.getLogger("serial_manager")
+    old_level = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    try:
+        with patch("serial_manager.time.sleep"):
+            sm.set_stir([10] * N_VIALS)
+            sm.set_stir([10] * N_VIALS)
+            sm.set_stir([10] * 15 + [0])
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(old_level)
+    lines = [r.getMessage() for r in records if r.getMessage().startswith("stir set to")]
+    assert lines == [
+        "stir set to " + ",".join(["10"] * 16),
+        "stir set to " + ",".join(["10"] * 15 + ["0"]),
+    ], lines
+    print("PASS  stir vector logged only when it changes")
+
+
 def main() -> int:
     test_temperature_command_format()
     test_set_temperature_celsius_roundtrip()
@@ -692,6 +791,9 @@ def main() -> int:
     test_apply_od_blank_row2_only()
     test_od_enhanced_out_of_range()
     test_od_enhanced_inter_command_delay()
+    test_frame_to_another_arduino_waits_for_a_quiet_bus()
+    test_write_drains_the_uart_and_requests_discard_stale_input()
+    test_stir_vector_is_logged_only_when_it_changes()
     print("\nAll tests passed.")
     return 0
 

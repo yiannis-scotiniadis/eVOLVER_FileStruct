@@ -63,7 +63,7 @@ All members of the Isaacs Lab at Yale, ranging from undergraduate researchers wi
 - [x] Volume-based fluidics (§16) — Session L
 - [x] Structured logging and unified event log (§20) — Sessions M/M2
 - [ ] Hygiene records and sterilisation wizard (§18)
-- [ ] Supervised per-vial override (§21)
+- [x] Supervised per-vial override (§21) — Session S, 2026-10-11
 - [ ] Rule-based anomaly and stall detection (§22)
 - [ ] Slack webhook integration for alerts (§22)
 - [ ] Off-box backup (§24)
@@ -605,10 +605,22 @@ POST /api/service/sterilize/start           # service mode only; refuses while R
 POST /api/service/sterilize/advance
 POST /api/service/sterilize/abort
 
-POST /api/vials/{vial}/override             # §21
-  Body: {"duration_minutes": 10, "reason": "sampling"}
-  Response: {"status": "ok", "expires_at": "..."}
-POST /api/vials/{vial}/override/release
+POST /api/vials/{vial}/override             # §21 — IMPLEMENTED (Session S)
+  Body: {"operator": "Ana", "reason": "rescue", "duration_minutes": 10}   (max 30)
+  Response: {"vial", "experiment", "operator", "reason", "granted_at",
+             "expires_at", "expires_in_seconds", "transient", "pending_pump"}
+  Re-POST on an unlocked vial extends it from now.
+  409 not_running / vial_faulted / calibration_in_progress; 404 not_owner; 400 bad body
+POST /api/vials/{vial}/override/release     {"operator"}
+POST /api/vials/{vial}/override/pump/preview  {"action": "dilute"|"influx"|"efflux", "volume_ml"}
+POST /api/vials/{vial}/override/pump        same body -> {"status": "queued", "influx_s", "efflux_s", ...}
+  409 override_required / override_expired / override_pump_pending /
+      consumables_blocked / maintenance_active / machine_hold; 400 below 1 s,
+      over the 30 s cap, or an influx-only spike past the headroom
+POST /api/vials/{vial}/override/temperature {"celsius": 22..45, "keep": false}
+POST /api/vials/{vial}/override/stir        {"value": 0..15, "keep": false}
+GET  /api/overrides                         # every active override, by vial
+GET  /api/experiments/{name}/overrides?vial=N   # windows + actions, from events.csv (plot markers)
 
 GET  /api/templates                         # §23
 POST /api/templates                         # save current or named experiment as template
@@ -766,13 +778,22 @@ timestamp,elapsed_hours,raw_adc,calibrated_temp_c
 ...
 ```
 
-**Pump log** (`vial00_pump_log.csv`):
+**Pump log** (`vial00_pump_log.csv`, schema 2 — `config.json` carries
+`"pump_csv_schema": 2`; absent = 1):
 ```csv
-timestamp,elapsed_hours,direction,duration_seconds,od_at_pump
-2026-05-12T16:45:00,2.250,influx,8.2,0.41
-2026-05-12T16:45:09,2.253,efflux,13.2,0.41
+timestamp,elapsed_hours,direction,duration_seconds,od_at_pump,source
+2026-05-12T16:45:00,2.250,influx,8.2,0.41,auto
+2026-05-12T16:45:00,2.250,efflux,10.2,0.41,auto
+2026-05-12T17:02:10,2.537,influx,3.0,0.44,override
 ...
 ```
+
+`source` says who fired the pump: `auto` (a control mode), `manual` (the manual
+actuator route, on a free or stopped run's vial) or `override` (a supervised
+per-vial override, §21). Schema 2 appended it at the **end** (fact 6 discipline):
+a schema-1 file resumed across the upgrade keeps its five columns, because the
+logger matches each file's own header. Every reader in the tree is positional on
+the first five columns or keyed by header name.
 
 ### Experiment configuration (`config.json`)
 
@@ -2573,6 +2594,12 @@ Every discrete occurrence is recorded here: experiment start/stop, pump fires **
 suppressed pump attempts** (§15), phase changes, alerts, maintenance enter/exit, refills,
 manual overrides (§21), drug escalations, sensor failures, and serial errors.
 
+Supervised overrides (§21) use category `override`: `override_granted`, `_extended`,
+`_released`, `_expired`, `_revoked`, `_pump`, `_pump_cancelled`, `_temperature`,
+`_stir`. Each row's `data_json` carries `operator`, `reason` and an `override` key
+(`granted`, `pump`, …) — the event `type` itself is not in `data_json`, so that key is
+what `/api/experiments/{name}/overrides` reads windows and actions back from.
+
 This is the artefact a researcher attaches to a lab-notebook entry, the backing store for
 the event-log table in the UI, and part of the export bundle.
 
@@ -2708,37 +2735,103 @@ acceptable *error* channel.
 
 ## 21. Supervised per-vial override
 
-**Status: not implemented — vials in a running experiment are hard-locked in the UI
-(`isLocked`). Priority P1 (`ROADMAP.md` Session S).**
+**Status: IMPLEMENTED 2026-10-11 (`ROADMAP.md` Session S).** `server/vial_override.py`
+(the mixin on `ExperimentEngine`, the pure pump plan, the `events.csv` reader), the
+controller hooks in `server/control_modes/`, `fluidics.ManualRun` /
+`plan_pump_schedule`, the `vial_targets` layer in `run_config.py`, the
+`/api/vials/{vial}/override*` routes (§6), and the vial modal in `index.html`. Tests:
+`server/test_vial_override.py`.
 
 Hard-locking is the right default and the wrong absolute. Real experiments need
-intervention: pull a sample, spike a vial, rescue a stalled culture.
+intervention: pull a sample, spike a vial, rescue a stalled culture. A vial a RUNNING
+experiment drives stays locked to `/api/actuators/*`; the override is its own audited
+door, not a hole in that lock.
 
 ### Behaviour
 
-An explicit unlock gesture (press-and-hold ≈2 s; typed confirmation for destructive
-actions) grants a **time-limited, audited override** on one vial — manual influx/efflux by
-volume, temperature change, stir change. Default expiry 10 minutes, after which the vial
-re-locks automatically so a forgotten unlock cannot leave a vial unguarded.
+- **Unlock.** Press and hold "Hold 2 s to unlock this vial" in the vial modal; a dialog
+  takes operator (prefilled from the wizard's stored name), a required reason and a
+  duration (default 10 min, max 30). Only a vial of a **RUNNING** experiment can be
+  unlocked — not a free vial (plain manual control), not a CREATED/preconditioned one,
+  not one with a latched fault. Re-granting extends from now and is recorded as such.
+- **Automatic control pauses** on the vial for the whole override: `run_cycle` still
+  pushes OD into the controller (its rolling mean stays fresh) but does not call
+  `decide()`. Granting drops any automatic dilution queued for that vial by
+  maintenance or the machine hold — it predates the operator's intervention.
+- **Re-lock.** On release, on expiry (checked at the top of every RUNNING tick, both
+  lanes), on a latched fault on the vial, on stop/emergency stop, and on restart.
+- **Actions** (all recorded with operator and reason):
+
+| Action | What fires | Cap | Media / waste booked |
+|---|---|---|---|
+| Dilute X mL | influx and efflux **together** (a `fluidics.Dilution`), efflux runs `efflux_extra_seconds` longer | 30 s (`PUMP_DURATION_HARD_CAP_SECONDS`) | bottle −influx mL; waste +efflux s × influx rate — exactly as `_debit_media_locked` books an automatic dilution |
+| Influx only (spike) | influx alone (`fluidics.ManualRun`) | the headroom above the straw: `vial_capacity_ml` (40) − `volume_ml` (25) − `overflow_margin_ml` (2) = **13 mL**; typed confirmation | bottle −influx mL; waste 0 |
+| Efflux only (drain to straw) | efflux alone | 30 s | waste +efflux s × efflux rate (an upper bound: past the straw it draws air) |
+| Temperature 22–45 °C | heater setpoint | — | — |
+| Stir 0–`STIR_MAX` | composed `zv` on the next tick | — | — |
+
+  Below one second of the relevant pump is refused naming the vial's minimum (§16);
+  never truncated. There is no software stop (§16.3.5), so the caps are the exposure
+  window. Efflux cannot take a sample: it removes only liquid above the straw.
 
 ### Controller-state coherence — the correctness requirement
 
-A manual action the controller does not know about will corrupt control. The turbidostat
-tracks `last_pump_time` and a deficit accumulator; a manual dilution invisible to it will
-be followed immediately by an automatic one, double-diluting the culture.
+A manual action the controller does not know about corrupts control: a manual dilution
+invisible to the turbidostat is followed by an automatic one on its next OD tick,
+double-diluting the culture. Every override pump is therefore **booked where an
+automatic dilution is booked** — in `run_cycle`, under the engine lock, on the tick it
+fires (`take_override_pumps_locked`):
 
-Every manual action on a controlled vial must therefore be **pushed into controller
-state**, not merely executed:
+- **The interlock re-runs** (`pump_suppressed` + `override_pump_cancelled` if the
+  carboy filled or the bottle emptied since the request); maintenance or the machine
+  hold arriving after the request cancel it too — never queue it behind a pause.
+- **The controller is told** through two optional, duck-typed hooks (called via
+  `getattr`, like `pop_events`):
+  - `record_manual_dilution(now, influx_ml)` — Dilute and Influx only (both dilute the
+    culture; Efflux only does not). Turbidostat: `last_pump_time = now`, so
+    `pump_wait` counts from the manual dilution. Morbidostat: delegates to its inner
+    turbidostat. Chemostat: **additive** — `manual_volume_ml += influx_ml` (persisted),
+    schedule and deficit untouched, so the setpoint D stays the setpoint and delivered
+    D is reconstructable as scheduled + manual.
+  - `rebaseline(now)` — on release. Chemostat: `last_bolus_time = now`, so the paused
+    interval is not sized into a catch-up bolus. Turbidostat: nothing to do.
+  (The turbidostat has had no deficit accumulator since CONTROL_MODE_AUDIT T-3; the
+  state to push is `last_pump_time`.)
+- **Growth:** a boundary spanning the real pump interval, `[now, now + max(influx_s,
+  efflux_s)]` — not the zero-width boundary the manual actuator route records.
+- **Media and waste** per the table above.
 
-- Manual influx/efflux updates `last_pump_time`, debits the media bottle, credits waste,
-  and appends to the vial's pump history exactly as an automatic event would.
-- Manual temperature or stir changes either update the experiment's persisted parameters
-  (so a restart does not silently revert them) or are explicitly marked transient with a
-  stated expiry. Ambiguity here produces experiments whose actual conditions cannot be
-  reconstructed.
-- Every override writes an `events.csv` entry with operator, action, and reason, **and is
-  drawn as a marker on that vial's plots**. An unexplained step in the data six months
-  later is a research problem, not a UI problem.
+**Fluidics.** An override pump never takes a private path to the bus (CLAUDE.md facts
+8–10). The request is queued (`status: "queued"`, one per vial at a time) and handed
+back from `run_cycle` as an `OverridePumpAction`; `app._dispatch_dilutions` folds it into
+that tick's ONE schedule via `fluidics.plan_pump_schedule(dilutions, manual_runs)`. A
+Dilute is never two per-direction frames. `pump_log.csv` rows carry `source=override`.
+
+### Temperature and stir: transient or kept, the operator chooses
+
+- **Transient** (default): reverts to the vial's target when the override ends —
+  release, expiry, revocation or restart. The revert is recorded in the ending event.
+- **Keep for the rest of the run** (typed confirmation): written to `config.json` as
+  `vial_targets: {"<vial>": {"temperature_c": …, "stir_rate": …}}` and mirrored in
+  `state.json`. `run_config.temperature_c_by_vial` / `stir_by_vial` layer it over the
+  group values, so start, resume, `reapply_temperature_targets` and the per-run blank's
+  condition check all honour it. A restart or recalibration cannot silently revert it.
+
+### Restart
+
+An override grant is **not restored**. `state.json` records `overrides_active`; on
+resume those vials are put back on their targets (transient changes dropped, kept ones
+stay), control resumes, and each gets an `override_revoked` event with `cause:
+"restart"`. Simpler and safer than restoring an expiry clock on a Pi with no RTC.
+
+### Records
+
+Every grant, extension, release, expiry, revocation and action is an `events.csv` row
+in category `override` (§20.2), with operator and reason. The vial modal draws each
+override window as a shaded band on the OD and temperature charts, each override pump
+as a tick on OD and each temperature/stir change as a tick on temperature, from
+`GET /api/experiments/{name}/overrides`. Automatic-pump diamonds exclude
+`source=override` rows; the Plots tab draws override pumps as hollow diamonds.
 
 ---
 

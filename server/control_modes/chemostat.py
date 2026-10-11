@@ -152,6 +152,11 @@ class ChemostatController:
         # the shortfall when the duration cap binds stays visible instead of
         # being erased.
         self.total_volume_intended_ml: float = 0.0
+        # Media an operator added by hand during supervised overrides
+        # (SPEC §21). Additive: it never shrinks the schedule, so the
+        # setpoint D stays the setpoint and the actual delivered D is
+        # reconstructable as scheduled + manual.
+        self.manual_volume_ml: float = 0.0
         self.last_od: Optional[float] = None
         # Carries the sub-second tail of each bolus's pump_time across
         # cycles. The legacy firmware truncates sub-second commands to
@@ -346,6 +351,25 @@ class ChemostatController:
         )
 
     # ------------------------------------------------------------------
+    # Supervised override hooks (SPEC §21)
+    # ------------------------------------------------------------------
+
+    def record_manual_dilution(self, now: float, influx_ml: float) -> None:
+        """An operator added ``influx_ml`` by hand during an override.
+
+        Additive by design: booked to ``manual_volume_ml`` only. The bolus
+        clock and deficit are untouched, so the schedule neither shrinks to
+        pay the manual volume back nor treats it as a bolus."""
+        self.manual_volume_ml += max(0.0, float(influx_ml))
+
+    def rebaseline(self, now: float) -> None:
+        """Override released: automatic control was paused, so the paused
+        interval must not be sized into a catch-up bolus. Restart the
+        cadence from ``now``. A start gate still held is left alone."""
+        if self.last_bolus_time is not None:
+            self.last_bolus_time = float(now)
+
+    # ------------------------------------------------------------------
     # State persistence
     # ------------------------------------------------------------------
 
@@ -356,6 +380,7 @@ class ChemostatController:
             "bolus_cycles": self.bolus_cycles,
             "total_volume_ml": self.total_volume_ml,
             "total_volume_intended_ml": self.total_volume_intended_ml,
+            "manual_volume_ml": self.manual_volume_ml,
             "last_od": self.last_od,
             "pump_time_deficit_seconds": self.pump_time_deficit_seconds,
             "dilution_started": self.dilution_started,
@@ -390,6 +415,8 @@ class ChemostatController:
         elif "total_volume_ml" in state and state["total_volume_ml"] is not None:
             # Pre-C-4 state.json booked intent in total_volume_ml.
             self.total_volume_intended_ml = float(state["total_volume_ml"])
+        if "manual_volume_ml" in state and state["manual_volume_ml"] is not None:
+            self.manual_volume_ml = float(state["manual_volume_ml"])
         if "last_od" in state:
             v = state["last_od"]
             self.last_od = None if v is None else float(v)

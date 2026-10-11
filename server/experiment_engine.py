@@ -61,6 +61,7 @@ import fluidics
 import growth_rate as growth
 import run_config
 import vessels as vessel_lib
+from vial_override import VialOverrideMixin, VialOverride
 from vessels import KIND_MEDIA, KIND_WASTE, VesselRegistry
 from serial_manager import (
     HEATER_OFF_SETPOINT,
@@ -768,7 +769,7 @@ class _BottleField(MutableMapping):
         return len(self._engine._bottle_vessel)
 
 
-class ExperimentEngine:
+class ExperimentEngine(VialOverrideMixin):
     """Drives ONE experiment: its lifecycle, per-vial controllers, heater
     safety, media books and ``state.json``.
 
@@ -915,6 +916,14 @@ class ExperimentEngine:
         self._maintenance_reason: Optional[str] = None
         # vial -> (PumpAction, ts_iso captured at decide time)
         self._pending_pump_actions: dict[int, tuple[PumpAction, str]] = {}
+
+        # Supervised per-vial overrides (SPEC §21, vial_override.py). A vial
+        # in here has automatic control PAUSED and accepts operator pump /
+        # temperature / stir requests until it expires or is released.
+        self._overrides: dict[int, VialOverride] = {}
+        # Set by the supervisor each tick while the machine hold is on, so a
+        # queued override pump is cancelled rather than fired into the hold.
+        self.machine_held: bool = False
 
         self._experiments_root.mkdir(parents=True, exist_ok=True)
 
@@ -1444,7 +1453,9 @@ class ExperimentEngine:
             self._apply_initial_actuators_locked()
             self._preconditioned_at = _now_utc()
             self._save_state_locked()
-            targets = run_config.temperature_c_by_vial(self._groups)
+            targets = run_config.temperature_c_by_vial(
+                self._groups, self._vial_targets_locked(),
+            )
             result = {
                 "name": self._name,
                 "vials": list(self._vials),
@@ -1493,6 +1504,10 @@ class ExperimentEngine:
 
             self._assert_status(ExperimentStatus.RUNNING, ExperimentStatus.ERROR)
             name = self._name
+
+            # Every override ends with the run. No revert: the actuators are
+            # zeroed next.
+            self.revoke_overrides_locked(cause=f"stopped:{reason}", revert=False)
 
             # Zero actuators for experiment vials only (preserve others).
             self._zero_experiment_actuators_locked()
@@ -2032,6 +2047,10 @@ class ExperimentEngine:
                 ):
                     self._conditioning_cycle_locked(temperature_calibrated)
                 return []
+            # SPEC §21: re-lock any override past its expiry, on both lanes,
+            # before this tick decides anything for its vial.
+            if self._overrides:
+                self.check_override_expiry_locked(now)
             for vial in list(self._vials):
                 if self._vial_faults.get(vial) is not None:
                     continue  # latched fault — skip
@@ -2163,6 +2182,11 @@ class ExperimentEngine:
                         controller.push_od(now=now, od=float(od))
                     else:
                         controller.push_od(float(od))
+                if vial in self._overrides:
+                    # SPEC §21: automatic control is paused while an operator
+                    # holds the vial. OD was still pushed above, so the
+                    # rolling mean is fresh the moment control resumes.
+                    continue
                 action = controller.decide(now)
                 if action is not None:
                     # Engine-level hard cap (SPEC §10 confirmation rule,
@@ -2266,6 +2290,15 @@ class ExperimentEngine:
                 pump_actions_to_return: list[tuple[int, PumpAction]] = []
             else:
                 pump_actions_to_return = pump_actions
+
+            # (4e) Supervised override pumps (SPEC §21). Every tick, not just
+            # OD ticks, and AFTER the maintenance step: they are booked here
+            # and fire in this tick's one schedule, or are cancelled -- never
+            # queued behind a pause the operator did not ask to wait for.
+            if self._overrides:
+                pump_actions_to_return = list(pump_actions_to_return) + list(
+                    self.take_override_pumps_locked(now, timestamp_iso)
+                )
 
             # (6) persist. Unconditional on an OD tick; on a fast tick only
             # when something that matters to a resume actually moved (a heater
@@ -2437,6 +2470,8 @@ class ExperimentEngine:
                 "setpoint_stir": self._uniform_stir_locked(),
                 "media": self._media_status_locked(),
                 "maintenance": self._maintenance_status_locked(),
+                # SPEC §21: {vial: {operator, reason, expires_at, ...}}.
+                "overrides": self.overrides_status_locked(),
                 "morbidostat": self._morbidostat_status_locked(),
             }
 
@@ -3531,6 +3566,10 @@ class ExperimentEngine:
             vial=vial,
             category="heater",
         )
+        # An operator's override never outlives a safety latch. The heater
+        # stays parked: _end_override_locked never reverts a faulted vial.
+        if vial in self._overrides:
+            self._end_override_locked(vial, "override_revoked", cause=f"fault:{kind}")
 
     # ------------------------------------------------------------------
     # Actuator helpers (must hold self._lock)
@@ -3542,13 +3581,17 @@ class ExperimentEngine:
         stir PWM, then send ``set_temperature_raw`` and ``set_stir``.
         Preserves non-experiment vials' existing setpoints (which default to
         HEATER_OFF_SETPOINT)."""
-        target_temps = run_config.temperature_c_by_vial(self._groups)
+        target_temps = run_config.temperature_c_by_vial(
+            self._groups, self._vial_targets_locked(),
+        )
         if self._temp_cal is None:
             raise RuntimeError(
                 "temp_cal is None — engine cannot convert °C to raw setpoint. "
                 "Load calibration first."
             )
-        self._stir_by_vial = run_config.stir_by_vial(self._groups)
+        self._stir_by_vial = run_config.stir_by_vial(
+            self._groups, self._vial_targets_locked(),
+        )
         # Build the full 16-vial raw-setpoint list, splicing in experiment vials
         # only. Vials outside the experiment keep whatever the manager last sent
         # (defaults to HEATER_OFF_SETPOINT on fresh init).
@@ -3605,7 +3648,9 @@ class ExperimentEngine:
         with self._lock:
             if self._temp_cal is None:
                 return []
-            targets = run_config.temperature_c_by_vial(self._groups)
+            targets = run_config.temperature_c_by_vial(
+                self._groups, self._vial_targets_locked(),
+            )
             changed: list[int] = []
             for vial in self._vials:
                 if self._vial_faults.get(vial) is not None:
@@ -3979,6 +4024,11 @@ class ExperimentEngine:
             "groups": (self._config or {}).get("groups"),
             "operator": (self._config or {}).get("operator", ""),
             "expected_end": (self._config or {}).get("expected_end"),
+            # SPEC §21: targets an operator kept for the rest of the run, and
+            # which vials were overridden -- a restart revokes those grants
+            # and reverts their transient changes (resume_from_state).
+            "vial_targets": (self._config or {}).get("vial_targets") or {},
+            "overrides_active": sorted(self._overrides),
             "setpoint_raw": dict(self._setpoint_raw),
             "stir_by_vial": {str(k): v for k, v in self._stir_by_vial.items()},
             "preconditioned_at": (
@@ -4095,6 +4145,8 @@ class ExperimentEngine:
             }
             if state.get("groups"):
                 self._config["groups"] = state["groups"]
+            if state.get("vial_targets"):
+                self._config["vial_targets"] = state["vial_targets"]
             self._vials = sorted(int(v) for v in state.get("vials", []))
             self._set_groups_locked(
                 run_config.groups_from_config(self._config, supported_modes())
@@ -4206,6 +4258,18 @@ class ExperimentEngine:
                 log.exception("data_logger.activate_experiment failed on resume")
                 raise
 
+            # SPEC §21: an override grant does not survive a restart. Its
+            # transient heater/stir changes were restored verbatim above, so
+            # put those vials back on their targets (group value, or a kept
+            # vial_targets value) before anything is re-sent. Recorded after
+            # the logger is active, so the revocation lands in events.csv.
+            revoked = sorted(
+                int(v) for v in (state.get("overrides_active") or [])
+                if int(v) in self._vials
+            )
+            if revoked:
+                self._revoke_after_restart_locked(revoked)
+
             # Re-send the heater + stir setpoints
             try:
                 self._apply_temperature_locked()
@@ -4256,6 +4320,8 @@ class ExperimentEngine:
         self._maintenance_entered_at = None
         self._maintenance_reason = None
         self._pending_pump_actions = {}
+        self._overrides = {}
+        self.machine_held = False
 
     def _register_owned_vessels_locked(self, name: str, media: dict) -> None:
         for b in media["bottles"]:

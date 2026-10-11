@@ -73,6 +73,13 @@ from supervisor import (  # noqa: E402
 from mock_serial_manager import MockSerialManager  # noqa: E402
 from serial_manager import HEATER_OFF_SETPOINT, MAX_SAFE_TEMP_C  # noqa: E402
 from watchdog import Watchdog  # noqa: E402
+from vial_override import (  # noqa: E402
+    OVERRIDE_DEFAULT_MINUTES,
+    OverrideError,
+    OverridePumpAction,
+    override_history,
+)
+from data_logger import _VALID_NAME  # noqa: E402
 
 N_VIALS = 16
 STIR_MAX = 15
@@ -516,6 +523,8 @@ def _event_message(kind: str, payload: dict) -> str:
             f"Pump suppressed for vial {vial}: "
             f"{payload.get('reason', 'unknown reason')}"
         )
+    if kind.startswith("override_"):
+        return _override_message(kind, payload)
     if kind == "created" and payload.get("groups"):
         groups = "; ".join(
             f"{g.get('name')} ({g.get('mode')}, vials "
@@ -581,6 +590,52 @@ def _event_message(kind: str, payload: dict) -> str:
             f"Mass reconciliation for '{name}': "
             f"{'within' if ok else 'OUTSIDE'} ±10 %"
         )
+    return kind.replace("_", " ")
+
+
+def _override_message(kind: str, payload: dict) -> str:
+    """The events.csv line for a supervised override event (SPEC §21). Names
+    the operator and their reason on every line, because the point of the
+    record is that an unexplained step in the data can be explained."""
+    vial = payload.get("vial")
+    who = payload.get("operator") or "?"
+    why = payload.get("reason") or ""
+    tail = f" — {who}: {why}" if why else f" — {who}"
+    if kind == "override_granted":
+        return (f"Vial {vial} unlocked for {payload.get('duration_minutes', 0):g} min, "
+                f"automatic control paused{tail}")
+    if kind == "override_extended":
+        return f"Vial {vial} override extended to {payload.get('expires_at')}{tail}"
+    if kind in ("override_released", "override_expired", "override_revoked"):
+        verb = {"override_released": "released",
+                "override_expired": "expired",
+                "override_revoked": "revoked"}[kind]
+        cause = payload.get("cause")
+        by = payload.get("released_by")
+        extra = f" by {by}" if by else ""
+        extra += f" ({cause})" if cause else ""
+        return (f"Vial {vial} override {verb}{extra}; re-locked, automatic "
+                f"control resumed")
+    if kind == "override_pump":
+        action = payload.get("action")
+        if action == "efflux":
+            what = f"efflux-only {payload.get('efflux_s')} s"
+        elif action == "influx":
+            what = (f"influx-only {payload.get('influx_ml', 0):.1f} mL "
+                    f"({payload.get('influx_s')} s)")
+        else:
+            what = (f"dilution {payload.get('influx_ml', 0):.1f} mL "
+                    f"(influx {payload.get('influx_s')} s, efflux "
+                    f"{payload.get('efflux_s')} s)")
+        return f"Vial {vial} manual {what}{tail}"
+    if kind == "override_pump_cancelled":
+        return (f"Vial {vial} override pump cancelled "
+                f"({payload.get('cause') or payload.get('detail') or 'cancelled'})")
+    if kind in ("override_temperature", "override_stir"):
+        label = "temperature" if kind == "override_temperature" else "stir"
+        unit = " °C" if kind == "override_temperature" else ""
+        return (f"Vial {vial} {label} {payload.get('old')}{unit} -> "
+                f"{payload.get('new')}{unit} ({payload.get('persistence')}){tail}")
     return kind.replace("_", " ")
 
 
@@ -773,6 +828,16 @@ def create_app(use_mock: bool):
         "calibration_installed": (evlog.LEVEL_INFO, evlog.CATEGORY_CALIBRATION),
         "reconciliation": (evlog.LEVEL_INFO, evlog.CATEGORY_CALIBRATION),
         "od_recalibrated": (evlog.LEVEL_INFO, evlog.CATEGORY_CALIBRATION),
+        # Supervised per-vial override (SPEC §21).
+        "override_granted": (evlog.LEVEL_WARNING, evlog.CATEGORY_OVERRIDE),
+        "override_extended": (evlog.LEVEL_INFO, evlog.CATEGORY_OVERRIDE),
+        "override_released": (evlog.LEVEL_INFO, evlog.CATEGORY_OVERRIDE),
+        "override_expired": (evlog.LEVEL_WARNING, evlog.CATEGORY_OVERRIDE),
+        "override_revoked": (evlog.LEVEL_WARNING, evlog.CATEGORY_OVERRIDE),
+        "override_pump": (evlog.LEVEL_INFO, evlog.CATEGORY_OVERRIDE),
+        "override_pump_cancelled": (evlog.LEVEL_WARNING, evlog.CATEGORY_OVERRIDE),
+        "override_temperature": (evlog.LEVEL_INFO, evlog.CATEGORY_OVERRIDE),
+        "override_stir": (evlog.LEVEL_INFO, evlog.CATEGORY_OVERRIDE),
     }
 
     def _emit_alert(
@@ -1469,6 +1534,7 @@ def create_app(use_mock: bool):
                 vial=int(vial),
                 direction=direction,
                 duration_seconds=float(seconds),
+                source="manual",
             )
         except Exception:
             # Silent data loss: the pump fired but the CSV never got the row.
@@ -1493,6 +1559,111 @@ def create_app(use_mock: bool):
             response["delivered_ml"] = round(delivered_ml, 4)
             response["seconds"] = int(seconds)
         return jsonify(**response)
+
+    # ------------------- Supervised per-vial override (SPEC §21) -------------
+    # A vial a running experiment drives stays locked to /api/actuators/*.
+    # These routes are its own audited door: an explicit, time-limited unlock
+    # of ONE vial (vial_override.py), every action under which is pushed into
+    # the owning controller's state and recorded with operator and reason.
+
+    def _override_route(call):
+        """Run an override call; map its refusals to stable HTTP answers."""
+        if state.engine is None:
+            return jsonify(error="engine not available"), 503
+        blocked = _tier3_in_progress()
+        if blocked is not None:
+            return blocked
+        try:
+            return jsonify(call())
+        except OverrideError as exc:
+            return jsonify(error=str(exc), code=exc.code), exc.status
+        except InvalidExperimentStateError as exc:
+            return jsonify(error=str(exc)), 409
+        except ValueError as exc:
+            return jsonify(error=str(exc)), 400
+
+    def _keep_flag(body: dict) -> bool:
+        keep = body.get("keep", False)
+        if not isinstance(keep, bool):
+            raise ValueError("'keep' must be true or false")
+        return keep
+
+    @flask_app.route("/api/vials/<int:vial>/override", methods=["POST"])
+    def api_override_grant(vial):
+        """Unlock ``vial`` of the experiment running it. Body:
+        ``{"operator", "reason", "duration_minutes"=10}`` (max 30). Re-POSTing
+        on an unlocked vial extends it from now."""
+        body = request.get_json(silent=True) or {}
+        return _override_route(lambda: state.engine.grant_override(
+            vial, body.get("operator"), body.get("reason"),
+            body.get("duration_minutes", OVERRIDE_DEFAULT_MINUTES),
+        ))
+
+    @flask_app.route("/api/vials/<int:vial>/override/release", methods=["POST"])
+    def api_override_release(vial):
+        body = request.get_json(silent=True) or {}
+        return _override_route(
+            lambda: state.engine.release_override(vial, body.get("operator") or "")
+        )
+
+    @flask_app.route("/api/vials/<int:vial>/override/pump/preview", methods=["POST"])
+    def api_override_pump_preview(vial):
+        """What an override pump would fire -- whole seconds per side, the
+        deliverable volume, the cap -- with no side effects."""
+        body = request.get_json(silent=True) or {}
+        return _override_route(lambda: state.engine.override_pump_preview(
+            vial, body.get("action"), body.get("volume_ml"),
+        ))
+
+    @flask_app.route("/api/vials/<int:vial>/override/pump", methods=["POST"])
+    def api_override_pump(vial):
+        """Queue ``{"action": "dilute"|"influx"|"efflux", "volume_ml"}`` on
+        an unlocked vial. It is booked and fired on the next tick, inside that
+        tick's single pump schedule; the answer is ``status: queued``."""
+        body = request.get_json(silent=True) or {}
+        return _override_route(lambda: state.engine.override_pump(
+            vial, body.get("action"), body.get("volume_ml"),
+        ))
+
+    @flask_app.route("/api/vials/<int:vial>/override/temperature", methods=["POST"])
+    def api_override_temperature(vial):
+        """``{"celsius", "keep": false}``. ``keep`` makes it the vial's target
+        for the rest of the run; otherwise it reverts when the override ends."""
+        body = request.get_json(silent=True) or {}
+        return _override_route(lambda: state.engine.override_temperature(
+            vial, body.get("celsius"), _keep_flag(body),
+        ))
+
+    @flask_app.route("/api/vials/<int:vial>/override/stir", methods=["POST"])
+    def api_override_stir(vial):
+        """``{"value": 0..STIR_MAX, "keep": false}`` -- as temperature."""
+        body = request.get_json(silent=True) or {}
+        return _override_route(lambda: state.engine.override_stir(
+            vial, body.get("value"), _keep_flag(body),
+        ))
+
+    @flask_app.route("/api/overrides", methods=["GET"])
+    def api_overrides():
+        """Every active override, ``{vial: {...}}``."""
+        if state.engine is None:
+            return jsonify({})
+        return jsonify(state.engine.overrides_status())
+
+    @flask_app.route("/api/experiments/<name>/overrides", methods=["GET"])
+    def api_experiment_overrides(name):
+        """Override windows and actions for the vial plots, from the run's
+        events.csv. ``?vial=N`` narrows to one vial."""
+        if not _VALID_NAME.match(name or ""):
+            return jsonify(error="invalid experiment name"), 400
+        exp_dir = EXPERIMENTS_DIR / name
+        if not (exp_dir / "config.json").is_file():
+            return jsonify(error=f"experiment '{name}' not found"), 404
+        vial_arg = request.args.get("vial")
+        try:
+            vial = int(vial_arg) if vial_arg not in (None, "") else None
+        except ValueError:
+            return jsonify(error="'vial' must be an integer"), 400
+        return jsonify(override_history(exp_dir / "events.csv", vial))
 
     @flask_app.route("/api/actuators/emergency_stop", methods=["POST"])
     def api_emergency_stop():
@@ -2957,6 +3128,10 @@ def create_app(use_mock: bool):
             "grouped": bool(s.get("grouped")),
             "preconditioned": bool(s.get("preconditioned")),
             "elapsed_hours": s.get("elapsed_hours"),
+            # SPEC §21: active overrides, {vial: {operator, reason,
+            # expires_in_seconds, pending_pump, ...}} -- the dashboard's
+            # countdown re-syncs from this every tick.
+            "overrides": s.get("overrides") or {},
             "media_summary": media_summary,
             "maintenance": s.get("maintenance"),
             "escalation_pending_vials": escalation_pending,
@@ -3061,16 +3236,27 @@ def create_app(use_mock: bool):
         ``pump_batch`` event."""
         planned = []
         for vial, action, ts_iso in entries:
-            influx_s, efflux_s = fluidics.quantise_dilution(
-                action.pump_time, action.efflux_extra_seconds
-            )
-            planned.append(
-                (fluidics.Dilution(int(vial), influx_s, efflux_s), action, ts_iso)
-            )
-        frames = fluidics.plan_dilution_frames(d for d, _, _ in planned)
+            if isinstance(action, OverridePumpAction):
+                # SPEC §21: an operator's pump on an overridden vial, already
+                # booked by the engine. A Dilute is a Dilution (paired, the
+                # overrun its tail); influx- or efflux-only is a ManualRun.
+                entry = action.schedule_entry(int(vial))
+            else:
+                influx_s, efflux_s = fluidics.quantise_dilution(
+                    action.pump_time, action.efflux_extra_seconds
+                )
+                entry = fluidics.Dilution(int(vial), influx_s, efflux_s)
+            planned.append((entry, action, ts_iso))
+        frames = fluidics.plan_pump_schedule(
+            (d for d, _, _ in planned if isinstance(d, fluidics.Dilution)),
+            (d for d, _, _ in planned if isinstance(d, fluidics.ManualRun)),
+        )
         if not frames:
             return
-        vials = [d.vial for d, _, _ in planned if d.influx_s > 0]
+        # A Dilution that quantised to 0 s is skipped by the planner; a
+        # ManualRun always runs at least one pump.
+        vials = [d.vial for d, _, _ in planned
+                 if isinstance(d, fluidics.ManualRun) or d.influx_s > 0]
         alert_vial = vials[0] if len(vials) == 1 else None
 
         if len(frames) > fluidics.FIRMWARE_QUEUE_VERIFIED_FRAMES:
@@ -3122,6 +3308,7 @@ def create_app(use_mock: bool):
         # failed part-way.
         dispatched = fluidics.seconds_per_pump(fired)
         for d, action, ts_iso in planned:
+            source = "override" if isinstance(action, OverridePumpAction) else "auto"
             for direction in ("influx", "efflux"):
                 seconds = dispatched.get(fluidics.pump_index(d.vial, direction), 0)
                 if seconds <= 0:
@@ -3133,6 +3320,7 @@ def create_app(use_mock: bool):
                         direction=direction,
                         duration_seconds=float(seconds),
                         od_at_pump=action.average_od,
+                        source=source,
                     )
                 except Exception:
                     log.exception(
@@ -3151,6 +3339,7 @@ def create_app(use_mock: bool):
                     "direction": direction,
                     "duration_seconds": float(seconds),
                     "average_od": action.average_od,
+                    "source": source,
                     "timestamp": ts_iso,
                 })
 

@@ -11,7 +11,8 @@ Protocol (CLAUDE.md):
   Inbound  prefixes: temp, turb
 
   Stir and fluidics are write-only; temperature and OD elicit a response.
-  >=50 ms between commands; 5 s read timeout; on timeout / malformed
+  >=50 ms between commands, >=100 ms of quiet bus when the next command goes
+  to a different Arduino; 5 s read timeout; on timeout / malformed
   response, log and continue (never hang).
 """
 
@@ -39,7 +40,19 @@ N_VIALS = 16
 DEFAULT_PORT = "/dev/ttyAMA0"
 DEFAULT_BAUDRATE = 9600
 DEFAULT_TIMEOUT_SECONDS = 5.0
-MIN_INTER_COMMAND_SECONDS = 0.050  # CLAUDE.md: 50 ms minimum between commands
+# CLAUDE.md: 50 ms minimum between commands -- measured from the END of the
+# previous frame's transmission (_write drains the UART before stamping).
+MIN_INTER_COMMAND_SECONDS = 0.050
+# Quiet bus before a frame addressed to a DIFFERENT Arduino than the previous
+# frame, measured from the end of that frame or of the reply to it. All four
+# Arduinos hear all traffic, and one still digesting it loses bytes of a frame
+# that arrives with no gap. Measured 2026-10-11, replaying the 10 s tick on the
+# rig: an `xr` sent straight behind a `zv` went unanswered 85/100 times, 0/100
+# with this gap. Back-to-back `we` reads to the OD Arduino never failed. A
+# write-only frame loses bytes silently: the stir firmware has no ceiling, so a
+# lost comma turns `zv10,10,...` into one vial at 1010 -- the intermittent
+# runaway stir -- and a lost mask digit fires the wrong pump.
+ADDRESS_CHANGE_QUIET_SECONDS = 0.100
 
 PREFIX_FLUIDICS = "st"
 PREFIX_STIR = "zv"
@@ -430,6 +443,8 @@ class SerialManager(OdCurveMixin):
         self._ser = ser
         self._lock = threading.Lock()
         self._last_command_time = 0.0  # monotonic seconds; 0 means "never sent"
+        self._last_rx_time = 0.0       # when the last read returned; 0 = never
+        self._last_prefix: Optional[str] = None  # address of the last frame sent
 
         # IMPORTANT: heater state defaults to OFF (4095), not 0. Under the
         # inverted convention 0 is the HOTTEST possible setpoint, so any
@@ -509,21 +524,66 @@ class SerialManager(OdCurveMixin):
     # Low-level RS485 (must hold self._lock)
     # ------------------------------------------------------------------
 
-    def _wait_inter_command(self) -> None:
-        elapsed = time.monotonic() - self._last_command_time
-        if 0.0 <= elapsed < MIN_INTER_COMMAND_SECONDS:
-            time.sleep(MIN_INTER_COMMAND_SECONDS - elapsed)
+    def _wait_inter_command(self, prefix: str) -> float:
+        """Sleep until the bus has been quiet long enough for a ``prefix``
+        frame: MIN_INTER_COMMAND_SECONDS after our last frame finished
+        transmitting, and -- when ``prefix`` addresses a different Arduino
+        than that frame -- ADDRESS_CHANGE_QUIET_SECONDS after the later of
+        that frame and its reply. Returns how long the bus has been quiet."""
+        now = time.monotonic()
+        wait = self._last_command_time + MIN_INTER_COMMAND_SECONDS - now
+        if prefix != self._last_prefix:
+            last_activity = max(self._last_command_time, self._last_rx_time)
+            wait = max(wait, last_activity + ADDRESS_CHANGE_QUIET_SECONDS - now)
+        wait = min(wait, max(MIN_INTER_COMMAND_SECONDS, ADDRESS_CHANGE_QUIET_SECONDS))
+        if wait > 0.0:
+            time.sleep(wait)
+            now = time.monotonic()
+        return now - max(self._last_command_time, self._last_rx_time)
 
-    def _write(self, prefix: str, body: str) -> None:
-        self._wait_inter_command()
+    def _discard_input(self) -> None:
+        """Drop stale received bytes before a request. A reply that arrived
+        after its read timed out would otherwise be taken as the NEXT
+        request's reply, leaving every later read one frame behind -- and
+        every later write going out while an Arduino is still answering."""
+        reset = getattr(self._ser, "reset_input_buffer", None)
+        if reset is None:
+            return
+        try:
+            reset()
+        except Exception:
+            log.exception("serial input reset failed")
+
+    def _write(self, prefix: str, body: str, *, discard_input: bool = False) -> None:
+        quiet = self._wait_inter_command(prefix)
+        if discard_input:
+            self._discard_input()
         message = f"{prefix}{body}{COMMAND_TERMINATOR}"
+        if prefix in (PREFIX_STIR, PREFIX_FLUIDICS):
+            log.debug("bus quiet %.0f ms before %r", quiet * 1000.0, message)
+        self._last_prefix = prefix
         try:
             self._ser.write(message.encode("ascii"))
         except Exception:
             log.exception("serial write failed (message=%r)", message)
-            raise
-        finally:
             self._last_command_time = time.monotonic()
+            raise
+        # pyserial's write returns once the bytes are QUEUED; drain the UART so
+        # the spacing above is measured from the end of this frame, not its
+        # start (a 16-value zv frame alone takes ~40-55 ms at 9600 baud). The
+        # frame is already queued, so a failed drain costs only the spacing.
+        flush = getattr(self._ser, "flush", None)
+        if flush is not None:
+            try:
+                flush()
+            except Exception:
+                log.exception("serial flush failed (message=%r)", message)
+        self._last_command_time = time.monotonic()
+
+    def _request(self, prefix: str, body: str, expected_prefix: str) -> Optional[list[float]]:
+        """One request/response transaction (``xr``->``temp``, ``we``->``turb``)."""
+        self._write(prefix, body, discard_input=True)
+        return self._read_response(expected_prefix)
 
     def _read_response(self, expected_prefix: str) -> Optional[list[float]]:
         try:
@@ -531,6 +591,9 @@ class SerialManager(OdCurveMixin):
         except Exception:
             log.exception("serial read failed (expected '%s...end')", expected_prefix)
             return None
+        finally:
+            # Any outcome, a timeout included: a late reply may be starting.
+            self._last_rx_time = time.monotonic()
         if not raw:
             log.warning(
                 "serial read timed out (no response, expected '%s...end')",
@@ -565,8 +628,7 @@ class SerialManager(OdCurveMixin):
         16 raw thermistor ADC counts (NaN on a dropped read). Records them as
         ``last_temperature_raw``."""
         body = self._format_csv(self.temp_setpoint_raw)
-        self._write(PREFIX_TEMPERATURE, body)
-        values = self._read_response(RESPONSE_TEMP)
+        values = self._request(PREFIX_TEMPERATURE, body, RESPONSE_TEMP)
         if values is None:
             raw = np.full(N_VIALS, np.nan)
         else:
@@ -583,8 +645,7 @@ class SerialManager(OdCurveMixin):
     def _read_od_locked(self, led_power: int) -> list[float]:
         led = int(np.clip(led_power, 0, OD_LED_MAX))
         body = self._format_csv(np.full(N_VIALS, led))
-        self._write(PREFIX_OD, body)
-        values = self._read_response(RESPONSE_OD)
+        values = self._request(PREFIX_OD, body, RESPONSE_OD)
         if values is None:
             return [float("nan")] * N_VIALS
         raw = np.asarray(values)
@@ -603,8 +664,7 @@ class SerialManager(OdCurveMixin):
         drops out of the per-vial aggregation."""
         rows: list[list[float]] = []
         for _ in range(n):
-            self._write(PREFIX_OD, body)
-            values = self._read_response(RESPONSE_OD)
+            values = self._request(PREFIX_OD, body, RESPONSE_OD)
             if values is None:
                 rows.append([float("nan")] * N_VIALS)
             else:
@@ -857,8 +917,13 @@ class SerialManager(OdCurveMixin):
             )
         speeds = np.clip(speeds, 0, STIR_MAX)
         with self._lock:
+            changed = not np.array_equal(speeds, self.stir_speed)
             self.stir_speed = speeds
             self._write(PREFIX_STIR, self._format_csv(speeds))
+        if changed:
+            # Only on change, so the log is a record of every stir vector ever
+            # commanded -- what to check a runaway-stir episode against.
+            log.info("stir set to %s", ",".join(str(int(v)) for v in speeds))
 
     def pump_command(self, vial: int, direction: str, seconds: float) -> None:
         """Fire one pump. A single-bit :meth:`pump_mask_command`; manual
@@ -943,8 +1008,9 @@ class SerialManager(OdCurveMixin):
                 log.exception("emergency_shutdown: stir zero failed")
             try:
                 self.temp_setpoint_raw = off_setpoints
-                self._write(PREFIX_TEMPERATURE, self._format_csv(off_setpoints))
                 # xr elicits a temp response — drain it so the next read isn't desynced.
-                self._read_response(RESPONSE_TEMP)
+                self._request(
+                    PREFIX_TEMPERATURE, self._format_csv(off_setpoints), RESPONSE_TEMP,
+                )
             except Exception:
                 log.exception("emergency_shutdown: heater park-off failed")

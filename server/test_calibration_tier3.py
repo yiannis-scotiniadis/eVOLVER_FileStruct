@@ -839,6 +839,13 @@ SERIES_LEVELS = [0.0, 0.05, 0.1, 0.2, 0.4, 0.8, 1.2, 1.6, 2.0]
 DARK = 1200.0
 
 
+# What the rig's LED-off read returns: the photodiode front end inverts, so
+# no light reads near the ADC rail, ABOVE every LED-on read (measured
+# 2026-10-11: 64 100-65 000 on every vial, while LED-on fell from 64 485 for
+# a blank to 26 884 for a dense vial).
+RAIL = 64_900.0
+
+
 def _true_ds_rows() -> np.ndarray:
     """The 2016 curves on dark-subtracted signal, blank-anchored at 58 000."""
     rows = LEGACY_OD.copy()
@@ -849,12 +856,22 @@ def _true_ds_rows() -> np.ndarray:
     return rows
 
 
-class OdRig:
-    """collect_od_raw stand-in: LED 0 reads the per-vial dark floor; a lit
-    LED reads dark + S_true(OD) from a true dark-subtracted curve."""
+def _true_raw_rows() -> np.ndarray:
+    """The 2016 curves on raw LED-on signal, blank-anchored at 58 000 -- the
+    space the series fits in."""
+    rows = LEGACY_OD.copy()
+    a, b, _c, d = rows
+    rows[2] = np.log10((b - a) / (58000.0 - a) - 1.0) / d
+    return rows
 
-    def __init__(self, rows=None, dark=DARK):
-        self.rows = _true_ds_rows() if rows is None else np.asarray(rows, float)
+
+class OdRig:
+    """collect_od_raw stand-in that behaves like the rig: a lit LED reads
+    S_true(OD) from the true RAW curve, and LED 0 reads the ADC rail --
+    above every lit read, as measured."""
+
+    def __init__(self, rows=None, dark=RAIL):
+        self.rows = _true_raw_rows() if rows is None else np.asarray(rows, float)
         self.dark = np.full(N_VIALS, float(dark))
         self.od = np.zeros(N_VIALS)
         self.sd = np.full(N_VIALS, 20.0)
@@ -870,7 +887,7 @@ class OdRig:
     def collect_od_raw(self, led_power, n_samples=5):
         leds = led_power if isinstance(led_power, (list, tuple)) else [led_power] * N_VIALS
         a, b, c, d = self.rows
-        lit = self.dark + F.signal_from_od(self.od, a, b, c, d) + self.lit_offset
+        lit = F.signal_from_od(self.od, a, b, c, d) + self.lit_offset
         med = [self.dark[v] if leds[v] == 0 else lit[v] for v in range(N_VIALS)]
         return {"median": [float(x) for x in med], "sd": self.sd.tolist(),
                 "n_valid": [n_samples] * N_VIALS}
@@ -912,7 +929,7 @@ def _od(rows, v, s):
     return float(F.od_from_signal(s, a, b, c, d))
 
 
-def test_series_recovers_the_true_curve_and_installs_it_dark_subtracted():
+def test_series_recovers_the_true_curve_and_installs_it_on_raw_signal():
     with tempfile.TemporaryDirectory() as tmp:
         rig = OdRig()
         svc = _series_service(Path(tmp), rig)
@@ -924,8 +941,17 @@ def test_series_recovers_the_true_curve_and_installs_it_dark_subtracted():
         assert out["profile_id"] == ORGANISM_ID and out["new_profile"] is True
         env = svc.store.get_od_profile(ORGANISM_ID)
         rows = np.asarray(env["data"]["rows"])
-        assert np.allclose(rows, rig.rows, rtol=1e-6), np.abs(rows / rig.rows - 1).max()
-        assert env["data"]["dark_subtracted"] is True
+        ods = np.linspace(0.0, 2.0, 201)
+        for v in range(N_VIALS):
+            # Where the upper asymptote is identifiable the parameters come
+            # back exactly; where it is a long extrapolation (b_at_bound) only
+            # the OD over the measured range is meaningful.
+            if not out["review"][str(v)]["b_at_bound"]:
+                assert np.allclose(rows[:, v], rig.rows[:, v], rtol=1e-6), v
+            back = F.od_from_signal(F.signal_from_od(ods, *rig.rows[:, v]), *rows[:, v])
+            assert np.nanmax(np.abs(back - ods)) < 0.01, v
+        assert env["data"]["dark_subtracted"] is False
+        assert env["conditions"]["dark_subtracted"] is False
         assert env["profile"] == {"id": ORGANISM_ID, "organism": ORGANISM}
         assert env["fit"]["per_vial_source"] == [OD_SERIES_SOURCE] * N_VIALS
         assert env["conditions"]["standard"] == "heat-killed E. coli"
@@ -941,26 +967,24 @@ def test_series_recovers_the_true_curve_and_installs_it_dark_subtracted():
         assert svc.tier3_status() is None
 
 
-def test_five_priority_vials_install_dark_subtracted_and_convert_the_rest_exactly():
+def test_five_priority_vials_install_and_carry_the_rest_unchanged():
     """SPEC §19.5's short-bench-time recommendation. The other eleven keep
-    their 2016 curve, shifted to dark-subtracted signal: same OD from S - D
-    as the old curve gave from S."""
+    their 2016 curve exactly: it is on raw signal, the space the series
+    fits in, so nothing is converted."""
     with tempfile.TemporaryDirectory() as tmp:
         rig = OdRig()
         svc = _series_service(Path(tmp), rig)
         _run_series(svc, rig, vials=[0, 1, 6, 14, 15])
         out = svc.series_finish()
         assert out["measured_vials"] == [0, 1, 6, 14, 15]
-        assert out["converted_vials"] == [2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13]
+        assert out["converted_vials"] == []
         env = svc.store.get_od_profile(ORGANISM_ID)
         rows = np.asarray(env["data"]["rows"])
-        for v in out["converted_vials"]:
-            for s in (40_000.0, 50_000.0, 57_000.0):
-                if LEGACY_OD[0, v] < s < LEGACY_OD[1, v]:
-                    assert abs(_od(rows, v, s - DARK) - _od(LEGACY_OD, v, s)) < 1e-9
+        carried = [2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13]
+        assert np.array_equal(rows[:, carried], LEGACY_OD[:, carried])
         src = env["fit"]["per_vial_source"]
         assert src[0] == OD_SERIES_SOURCE and src[2] == "legacy-import-2016"
-        assert env["data"]["dark_subtracted"] is True
+        assert env["data"]["dark_subtracted"] is False
         # Only the five were measured FOR this organism; the rest are the
         # default curve carried in, and the profile says so.
         assert svc.store.od_vials_measured(ORGANISM_ID, env) == [0, 1, 6, 14, 15]
@@ -1022,14 +1046,37 @@ def test_series_discard_and_signal_below_dark():
         assert svc.series_fit()["qc"]["passed"] is False
         svc.series_discard(bad)
         assert svc.series_fit()["qc"]["passed"] is True
-        # LED-on not above the dark: rejected, not recorded.
+        # A non-positive LED-on reading: rejected, not recorded.
         rig.lit_offset[9] = -1e6
         try:
             svc.series_point(entries=[{"vial": 9, "spec_reading": 0.3}])
         except ValueError as exc:
-            assert "not above the dark" in str(exc)
+            assert "not positive" in str(exc)
         else:
-            raise AssertionError("recorded a point whose signal was below the dark")
+            raise AssertionError("recorded a point with a non-positive LED-on reading")
+
+
+def test_led_off_reading_above_led_on_is_recorded_not_subtracted():
+    """The rig, 2026-10-11: LED-off read ~64 500 on every vial, above every
+    LED-on read. The series refused every point ("LED-on 64485 is not above
+    the dark 64987"). The fit signal is the raw LED-on reading; the LED-off
+    read is kept on the point as a diagnostic."""
+    with tempfile.TemporaryDirectory() as tmp:
+        rig = OdRig()
+        svc = _series_service(Path(tmp), rig)
+        svc.series_start({"operator": "t", "vials": [0, 9], "new_organism": ORGANISM})
+        svc.series_apply()
+        rig.set_od([0], 0.0)
+        rig.set_od([9], 1.6)
+        out = svc.series_point(entries=[{"vial": 0, "spec_reading": 0.0},
+                                        {"vial": 9, "spec_reading": 0.4,
+                                         "dilution_factor": 4}])
+        assert out["rejected"] == []
+        by_vial = {p["vial"]: p for p in out["captured"]}
+        for v in (0, 9):
+            p = by_vial[v]
+            assert p["dark_median"] == RAIL > p["lit_median"]
+            assert p["signal"] == p["lit_median"]
 
 
 def test_series_survives_a_restart_suspended_with_its_points():

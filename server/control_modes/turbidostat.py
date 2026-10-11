@@ -319,6 +319,24 @@ class TurbidostatController:
         )
 
     # ------------------------------------------------------------------
+    # Supervised override hooks (SPEC §21)
+    # ------------------------------------------------------------------
+
+    def record_manual_dilution(self, now: float, influx_ml: float) -> None:
+        """An operator diluted this vial by hand during an override.
+
+        Restarts the ``pump_wait`` refractory clock exactly as an automatic
+        dilution does, so the controller cannot follow the manual dilution
+        with an automatic one -- the double-dilution SPEC §21 exists to
+        prevent. The hysteresis target is left alone: it re-derives from the
+        rolling mean every cycle."""
+        self.last_pump_time = float(now)
+
+    def rebaseline(self, now: float) -> None:
+        """Override released. Nothing to do: ``decide()`` sizes from fresh OD
+        and ``last_pump_time`` already reflects any manual dilution."""
+
+    # ------------------------------------------------------------------
     # State persistence
     # ------------------------------------------------------------------
 

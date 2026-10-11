@@ -191,6 +191,27 @@ def decompose(runs: Mapping[int, int]) -> list[Frame]:
     return frames
 
 
+@dataclass(frozen=True)
+class ManualRun:
+    """One vial's operator-commanded pump runs during a supervised override
+    (SPEC §21). Unlike :class:`Dilution`, either side may be zero -- an
+    influx-only spike or an efflux-only drain to the straw -- and there is no
+    ``efflux_s >= influx_s`` rule. A paired manual dilution is a
+    :class:`Dilution`, never a ``ManualRun``, so it keeps the overrun tail."""
+
+    vial: int
+    influx_s: int
+    efflux_s: int
+
+    def __post_init__(self) -> None:
+        for side in ("influx_s", "efflux_s"):
+            v = getattr(self, side)
+            if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+                raise ValueError(f"vial {self.vial}: {side} must be an int >= 0, got {v!r}")
+        if self.influx_s == 0 and self.efflux_s == 0:
+            raise ValueError(f"vial {self.vial}: a manual run must run at least one pump")
+
+
 def plan_dilution_frames(dilutions: Iterable[Dilution]) -> list[Frame]:
     """One cycle's dilutions as a single concurrent schedule.
 
@@ -198,12 +219,27 @@ def plan_dilution_frames(dilutions: Iterable[Dilution]) -> list[Frame]:
     may appear once per schedule: two dilutions for one vial in one cycle
     would be summed by the firmware (FW-5) and is a caller bug.
     """
+    return plan_pump_schedule(dilutions)
+
+
+def plan_pump_schedule(
+    dilutions: Iterable[Dilution],
+    manual_runs: Iterable[ManualRun] = (),
+) -> list[Frame]:
+    """One cycle's dilutions plus any override runs as ONE concurrent
+    schedule: every pump starts at t=0 (so frame 0 holds every bit) and the
+    schedule is cut at each distinct end time. A vial may appear once across
+    both inputs -- FW-5 would sum two entries on one pump."""
     runs: dict[int, int] = {}
     seen: set[int] = set()
+
+    def _claim(vial: int) -> None:
+        if vial in seen:
+            raise ValueError(f"vial {vial} appears twice in one pump schedule")
+        seen.add(vial)
+
     for d in dilutions:
-        if d.vial in seen:
-            raise ValueError(f"vial {d.vial} appears twice in one pump schedule")
-        seen.add(d.vial)
+        _claim(d.vial)
         if d.influx_s < 0 or d.efflux_s < d.influx_s:
             raise ValueError(
                 f"vial {d.vial}: need 0 <= influx_s <= efflux_s, "
@@ -213,6 +249,10 @@ def plan_dilution_frames(dilutions: Iterable[Dilution]) -> list[Frame]:
             continue
         runs[pump_index(d.vial, "influx")] = d.influx_s
         runs[pump_index(d.vial, "efflux")] = d.efflux_s
+    for m in manual_runs:
+        _claim(m.vial)
+        runs[pump_index(m.vial, "influx")] = m.influx_s
+        runs[pump_index(m.vial, "efflux")] = m.efflux_s
     return decompose(runs)
 
 

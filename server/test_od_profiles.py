@@ -483,7 +483,7 @@ def test_introduce_then_recalibrate_an_organism():
         assert svc.store.od_vials_measured("pichia-pastoris", env) == [0, 1, 2, 3]
         summary = {p["id"]: p for p in svc.store.od_profile_summaries()}["pichia-pastoris"]
         assert summary["vials_measured"] == [0, 1, 2, 3]
-        assert summary["dark_subtracted"] is True
+        assert summary["dark_subtracted"] is False
         assert summary["versions"] == [second["version"], first["version"]]
         assert any("2016" in r for r in summary["reasons"])     # 12 vials carried
 

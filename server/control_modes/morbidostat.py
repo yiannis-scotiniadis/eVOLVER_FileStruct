@@ -318,6 +318,17 @@ class MorbidostatController:
         self._pending_escalation = None
 
     # ------------------------------------------------------------------
+    # Supervised override hooks (SPEC §21) -- dilution timing is the inner
+    # turbidostat's, so both delegate.
+    # ------------------------------------------------------------------
+
+    def record_manual_dilution(self, now: float, influx_ml: float) -> None:
+        self._inner.record_manual_dilution(now, influx_ml)
+
+    def rebaseline(self, now: float) -> None:
+        self._inner.rebaseline(now)
+
+    # ------------------------------------------------------------------
     # State persistence
     # ------------------------------------------------------------------
 

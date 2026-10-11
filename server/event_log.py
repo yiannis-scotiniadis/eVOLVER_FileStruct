@@ -319,6 +319,9 @@ CATEGORY_ACTUATOR = "actuator"
 CATEGORY_STORAGE = "storage"
 CATEGORY_SYSTEM = "system"
 CATEGORY_CALIBRATION = "calibration"
+# Supervised per-vial override (SPEC §21): grants, releases, expiries and
+# every operator action taken under one.
+CATEGORY_OVERRIDE = "override"
 
 
 class EventLog:
