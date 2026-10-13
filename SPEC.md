@@ -898,11 +898,13 @@ figures above are from an x86 box and SD-card I/O does not extrapolate.
 
 Runs in a background thread, ticking every 10 seconds. The loop is two-lane capable
 (a fast safety lane and an optionally-decimated OD lane, `app.py OD_EVERY_N_TICKS`),
-but both currently run at 10 s and the stirrers are never stopped:
+but both currently run at 10 s. Stirrers are paused only for vials whose group sets
+`od_stir_pause` (§9.1.1), and never by blocking the loop:
 
 ```
 every 10 seconds:
-    1. Read OD from all active vials (SerialManager.read_od)
+    1. Read OD from all active vials (SerialManager.read_od); stir-pausing vials
+       accept only the read that ends their settle (§9.1.1)
     2. Read temperature from all active vials (SerialManager.read_temperature)
     3. Log sensor data to CSV files
     4. Emit sensor_update to all connected WebSocket clients
@@ -911,7 +913,8 @@ every 10 seconds:
         b. If actuator changes needed, send commands via SerialManager
         c. Log any pump events
         d. Check alert conditions
-    6. Update stir rates (resend every cycle to prevent drift)
+    6. Update stir rates (resend every cycle to prevent drift; a settling vial
+       is written at its pause_pwm)
     7. Pet the watchdog timer
 ```
 
@@ -967,6 +970,66 @@ configuration. Anything needing an independent lifecycle is a separate experimen
   per-vial `group`/`mode`/`stir`/`target_temp_c`; `setpoint_stir` is `None` when
   groups stir differently. The export bundle gains `vial_groups.csv`
   (`vial,group,mode`) — a new file, never a new column (CLAUDE.md fact 6).
+
+#### 9.1.1 Stir pause before OD reads (`od_stir_pause`)
+
+**Status: IMPLEMENTED 2026-10-13 (software; not yet run on the rig).** `server/od_stir_pause.py`
+(pure scheduler), `run_config.normalise_stir_pause` / `stir_pause_by_vial`, the supervisor's
+composed stir write, and the wizard's Parameters step.
+
+A vortex, foam or bubble train that reaches the light path spoils an OD read. Whether it does
+depends on fill height, stir rate and culture — so pausing is a **group parameter**, beside
+`stir_rate`, not a run-wide one:
+
+```json
+"od_stir_pause": {"enabled": true, "settle_seconds": 20, "period_seconds": 120,
+                  "pause_pwm": 0, "min_mix_seconds": 30}
+```
+
+- **Scope.** Run-level `parameters` give the default and each group overrides it, like any
+  group parameter; an ungrouped run is the implicit group. One object per group, no per-vial
+  lists inside it — a vial needing different timing goes in its own group. Absent or
+  `enabled: false` means the vial never pauses, so every older config loads unchanged.
+- **Mechanism — per-vial acceptance, nothing blocks.** The machine keeps reading all sixteen
+  vials on every tick. A pausing vial: (1) has its stir lowered to `pause_pwm` in the
+  supervisor's per-tick composed stir write (`min(stir, pause_pwm)`, so a pause never speeds a
+  stirrer up); (2) for `settle_seconds`, its reads are flagged `stir_settling` and discarded;
+  (3) accepts the first acquisition that *starts* at least `settle_seconds` after the pause;
+  (4) gets its stir back in that same tick's composed write, before any dilution decided on
+  that read fires; (5) between pauses its reads are `stir_unsettled` and discarded. Next pause
+  is due `period_seconds` after the last one began, and never sooner than `min_mix_seconds`
+  after its last dilution finished. Temperature, heater safety and every other vial carry on at
+  the base tick — the settle never stalls the safety lane. Timings are minimums rounded up to
+  the 10 s tick: the stirrer is held paused `ceil(settle/10)·10 + 10` s per period.
+- **Groups and parallel experiments share one tick with nothing to merge**, because acceptance
+  is per vial. Each engine reports its RUNNING, non-faulted pausing vials
+  (`stir_pause_targets`); the supervisor syncs one machine-wide schedule from them at both ends
+  of every tick.
+- **Engine.** `run_cycle` treats both gate flags like "no sample for this vial": no OD streak,
+  no push, no growth point. `stir_settling` holds **every** mode's decision, including an
+  open-loop chemostat (its elapsed-time sizing absorbs the delay); `stir_unsettled` lets a
+  chemostat decide as normal. Heater safety is untouched. Bus and sleeve health use the
+  ungated read.
+- **Overrides (§21).** While an operator holds a vial its pause is suspended (an abandoned
+  settle restores stir at once); afterwards it stirs `min_mix_seconds`, then pauses.
+- **Logging.** A pausing vial's `vialNN_OD.csv` gets only the reads it accepted (rows are
+  fewer; columns unchanged). Stirred reads are discarded, not logged elsewhere.
+- **Dashboard.** `sensor_update.od.calibrated` carries each vial's last *accepted* value, with
+  `od.vial_timestamps`, `od.vial_ages` and `od.stir_pause` (per pausing vial: state + config).
+  Charts plot a vial's point only on the acquisition it accepted.
+- **Validation (HTTP 400).** Unknown key; non-boolean `enabled`; settle outside 5–120 s;
+  `pause_pwm` not below the group's stir rate; `period_seconds` shorter than the paused time
+  plus `min_mix_seconds`; paused fraction above 50 %. **Warnings:** paused fraction above 33 %;
+  turbidostat/morbidostat `pump_wait` holding fewer than 8 settled reads; chemostat
+  `bolus_interval_seconds` shorter than a pause plus its mixing (boli will be held).
+- **Blank — warn only (§19.2).** The blank is always taken stirring, so for paused vials it
+  corrects reads taken in a different optical condition. `blank/start` and the commit QC
+  return a warning, the envelope records `stir_condition: "stirring"` and
+  `stir_paused_reads_by_vial`, and `start` records one warning alert in `events.csv`.
+- **Growth.** A pausing vial's OD cadence is its period. `growth_rate.py` switches a series
+  with median cadence ≥ 30 s to a slow tier (`min_samples_for_cadence`,
+  `preferred_span_for_cadence`, `history_window_for_cadence`) so such vials still get an
+  approximate μ; 10 s series are bit-identical.
 
 ### 9.2 Parallel experiments
 
@@ -2321,6 +2384,12 @@ conditions"); `blank/start` expects every vial at its own group's stir, accepts 
 `stir_pwm` claim only when every group stirs alike, reports any vial whose commanded stir
 differs as `stir_mismatch` (a warning), and records `stir_pwm_by_vial` in the envelope's
 `conditions` beside the scalar `stir_pwm` (null when groups differ).
+
+**Vials that pause their stirrer before OD reads (§9.1.1) are warned, not refused.** The blank
+is measured stirring; those vials are read settled, so its row-2 re-anchor is an offset taken in
+a different optical condition (as is the organism curve). `blank/start` and the commit QC carry
+the warning, and the envelope records `stir_condition: "stirring"` plus
+`stir_paused_reads_by_vial`, so a future paused blank can be told apart.
 
 1. **Dark read** — LED power 0, five reads, per-vial median and SD.
 2. **Blank read** — LED at the run value, five reads, per-vial median and SD.

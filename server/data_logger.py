@@ -578,9 +578,17 @@ class DataLogger:
         od_dark_n_valid: Optional[list] = None,
         od_dark_subtracted: Optional[list] = None,
         od_led_power: Optional[int] = None,
+        od_skip_vials: Optional[Iterable[int]] = None,
     ) -> None:
         """Append one temperature row per active vial, and one OD row when
         OD was actually acquired this cycle.
+
+        ``od_skip_vials`` names vials whose OD row is NOT written this cycle
+        although OD was read: a vial that pauses its stirrer before reads
+        (``od_stir_pause``) records only the read it accepts, so its
+        vialNN_OD.csv stays a single optical regime instead of interleaving
+        stirred and settled reads that no flag-unaware script could separate.
+        Rows are simply fewer; columns are untouched.
 
         The sensor loop can read temperature more often than OD (``app.py``
         OD_EVERY_N_TICKS; currently 1, so both are on the same 10 s tick and
@@ -638,13 +646,17 @@ class DataLogger:
                     raise ValueError(
                         f"'{label}' must have {N_VIALS} entries, got {len(series)}"
                     )
+            skip = frozenset(int(v) for v in (od_skip_vials or ()))
             if has_od:
                 # Only refreshed on an OD tick, so this stays the last
                 # ACTUALLY measured OD rather than being reset by the five
-                # temperature-only ticks between acquisitions.
+                # temperature-only ticks between acquisitions -- and, for a
+                # vial skipped here, the last read it ACCEPTED.
+                prev = self._latest_od or [float("nan")] * N_VIALS
                 self._latest_od = [
-                    float(x) if not _is_nan(x) else float("nan")
-                    for x in od_calibrated
+                    prev[i] if i in skip
+                    else (float(x) if not _is_nan(x) else float("nan"))
+                    for i, x in enumerate(od_calibrated)
                 ]
 
             od_v2 = {
@@ -656,12 +668,14 @@ class DataLogger:
                 self._write_sensor_rows_locked(
                     run, timestamp_iso, temperature_calibrated, temperature_raw,
                     od_calibrated, od_raw, od_n_valid, od_flags, od_dark, od_v2,
+                    od_skip=skip,
                 )
 
     def _write_sensor_rows_locked(
         self, run: _ActiveRun, timestamp_iso: str,
         temperature_calibrated, temperature_raw,
         od_calibrated, od_raw, od_n_valid, od_flags, od_dark, od_v2=None,
+        od_skip: frozenset = frozenset(),
     ) -> None:
         """One temperature row (and one OD row on an OD tick) per vial of
         ``run``, stamped with ``run``'s own elapsed hours."""
@@ -678,7 +692,7 @@ class DataLogger:
                     _format_number(temperature_calibrated[v], 4),
                 ],
             )
-            if not has_od:
+            if not has_od or v in od_skip:
                 continue
             row = [
                 timestamp_iso,

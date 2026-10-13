@@ -988,6 +988,16 @@
       accent-color: var(--status-info);
       margin-top: 4px;
     }
+    /* Stir pause before OD reads (per group). The fields sit indented under
+       their toggle; the readout says what the settings cost the culture. */
+    .spause-toggle {
+      display: inline-flex; align-items: center; gap: 6px;
+      font-size: 13px; cursor: pointer;
+    }
+    .spause-fields { padding-left: 14px; border-left: 2px solid var(--border); }
+    .spause-readout { font-size: 12px; padding: 8px 0 4px; }
+    .spause-readout.warn { color: var(--status-warn); }
+    .spause-readout.bad { color: var(--status-critical); }
 
     /* Mode picker (step 3) */
     .mode-grid {
@@ -2714,6 +2724,33 @@
               <div class="pv" id="pv-stir">10</div>
               <input type="range" id="p-stir" min="0" max="15" step="1" value="10">
             </div>
+            <div class="param-row" title="Lower this group's stir before each OD read so the vortex settles out of the light path. Only the settled read is used; stirred reads in between are discarded. Leave off if the vortex does not reach the beam at your fill height.">
+              <div class="pl">Pause stirring before OD reads</div>
+              <label class="spause-toggle"><input type="checkbox" id="p-spause"> <span id="pv-spause">Off</span></label>
+            </div>
+            <div class="spause-fields" id="spause-fields" hidden>
+              <div class="param-row">
+                <div class="pl">Settle time before the read</div>
+                <div class="pv" id="pv-spause_settle">20 s</div>
+                <input type="range" id="p-spause_settle" min="5" max="120" step="5" value="20">
+              </div>
+              <div class="param-row">
+                <div class="pl">Take a settled read every</div>
+                <div class="pv" id="pv-spause_every">120 s</div>
+                <input type="range" id="p-spause_every" min="30" max="900" step="10" value="120">
+              </div>
+              <div class="param-row">
+                <div class="pl">Stir during the pause (0 = stop)</div>
+                <div class="pv" id="pv-spause_pwm">0</div>
+                <input type="range" id="p-spause_pwm" min="0" max="14" step="1" value="0">
+              </div>
+              <div class="param-row">
+                <div class="pl">Minimum mixing after a dilution</div>
+                <div class="pv" id="pv-spause_mix">30 s</div>
+                <input type="range" id="p-spause_mix" min="0" max="300" step="5" value="30">
+              </div>
+              <div class="muted spause-readout" id="spause-readout"></div>
+            </div>
           </div>
           <div class="params-mode" data-params-mode="turbidostat">
             <div class="param-row">
@@ -2806,7 +2843,6 @@
       <div class="wizard-footer">
         <button class="btn" id="wizard-back" type="button" disabled>Back</button>
         <div class="right">
-          <button class="btn" id="wizard-cancel" type="button">Cancel</button>
           <button class="btn btn-primary" id="wizard-next" type="button">Next</button>
         </div>
       </div>
@@ -3177,6 +3213,13 @@
     // suppressed in that case rather than adding a column of noise. Both the
     // period and the decision come from the server's `intervals` block, so
     // the chip reappears by itself if the OD lane is ever decimated again.
+    function _ageLabel(age) {
+      return age == null ? ""
+        : age < 1.5 ? "now"
+        : age < 90 ? `${Math.round(age)}s ago`
+        : `${Math.round(age / 60)}m ago`;
+    }
+
     function renderOdAge(msg) {
       const od = msg.od || {};
       const iv = msg.intervals || {};
@@ -3184,29 +3227,41 @@
       const basePeriod = iv.base_seconds || null;
       const decimated = odPeriod != null && basePeriod != null
         && odPeriod > basePeriod * 1.01;
-      if (!decimated) {
-        for (let i = 0; i < N_VIALS; i++) {
-          const ageEl = document.getElementById(`od-age-${i}`);
-          if (ageEl) ageEl.textContent = "";
-          const odEl = document.getElementById(`od-${i}`);
-          if (odEl) odEl.classList.remove("stale-od");
+      // Machine-wide age: only meaningful when the OD lane is decimated.
+      let age = null;
+      if (decimated) {
+        age = od.age_seconds;
+        if (age == null && od.timestamp) {
+          const t = tsToEpoch(od.timestamp);
+          if (t != null) age = Math.max(0, Date.now() / 1000 - t);
         }
-        return;
       }
-      let age = od.age_seconds;
-      if (age == null && od.timestamp) {
-        const t = tsToEpoch(od.timestamp);
-        if (t != null) age = Math.max(0, Date.now() / 1000 - t);
-      }
-      const stale = age != null && odPeriod != null && age > 1.5 * odPeriod;
-      const label = age == null ? ""
-        : age < 1.5 ? "now"
-        : age < 90 ? `${Math.round(age)}s ago`
-        : `${Math.round(age / 60)}m ago`;
+      const machineStale = age != null && age > 1.5 * odPeriod;
+      // A vial whose group pauses its stirrer before reads (od_stir_pause)
+      // shows its LAST SETTLED value between pauses, so it gets its own age
+      // and state -- otherwise a two-minute-old number would look live.
+      const pause = od.stir_pause || {};
+      const vialAges = od.vial_ages || [];
       for (let i = 0; i < N_VIALS; i++) {
         const ageEl = document.getElementById(`od-age-${i}`);
-        if (ageEl) ageEl.textContent = label;
         const odEl = document.getElementById(`od-${i}`);
+        const p = pause[String(i)];
+        let label = decimated ? _ageLabel(age) : "";
+        let stale = machineStale;
+        if (p) {
+          const vAge = vialAges[i];
+          const what = p.state === "settling" ? "settling"
+            : p.state === "suspended" ? "pause off (override)" : "settled read";
+          label = vAge == null ? what : `${what} · ${_ageLabel(vAge)}`;
+          stale = vAge != null && vAge > 1.5 * (p.period_seconds || 120);
+          if (ageEl) {
+            ageEl.title = `Stir pauses before OD reads: every ${p.period_seconds} s, `
+              + `settle ${p.settle_seconds} s. The value shown is the last settled read.`;
+          }
+        } else if (ageEl) {
+          ageEl.title = "";
+        }
+        if (ageEl) ageEl.textContent = label;
         if (odEl) odEl.classList.toggle("stale-od", stale);
       }
     }
@@ -5272,7 +5327,6 @@
     const expModalClose = document.getElementById("exp-modal-close");
     const wizardBack = document.getElementById("wizard-back");
     const wizardNext = document.getElementById("wizard-next");
-    const wizardCancel = document.getElementById("wizard-cancel");
     const bottleListEl = document.getElementById("bottle-list");
     const addBottleBtn = document.getElementById("add-bottle-btn");
     const vialBottleGrid = document.getElementById("vial-bottle-grid");
@@ -5575,11 +5629,9 @@
       }, 160);
     }
     newExperimentBtn.addEventListener("click", openExpModal);
+    // The × is the only way out: a stray click on the backdrop must not
+    // throw away a half-drafted experiment.
     expModalClose.addEventListener("click", closeExpModal);
-    wizardCancel.addEventListener("click", closeExpModal);
-    expModal.addEventListener("click", (e) => {
-      if (e.target === expModal) closeExpModal();
-    });
 
     function gotoStep(step) {
       wizardState.step = step;
@@ -5713,7 +5765,8 @@
       }
       if (step === 6) {
         for (const g of wizardState.groups) {
-          const problem = (MODE_VALIDATORS[g.mode] || (() => null))(g.params);
+          const problem = (MODE_VALIDATORS[g.mode] || (() => null))(g.params)
+            || _stirPauseProblem(g.params);
           if (problem) {
             showToast(_isGrouped() ? `Group "${g.name}": ${problem}` : problem, "error");
             wizardState.activeGid = g.gid;
@@ -5863,6 +5916,63 @@
       }
     }
 
+    // Mirrors run_config.stir_pause_paused_seconds / normalise_stir_pause.
+    // One OD read holds the bus for one 10 s tick, and the settle is honoured
+    // as a minimum rounded up to whole ticks, so the stirrer is held at the
+    // pause setting for ceil(settle / 10) * 10 + 10 seconds of every period.
+    const SPAUSE_TICK_S = 10;
+    const SPAUSE_MAX_FRACTION = 0.5;
+    const SPAUSE_WARN_FRACTION = 1 / 3;
+    function _stirPauseCost(q) {
+      const paused = Math.ceil(q.spause_settle / SPAUSE_TICK_S - 1e-9) * SPAUSE_TICK_S
+        + SPAUSE_TICK_S;
+      return { paused, fraction: paused / q.spause_every };
+    }
+    function _stirPauseProblem(q) {
+      if (!q.spause) return null;
+      if (q.spause_pwm >= q.stir) {
+        return `Stir during the pause (${q.spause_pwm}) must be below the stir rate (${q.stir}).`;
+      }
+      const { paused, fraction } = _stirPauseCost(q);
+      if (q.spause_every < paused + q.spause_mix) {
+        return `A settled read every ${q.spause_every} s is too often: each pause holds the `
+          + `stirrer ~${paused} s and then needs ${q.spause_mix} s of mixing `
+          + `(at least ${paused + q.spause_mix} s).`;
+      }
+      if (fraction > SPAUSE_MAX_FRACTION + 1e-9) {
+        return `The stirrer would be paused ${Math.round(100 * fraction)} % of the time `
+          + `(limit ${100 * SPAUSE_MAX_FRACTION} %). Read less often or shorten the settle.`;
+      }
+      return null;
+    }
+    function _stirPauseSummary(q) {
+      if (!q.spause) return "Off";
+      const pwm = q.spause_pwm === 0 ? "stopped" : `at ${q.spause_pwm}`;
+      return `every ${q.spause_every} s, settle ${q.spause_settle} s, stir ${pwm}, `
+        + `mix ≥ ${q.spause_mix} s after dilution`;
+    }
+    function _renderStirPause() {
+      const q = _activeGroup().params;
+      const on = !!q.spause;
+      document.getElementById("p-spause").checked = on;
+      document.getElementById("pv-spause").textContent = on ? "On" : "Off";
+      document.getElementById("spause-fields").hidden = !on;
+      const out = document.getElementById("spause-readout");
+      out.classList.remove("warn", "bad");
+      if (!on) { out.textContent = ""; return; }
+      const problem = _stirPauseProblem(q);
+      if (problem) {
+        out.textContent = problem;
+        out.classList.add("bad");
+        return;
+      }
+      const { paused, fraction } = _stirPauseCost(q);
+      out.textContent = `Stirrer paused ~${paused} s of every ${q.spause_every} s `
+        + `(≈ ${Math.round(100 * fraction)} % unmixed). One settled OD reading per `
+        + `${q.spause_every} s for these vials; growth rates from them are approximate.`;
+      if (fraction > SPAUSE_WARN_FRACTION) out.classList.add("warn");
+    }
+
     function _syncParamSliders() {
       const q = _activeGroup().params;
       for (const { id, key, format } of PARAM_SLIDERS) {
@@ -5895,6 +6005,7 @@
           `Group "${active.name}" · ${active.mode} · vials ${_groupVials(active).join(", ") || "—"}`;
       }
       _syncParamSliders();
+      _renderStirPause();
       applyParamPaneVisibility();
     }
 
@@ -6082,6 +6193,20 @@
     }
     bindParamSlider("temp", "temperature", v => `${v.toFixed(1)} °C`);
     bindParamSlider("stir", "stir", v => `${v}`);
+    // Stir pause before OD reads: a per-group setting (run_config
+    // od_stir_pause). The toggle is a checkbox, the rest are sliders.
+    bindParamSlider("spause_settle", "spause_settle", v => `${v} s`);
+    bindParamSlider("spause_every", "spause_every", v => `${v} s`);
+    bindParamSlider("spause_pwm", "spause_pwm", v => `${v}`);
+    bindParamSlider("spause_mix", "spause_mix", v => `${v} s`);
+    GROUP_PARAM_DEFAULTS.spause = false;
+    document.getElementById("p-spause").addEventListener("change", (e) => {
+      _activeGroup().params.spause = e.target.checked;
+      _renderStirPause();
+    });
+    for (const id of ["stir", "spause_settle", "spause_every", "spause_pwm", "spause_mix"]) {
+      document.getElementById(`p-${id}`).addEventListener("input", _renderStirPause);
+    }
     bindParamSlider("vol", "volume", v => `${v} mL`);
     bindParamSlider("effx", "efflux_extra", v => `${v} s`);
     // Turbidostat
@@ -6150,7 +6275,8 @@
         return header + `
           <dt>Mode</dt><dd>${escapeHtml(g.mode)}</dd>
           <dt>Temperature</dt><dd>${q.temperature.toFixed(1)} °C</dd>
-          <dt>Stir</dt><dd>${q.stir}</dd>`
+          <dt>Stir</dt><dd>${q.stir}</dd>
+          <dt>Stir pause</dt><dd>${escapeHtml(_stirPauseSummary(q))}</dd>`
           + (MODE_REVIEW_ROWS[g.mode] || (() => ""))(q);
       }).join("");
       reviewDl.innerHTML = sharedRows + groupRows;
@@ -6167,6 +6293,17 @@
       const groupParams = g => ({
         temperature_c: g.params.temperature,
         stir_rate: g.params.stir,
+        // Only sent when on: a config without the key never pauses, so a
+        // run that does not use it stays byte-identical to before.
+        ...(g.params.spause ? {
+          od_stir_pause: {
+            enabled: true,
+            settle_seconds: g.params.spause_settle,
+            period_seconds: g.params.spause_every,
+            pause_pwm: g.params.spause_pwm,
+            min_mix_seconds: g.params.spause_mix,
+          },
+        } : {}),
         ...(MODE_PARAMS[g.mode] || (() => ({})))(g.params),
       });
       const body = {
@@ -6492,6 +6629,19 @@
 
     function chartingReady() { return typeof uPlot !== "undefined"; }
 
+    // The OD values to plot at this acquisition: each vial's value only if
+    // that vial accepted THIS read, else null (the multi-vial plot uses
+    // spanGaps, so a pausing vial's line joins its settled points). Without
+    // this, a vial that pauses its stirrer would replot its last settled
+    // value on every tick between pauses.
+    function _freshOdValues(msg) {
+      const od = msg.od || {};
+      const cal = od.calibrated || [];
+      const vts = od.vial_timestamps;
+      if (!Array.isArray(vts) || !od.timestamp) return cal;
+      return cal.map((x, v) => (vts[v] === od.timestamp ? x : null));
+    }
+
     // ---------- Dedicated multi-vial Plots view ----------
     const plots = {
       exp: null,
@@ -6702,7 +6852,7 @@
       // `msg.od.timestamp` is the whole fix.
       const odEpoch = tsToEpoch((msg.od && msg.od.timestamp) || msg.timestamp);
       const hours = RANGE_TO_HOURS[plots.range];
-      const odCal = (msg.od && msg.od.calibrated) || [];
+      const odCal = _freshOdValues(msg);
       const tCal = (msg.temperature && msg.temperature.calibrated) || [];
       if (odEpoch != null) {
         appendLive(plots.od, plots._chartVials, odEpoch, odCal, hours);
@@ -6851,7 +7001,12 @@
       // Same as plotsOnSensorUpdate: the OD series is stamped with the tick
       // OD was measured on, or a re-sent reading lands as a run of identical
       // points between acquisitions.
-      const odEpoch = tsToEpoch((msg.od && msg.od.timestamp) || msg.timestamp);
+      // A vial that pauses its stirrer accepts one read per period: stamp
+      // its point with ITS read time, so the held value between pauses is
+      // not replotted (appendLive drops a non-advancing timestamp).
+      const vts = (msg.od && msg.od.vial_timestamps) || [];
+      const odEpoch = tsToEpoch(
+        vts[modalTrends.vial] || (msg.od && msg.od.timestamp) || msg.timestamp);
       const hours = RANGE_TO_HOURS[modalTrends.range];
       const odCal = (msg.od && msg.od.calibrated) || [];
       const tCal = (msg.temperature && msg.temperature.calibrated) || [];

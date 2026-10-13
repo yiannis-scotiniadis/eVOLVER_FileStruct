@@ -60,6 +60,8 @@ from data_logger import _VALID_NAME
 import fluidics
 import growth_rate as growth
 import run_config
+from od_stir_pause import GATE_FLAGS as STIR_GATE_FLAGS
+from od_stir_pause import STIR_SETTLING, STIR_UNSETTLED
 import vessels as vessel_lib
 from vial_override import VialOverrideMixin, VialOverride
 from vessels import KIND_MEDIA, KIND_WASTE, VesselRegistry
@@ -518,7 +520,59 @@ def validate_control_parameters(
         )
     if min(influx_rates) <= 0:
         raise ValueError("every active vial needs a positive influx flow rate")
+    warnings.extend(_validate_stir_pause(mode, parameters, list(vials)))
     return warnings
+
+
+def _validate_stir_pause(mode: str, parameters: dict, vials: list[int]) -> list[str]:
+    """The group's ``od_stir_pause`` block (``run_config.normalise_stir_pause``
+    raises on anything unrunnable) plus the warnings that depend on the mode.
+
+    A pausing vial accepts one OD read per ``period_seconds``, so everything
+    a mode does per OD sample slows to that period."""
+    raw_stir = parameters.get("stir_rate")
+    rates = [
+        int(run_config._per_vial_value(raw_stir, v, run_config.DEFAULT_STIR_RATE))
+        for v in vials
+    ]
+    pause = run_config.normalise_stir_pause(
+        parameters.get(run_config.STIR_PAUSE_KEY),
+        where="stir pause", stir_rates=rates, tick_seconds=DEFAULT_BASE_TICK_SECONDS,
+    )
+    if pause is None:
+        return []
+    out: list[str] = []
+    paused = run_config.stir_pause_paused_seconds(pause, DEFAULT_BASE_TICK_SECONDS)
+    fraction = paused / pause.period_seconds
+    if fraction > run_config.STIR_PAUSE_WARN_PAUSED_FRACTION:
+        out.append(
+            f"stir pause: the stirrer is paused ~{100 * fraction:.0f} % of the "
+            f"time (~{paused:g} s of every {pause.period_seconds:g} s). Mixing "
+            "and oxygen transfer stop for that long -- sedimenting or strictly "
+            "aerobic cultures may not tolerate it."
+        )
+    if mode in ("turbidostat", "morbidostat"):
+        wait_s = 60.0 * float(parameters.get("pump_wait_minutes", DEFAULT_PUMP_WAIT_MINUTES))
+        reads = wait_s / pause.period_seconds
+        if reads < 8:
+            out.append(
+                f"stir pause: only ~{reads:.0f} settled OD read(s) fit in each "
+                f"{wait_s / 60:g} min pump_wait (one per {pause.period_seconds:g} s), "
+                "so the controller's 5-read average spans most of a segment and "
+                "growth rates will be coarse. Lengthen pump_wait or shorten "
+                "period_seconds."
+            )
+    elif mode == "chemostat":
+        bolus = float(parameters.get("bolus_interval_seconds") or DEFAULT_CYCLE_INTERVAL_SECONDS)
+        if bolus < paused + pause.min_mix_seconds:
+            out.append(
+                f"stir pause: a bolus is due every {bolus:g} s but each pause "
+                f"holds dosing for ~{paused:g} s and then needs "
+                f"{pause.min_mix_seconds:g} s of mixing, so boli will regularly be "
+                "held until the stirrer restarts (delivered volume is preserved "
+                "-- boli are sized from elapsed time)."
+            )
+    return out
 
 
 def compute_pump_quantization(volume_ml: float, flow_rate_ml_s: float) -> dict:
@@ -835,6 +889,10 @@ class ExperimentEngine(VialOverrideMixin):
         self._setpoint_raw: dict[int, int] = {}
         # Per-vial stir PWM: groups may stir at different rates.
         self._stir_by_vial: dict[int, int] = {}
+        # Per-vial stir pause before OD reads (run_config.od_stir_pause),
+        # resolved from the groups. Absent = the vial never pauses. The
+        # schedule itself is machine-wide and lives in the supervisor.
+        self._stir_pause_by_vial: dict[int, run_config.StirPause] = {}
         # Set while a CREATED experiment holds its vials at run conditions
         # (heaters at target, stir on) so the per-run OD blank can be taken
         # under the conditions it will be used in. See precondition_experiment.
@@ -1031,6 +1089,53 @@ class ExperimentEngine(VialOverrideMixin):
     def _set_groups_locked(self, groups: list[run_config.Group]) -> None:
         self._groups = list(groups)
         self._vial_group = run_config.group_by_vial(self._groups)
+        try:
+            self._stir_pause_by_vial = run_config.stir_pause_by_vial(
+                self._groups, tick_seconds=self._base_tick_seconds,
+            )
+        except ValueError as exc:
+            # Validated at create; only a hand-edited config.json reaches
+            # here. Never pausing is the safe reading -- a resume must not be
+            # stranded by it -- but it must not be silent either.
+            self._stir_pause_by_vial = {}
+            log.error("invalid od_stir_pause in loaded config: %s", exc)
+            self._broadcast_alert(
+                level="warning",
+                message=f"Stir pause disabled for this run: {exc}",
+                category="sensor",
+            )
+
+    def stir_pause_targets(self) -> tuple[dict[int, run_config.StirPause], set[int]]:
+        """``(configs, suspended)`` for the machine-wide stir-pause schedule:
+        the pause config of every vial this run is RUNNING (never while
+        CREATED -- preconditioning and the blank stir at the run's rate), and
+        which of those an operator currently holds (SPEC §21), whose pause is
+        suspended while they do. Faulted vials stir at 0 and never pause."""
+        with self._lock:
+            if self._status != ExperimentStatus.RUNNING:
+                return {}, set()
+            configs = {
+                v: p for v, p in self._stir_pause_by_vial.items()
+                if v in self._vials and self._vial_faults.get(v) is None
+            }
+            return configs, {v for v in configs if v in self._overrides}
+
+    def stir_pause_config(self) -> dict[int, dict]:
+        """``{vial: od_stir_pause dict}`` for the vials of this run that pause
+        -- for ``status()`` consumers and the blank's condition check."""
+        with self._lock:
+            return {v: p.to_dict() for v, p in self._stir_pause_by_vial.items()}
+
+    def _od_cadence_locked(self, vial: int) -> float:
+        """How often ``vial`` actually accepts an OD read: its pause period
+        when it pauses, else the control interval."""
+        pause = self._stir_pause_by_vial.get(vial)
+        if pause is None:
+            return self._cycle_interval_seconds
+        return max(self._cycle_interval_seconds, pause.period_seconds)
+
+    def _growth_history_seconds_locked(self, vial: int) -> float:
+        return growth.history_window_for_cadence(self._od_cadence_locked(vial))
 
     def _vial_mode_locked(self, vial: int) -> str:
         g = self._vial_group.get(vial)
@@ -2056,8 +2161,22 @@ class ExperimentEngine(VialOverrideMixin):
                     continue  # latched fault — skip
                 temp_c = temperature_calibrated[vial]
                 temp_nan = _is_nan(temp_c)
-                od = od_calibrated[vial] if od_tick else None
-                od_nan = od_tick and _is_nan(od)
+                # Stir pause (od_stir_pause.py): a pausing vial only ACCEPTS
+                # the read taken at the end of its settle. Any other read of
+                # it arrives flagged STIR_SETTLING (stirrer paused, not yet
+                # settled) or STIR_UNSETTLED (stirring between pauses) and is
+                # not this vial's sample at all -- no OD streak, no push, no
+                # growth point. It is not a dropped read either: the bus
+                # delivered it, the vial was just in the wrong optical state.
+                stir_gate = (
+                    od_flags[vial]
+                    if od_tick and od_flags is not None and vial < len(od_flags)
+                    and od_flags[vial] in STIR_GATE_FLAGS
+                    else None
+                )
+                vial_od = od_tick and stir_gate is None
+                od = od_calibrated[vial] if vial_od else None
+                od_nan = vial_od and _is_nan(od)
 
                 # (1a) OD out-of-range: a DISTINCT condition from a lossy
                 # dropped read. The OD is NaN (range guard rejected it), but
@@ -2066,13 +2185,13 @@ class ExperimentEngine(VialOverrideMixin):
                 # warn once on crossing the threshold, and skip OD control —
                 # but let heater safety still run if the temperature is valid.
                 od_out_of_range = (
-                    od_tick
+                    vial_od
                     and od_flags is not None
                     and vial < len(od_flags)
                     and od_flags[vial] == "out_of_range"
                 )
-                if not od_tick:
-                    pass  # OD streaks are the OD lane's business
+                if not vial_od:
+                    pass  # OD streaks only count reads this vial accepts
                 elif od_out_of_range:
                     self._od_range_streak[vial] = self._od_range_streak.get(vial, 0) + 1
                     if self._od_range_streak[vial] == self._sensor_failure_threshold:
@@ -2119,7 +2238,7 @@ class ExperimentEngine(VialOverrideMixin):
                 # wall-clock duration out in the alert: at a 60 s OD lane
                 # "3 consecutive" would be three MINUTES, and an operator
                 # reading a bare count will assume otherwise.
-                if od_tick:
+                if vial_od:
                     if od_nan and not od_out_of_range:
                         self._od_nan_streak[vial] = self._od_nan_streak.get(vial, 0) + 1
                         if self._od_nan_streak[vial] == self._sensor_failure_threshold:
@@ -2167,7 +2286,20 @@ class ExperimentEngine(VialOverrideMixin):
                     # is no new OD to push or decide on. Growth still updates
                     # below -- it reads history, not this tick's sample.
                     continue
-                if od_nan:
+                if stir_gate == STIR_SETTLING:
+                    # The stirrer is paused. Hold EVERY mode's decision,
+                    # including an open-loop chemostat: a bolus pumped into an
+                    # unstirred vial is exactly what the restore ordering
+                    # exists to avoid. The chemostat sizes from elapsed time,
+                    # so the held bolus fires in full once stir is back.
+                    continue
+                if stir_gate == STIR_UNSETTLED:
+                    # Stirring between settled reads: nothing to push. Modes
+                    # that close the loop on OD wait for the next settled read;
+                    # open-loop ones (requires_od = False) decide as normal.
+                    if getattr(controller, "requires_od", True):
+                        continue
+                elif od_nan:
                     if getattr(controller, "requires_od", True):
                         continue
                 else:
@@ -2830,7 +2962,7 @@ class ExperimentEngine(VialOverrideMixin):
         """
         hist = self._od_history.setdefault(vial, deque())
         hist.append((float(now), float(od)))
-        cutoff = float(now) - growth.HISTORY_WINDOW_SECONDS
+        cutoff = float(now) - self._growth_history_seconds_locked(vial)
         while hist and hist[0][0] < cutoff:
             hist.popleft()
 
@@ -2906,7 +3038,7 @@ class ExperimentEngine(VialOverrideMixin):
         events = self._dilution_events.get(vial)
         if not events:
             return
-        cutoff = float(now) - growth.HISTORY_WINDOW_SECONDS
+        cutoff = float(now) - self._growth_history_seconds_locked(vial)
         while events and events[0].t_efflux_end < cutoff:
             events.popleft()
 
@@ -3029,6 +3161,7 @@ class ExperimentEngine(VialOverrideMixin):
                     samples_seen=samples_seen,
                     warmup_samples=int(warmup),
                     extra_flags=tuple(extra),
+                    history_window_seconds=self._growth_history_seconds_locked(vial),
                     origin_s=self._growth_run_start,
                 )
             except Exception:
@@ -4298,6 +4431,7 @@ class ExperimentEngine(VialOverrideMixin):
         self._groups = []
         self._vial_group = {}
         self._stir_by_vial = {}
+        self._stir_pause_by_vial = {}
         self._preconditioned_at = None
         self._temp_nan_streak = {}
         self._od_nan_streak = {}

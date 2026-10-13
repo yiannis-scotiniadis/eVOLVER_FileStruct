@@ -410,6 +410,7 @@ processes, owns `/dev/ttyAMA0` directly, and serves the dashboard at
 | Subsystem | Status | Where |
 |---|---|---|
 | Flask + socketio server, 10 s sensor loop (two-lane capable), watchdog, shutdown handler | Built | `server/app.py`, `watchdog.py` |
+| Per-group stir pause before OD reads (settle, accept only the settled read; wizard toggle) | Built (software) | `server/od_stir_pause.py`, `run_config.py`, `supervisor.py`, SPEC §9.1.1 |
 | `SerialManager` + `MockSerialManager` (`--mock` runs with no hardware) | Built | `server/serial_manager.py`, `mock_serial_manager.py` |
 | Dashboard, 4×4 vial grid, per-vial modal with uPlot charts | Built | `frontend/templates/index.html` (single file) |
 | Manual controls (temperature in °C, stir, pump, emergency stop) | Built | `/api/actuators/*` |
@@ -450,6 +451,8 @@ gravimetric wizard, reconciliation, and the 32-flow-rate engine plumbing. The so
 bench-ready but **no Tier 1/Tier 2 procedure has yet been run on the bench**, so the
 inherited-constant caveats below still stand.
 
+**Per-group stir pause shipped 2026-10-13** — `od_stir_pause` (SPEC §9.1.1): software only,
+exercised against the mock and a live mock server; no settle time has been chosen on the rig.
 **Session S shipped 2026-10-11** — the supervised per-vial override and pump-log schema 2.
 Software only: exercised against the mock and a live mock server, not yet on the rig.
 **Session AG shipped 2026-09-29** — per-organism OD calibration profiles, the raw-count OD
@@ -564,40 +567,39 @@ backup, multi-phase protocols, and authentication.
    keep the logger matching each file's own header, so a schema-1 file resumed across an
    upgrade stays seven columns.
 
-7. **Everything is on one 10 s cycle, and the stirrers never stop — but the loop is
-   two-lane *capable*, and that capability is a safety property.** `app.py` currently sets
-   `OD_EVERY_N_TICKS = 1`, so temperature and OD are read on the same tick and control
-   decides on it. `OD_SETTLE_SECONDS` must be **0**; `configure_cadence` rejects anything
-   else, because the settle has no implementation and the only way to honour one today
-   would be to block the sensor thread — which stalls the *temperature* lane too.
+7. **Everything is on one 10 s cycle, and the loop never blocks — stirrers pause per vial
+   group, by acceptance, not by waiting.** `app.py` sets `OD_EVERY_N_TICKS = 1`, so
+   temperature and all sixteen OD channels are read every tick and control decides on it.
+   A group's `od_stir_pause` parameter (SPEC §9.1.1) makes its vials lower their stir, let
+   the vortex settle, and **accept only the read that starts after the settle**; every
+   other read of those vials is flagged `stir_settling` / `stir_unsettled` and discarded
+   (never pushed, never logged to `vialNN_OD.csv`). Four rules for new work:
 
-   The decimation machinery is kept because slowing OD down is still wanted: it is what
-   buys time to stop the stirrers and let the vortex settle. If you raise
-   `OD_EVERY_N_TICKS`, know the four things that come with it:
+   - **Never implement a settle as a wait.** Blocking the sensor thread stalls the
+     *temperature* lane too; over-temperature is the one real-time guarantee *not*
+     delegated to firmware (`_handle_heater_safety_locked`, three consecutive reads), so a
+     blocked loop multiplies its latency. That is why the old global `OD_SETTLE_SECONDS`
+     knob was removed, and why the base tick must never be slowed instead.
+   - **The pause lives inside the supervisor's composed stir write.** That write
+     re-asserts every vial every tick (`supervisor._resend_stir_locked`), so a stir change
+     made anywhere else is undone a tick later. The schedule (`server/od_stir_pause.py`) is
+     synced from the engines at *both* ends of a tick — at `classify_od_read`, so the first
+     read after a start or resume is already judged, and at the stir write. It runs on a
+     monotonic clock; the sensor loop stamps OD acquisitions and pump-schedule ends
+     (`note_dilutions`) on the same one.
+   - **Acceptance is per vial, so groups and parallel experiments never merge anything.**
+     Restore happens in the stir write of the accepting tick, before that tick's pump
+     schedule fires, so pumps always run into a stirred vial; `stir_settling` holds every
+     mode's `decide()`, chemostat included.
+   - **The blank is warn-only for paused vials** (it and the organism curve are measured
+     stirring). If you build a paused blank, the envelope's `stir_condition` /
+     `stir_paused_reads_by_vial` are there to detect the mismatch.
 
-   - **Never slow the base tick instead.** Over-temperature is the one real-time guarantee
-     *not* delegated to firmware; `_handle_heater_safety_locked` needs three consecutive
-     over-critical reads, so detection latency is `3 x the FAST lane's period`. A flat 60 s
-     loop takes that from 30 s to **3 minutes**, on a rig where `xr=0` requests ~82 °C.
-     Temperature, heater safety, bus/sleeve health, the watchdog pet, the dashboard
-     broadcast and the growth recompute all belong on the fast lane.
-   - **`growth_rate.py`'s span constants are tuned to the OD cadence and must move with
-     it.** Measured: the cadence change alone cost 2.6× in μ dispersion until
-     `PREFERRED_FIT_SPAN_SECONDS` / `MIN_SAMPLES` / `HISTORY_WINDOW_SECONDS` were
-     re-derived. `MIN_FIT_SPAN_SECONDS` must *not* be raised past `pump_wait - 60` or fast
-     growers report no μ at all. See `GROWTH_RATE_METHOD.md` §5.1–5.2 and re-run
-     `server/verify_cadence_growth.py`.
-   - **Per-cycle counters are already split per lane** (`_temp_nan_streak`/`_od_nan_streak`,
-     `VialHealth._temp_dropped`/`_od_dropped`) — a fused counter lets the fast lane reset
-     the slow lane's streak before it can reach its threshold.
-   - **`sensor_update` re-sends the last OD on fast ticks**, so anything plotting it must
-     key off `msg.od.timestamp`, never `msg.timestamp`, or one real sample lands as N
-     identical points.
-
-   And before the stirrers actually stop: `_resend_stir_locked` re-sends stir every base
-   tick and would switch them back on mid-settle, and the OD calibration and per-run blank
-   were both taken with stir *on* — reading with it off reproduces the known "raw OD below
-   the dark floor → NaN" failure. `_acquire_od`'s docstring carries the full list.
+   If you raise `OD_EVERY_N_TICKS`: `growth_rate.py`'s fast-tier constants are tuned to a
+   10 s cadence (a series at ≥ 30 s already switches to the slow tier); per-cycle counters
+   are split per lane (`_temp_nan_streak`/`_od_nan_streak`, `VialHealth`); and anything
+   plotting `sensor_update` must key OD off `msg.od.timestamp` / `od.vial_timestamps`,
+   never `msg.timestamp`.
 8. **The fluidics firmware queues frames, runs them one at a time, and cannot be stopped.**
    Measured 2026-09-23, full evidence in `FLUIDICS_FIRMWARE_AUDIT.md`. Each frame drives
    **every pump in its mask concurrently** (verified to 14 pumps at full speed) for
@@ -826,6 +828,7 @@ eVOLVER_FileStruct/
     vial_override.py         # supervised per-vial override (SPEC §21): engine mixin, pump plan,
                              #   events.csv reader for the plot markers
     run_config.py            # vial groups: normalise/validate, per-vial targets — pure (SPEC §9.1)
+    od_stir_pause.py         # per-vial stir pause before OD reads: the schedule — pure (SPEC §9.1.1)
     supervisor.py            # parallel experiments: one engine per experiment, one tick (SPEC §9.2)
     vessels.py               # machine-scoped bottle/carboy levels, shareable across experiments
     growth_rate.py           # SPEC §17 growth estimation — pure, I/O-free, no engine imports
@@ -849,6 +852,7 @@ eVOLVER_FileStruct/
                              #   simulated culture and checks the OD band / delivered D
     test_vial_groups.py      #   vial groups: run_config, engine, API (SPEC §9.1)
     test_parallel_runs.py    #   parallel experiments: supervisor + API (SPEC §9.2)
+    test_od_stir_pause.py    #   stir pause: schedule, group/parallel scope, engine gates, logging, API
     test_od_profiles.py      #   organism profiles, per-vial curves, OD CSV schema 2, wiring
     test_od_recalibrate.py   #   post-hoc recalibration: identity, true curve, schema 1, HTTP
     test_vial_override.py    #   override: grant/expiry, controller coherence, books, holds,

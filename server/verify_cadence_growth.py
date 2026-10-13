@@ -67,16 +67,23 @@ class Config:
             g.MIN_FIT_SPAN_SECONDS,
             g.PREFERRED_FIT_SPAN_SECONDS,
             g.MIN_SAMPLES,
+            g.SLOW_CADENCE_SECONDS,
         )
         g.MIN_FIT_SPAN_SECONDS = self.min_span
         g.PREFERRED_FIT_SPAN_SECONDS = self.preferred
         g.MIN_SAMPLES = self.min_samples
+        # Each row pins its constants explicitly, so the estimator's automatic
+        # slow-cadence tier (GROWTH_RATE_METHOD.md 5.3) is switched off here --
+        # otherwise the "naive" row would silently get the tier's values and
+        # stop measuring what the cadence change alone costs.
+        g.SLOW_CADENCE_SECONDS = float("inf")
         return self
 
     def __exit__(self, *exc):
         (g.MIN_FIT_SPAN_SECONDS,
          g.PREFERRED_FIT_SPAN_SECONDS,
-         g.MIN_SAMPLES) = self._saved
+         g.MIN_SAMPLES,
+         g.SLOW_CADENCE_SECONDS) = self._saved
         return False
 
 

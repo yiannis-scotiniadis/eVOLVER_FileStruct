@@ -50,6 +50,7 @@ import data_export as dx  # noqa: E402
 import fluidics  # noqa: E402
 import growth_rate as growth  # noqa: E402
 import od_recalibrate as odr  # noqa: E402
+from od_stir_pause import ACCEPTED as STIR_ACCEPTED  # noqa: E402
 import event_log as evlog  # noqa: E402
 from calibration_service import (  # noqa: E402
     CalibrationConflict,
@@ -57,6 +58,7 @@ from calibration_service import (  # noqa: E402
     QCRefusal,
     RESERVED_OD_PROFILES,
     SUBSYSTEMS as CAL_SUBSYSTEMS,
+    stir_pause_blank_warning,
 )
 from data_logger import DataLogger  # noqa: E402
 from experiment_engine import (  # noqa: E402
@@ -107,14 +109,15 @@ LOGS_DIR = PROJECT_ROOT / "logs"
 # --- Sensor loop cadence --------------------------------------------------
 #
 # CURRENT CONFIGURATION: everything on one 10 s cycle. Temperature and OD are
-# read on the same tick, control decides on that tick, and THE STIRRERS NEVER
-# STOP. `OD_EVERY_N_TICKS = 1` collapses the two lanes onto each other.
+# read on the same tick and control decides on that tick.
+# `OD_EVERY_N_TICKS = 1` collapses the two lanes onto each other.
 #
-# The two-lane machinery underneath is kept, not deleted, because slowing the
-# OD lane down is still wanted -- it is what buys time to stop the stirrers
-# and let the vortex settle before a read. Raising OD_EVERY_N_TICKS is all
-# that is needed to get that cadence back. What is NOT yet built is the stir
-# stop itself; see OD_SETTLE_SECONDS below.
+# Stirring is paused before OD reads PER VIAL GROUP, not here: a group's
+# `od_stir_pause` parameter (run_config.py) makes its vials accept only the
+# read taken at the end of a settle, and the stir pause itself rides the
+# supervisor's per-tick composed stir write (od_stir_pause.py). The machine
+# still reads all sixteen vials every tick, so nothing ever blocks the sensor
+# thread -- see _acquire_od.
 #
 # Why the machinery exists at all, so nobody re-collapses it by hand: the tick
 # is not only a measurement cadence, it is the SAFETY cadence. Over-temperature
@@ -134,7 +137,6 @@ LOGS_DIR = PROJECT_ROOT / "logs"
 # server/verify_cadence_growth.py.
 SENSOR_LOOP_INTERVAL_SECONDS = 10.0   # base tick: temperature, safety, emit
 OD_EVERY_N_TICKS = 1                  # 1 = OD on every tick (10 s), no decimation
-OD_SETTLE_SECONDS = 0.0               # stir stop: NOT IMPLEMENTED, must stay 0
 OD_INTERVAL_SECONDS = SENSOR_LOOP_INTERVAL_SECONDS * OD_EVERY_N_TICKS
 OD_LED_POWER = 2125  # CLAUDE.md: standard LED power for OD reads
 
@@ -142,7 +144,6 @@ OD_LED_POWER = 2125  # CLAUDE.md: standard LED power for OD reads
 def configure_cadence(
     base_seconds: float | None = None,
     od_every: int | None = None,
-    od_settle_seconds: float | None = None,
 ) -> None:
     """Override the sensor-loop cadence before ``create_app`` is called.
 
@@ -151,12 +152,13 @@ def configure_cadence(
     engine's streak wording all key off the control interval, and making the
     cadence per-run would make every one of those per-run too.
 
-    Exists so settle time can be tuned on the bench without a redeploy --
-    ``main()`` wires it to ``--sensor-interval`` / ``--od-every`` /
-    ``--od-settle``.
+    ``main()`` wires it to ``--sensor-interval`` / ``--od-every``. Pausing
+    the stirrers before OD reads is not a cadence setting: it is the
+    per-group ``od_stir_pause`` parameter (run_config.py), which never
+    slows or blocks this loop.
     """
     global SENSOR_LOOP_INTERVAL_SECONDS, OD_EVERY_N_TICKS
-    global OD_SETTLE_SECONDS, OD_INTERVAL_SECONDS
+    global OD_INTERVAL_SECONDS
     if base_seconds is not None:
         if base_seconds <= 0:
             raise ValueError(f"base tick must be > 0, got {base_seconds}")
@@ -165,29 +167,6 @@ def configure_cadence(
         if od_every < 1:
             raise ValueError(f"--od-every must be >= 1, got {od_every}")
         OD_EVERY_N_TICKS = int(od_every)
-    if od_settle_seconds is not None:
-        if od_settle_seconds != 0:
-            # Refused rather than documented, because the failure is silent and
-            # lands on the safety lane. The settle has no implementation yet;
-            # the only way to honour a non-zero value here would be to block
-            # the sensor thread, which stalls TEMPERATURE too and takes
-            # overtemp detection from 3 x 10 s to 3 x (10 + settle). That is
-            # the exact regression the two-lane split exists to prevent.
-            #
-            # Implementing it properly means interleaving temperature reads
-            # through the settle -- a state machine across base ticks, not a
-            # sleep -- plus teaching _resend_stir_locked not to switch the
-            # stirrers back on mid-settle, plus a stir-off OD blank. See
-            # _acquire_od for the full list.
-            raise ValueError(
-                f"od_settle_seconds must be 0 (got {od_settle_seconds}): "
-                "stopping the stirrers before an OD read is not implemented. "
-                "A non-zero settle could only be honoured by blocking the "
-                "sensor thread, which would stall the temperature/heater-safety "
-                "lane as well and multiply over-temperature detection latency. "
-                "See _acquire_od for what implementing it requires."
-            )
-        OD_SETTLE_SECONDS = float(od_settle_seconds)
     OD_INTERVAL_SECONDS = SENSOR_LOOP_INTERVAL_SECONDS * OD_EVERY_N_TICKS
 
 # Low-disk monitor (sensor loop). The Pi's disk is finite and a multi-day run
@@ -326,6 +305,14 @@ class AppState:
         self.last_od: dict | None = None
         self.last_od_timestamp: str | None = None
         self.last_od_monotonic: float | None = None
+        # The last OD each vial ACCEPTED, and when. A vial that pauses its
+        # stirrer before reads (od_stir_pause) accepts one read per period, so
+        # the latest acquisition is the wrong number to show for it: the
+        # dashboard shows these, with their own per-vial age.
+        self.od_vial_calibrated: list = [float("nan")] * N_VIALS
+        self.od_vial_raw: list = [float("nan")] * N_VIALS
+        self.od_vial_timestamp: list = [None] * N_VIALS
+        self.od_vial_monotonic: list = [None] * N_VIALS
         self.last_update_monotonic: float | None = None
 
 
@@ -407,36 +394,23 @@ def _od_reading_dict(r) -> dict:
 
 
 def _acquire_od(state: AppState) -> dict:
-    """One OD acquisition, including whatever has to happen around the read.
+    """One OD acquisition of all sixteen vials. Always a plain read.
 
-    **Today this is exactly a bare read, and the stirrers never stop.** The
-    function exists as the seam where stopping them would go, and as the place
-    the requirements for doing so are written down.
+    Stopping the stirrers before a read is NOT done here, and must never be:
+    a settle implemented as a wait in this function would block the sensor
+    thread, stalling the temperature lane too -- and over-temperature
+    detection is three consecutive reads of that lane.
+
+    Instead a pausing vial (its group's ``od_stir_pause``, run_config.py)
+    follows a per-vial schedule (od_stir_pause.py): its stir is lowered by
+    the supervisor's per-tick composed stir write, the machine keeps reading
+    every tick, and the sensor loop asks the supervisor which vials ACCEPT
+    this read (``classify_od_read``). The others are flagged
+    ``stir_settling`` / ``stir_unsettled`` and discarded for that vial.
 
     Kept separate from ``_read_od_pair`` so the HTTP live-read routes
     (``/api/sensors/*``) keep hitting the bare read: they are operator-driven
-    one-shots and must not stop the stirrers of a running experiment.
-
-    **What implementing the stir stop actually requires.** It is not a sleep
-    here. ``configure_cadence`` refuses a non-zero ``OD_SETTLE_SECONDS`` for
-    that reason: blocking this thread stalls the TEMPERATURE lane too, and
-    overtemp detection is three consecutive reads of that lane. The settle has
-    to be a state machine spanning several base ticks, with temperature still
-    being read through it.
-
-    **And a landmine on top of that.** The engine re-sends
-    stir setpoints on EVERY base tick, from ``_resend_stir_locked`` inside
-    ``run_cycle`` (step 5) -- that is deliberate drift protection against a
-    PWM board that has lost its setting. If the settle window is long enough
-    to span a base tick, that re-send will switch the stirrers back on in the
-    middle of it, and the OD read lands on a vortex that never settled. The
-    two mechanisms have to be made aware of each other: either the engine
-    learns a "stir suspended for OD acquisition" state that ``_resend_stir_locked``
-    honours, or the whole acquire runs inside the engine lock so no re-send can
-    interleave. The second question to settle at the same time is what the OD
-    calibration and the per-run blank mean once the read happens with stir off
-    -- both were taken with stir ON, and CalibrationService already warns when
-    a blank's ``stir_pwm`` differs from the run's ``stir_rate``.
+    one-shots that know nothing of the schedule.
     """
     return _read_od_pair(state)
 
@@ -1923,6 +1897,23 @@ def create_app(use_mock: bool):
                 category=evlog.CATEGORY_CALIBRATION,
                 dedup_key=("blank_override", name),
             )
+        # Stir pause (od_stir_pause): the blank and the organism curve were
+        # both measured stirring, these vials will be read settled. Warn-only
+        # by decision (SPEC 19.2) -- but into events.csv, where it is part of
+        # the run's record, not just a response body.
+        try:
+            run = state.engine.get_run(name)
+            paused = run.stir_pause_config() if run is not None else {}
+            warning = stir_pause_blank_warning(paused)
+            if warning:
+                _emit_alert(
+                    "warning",
+                    f"Experiment '{name}': {warning}",
+                    category=evlog.CATEGORY_CALIBRATION,
+                    dedup_key=("stir_pause_blank", name),
+                )
+        except Exception:
+            log.exception("stir-pause start warning failed for '%s'", name)
         # After the blank is live, so the per-vial OD floors are derived from
         # the calibration the run will actually use.
         _push_growth_context(name)
@@ -3158,8 +3149,16 @@ def create_app(use_mock: bool):
             if (summary := _experiment_summary(n)) is not None
         ]
         od_age = None
+        now_mono = time.monotonic()
         if state.last_od_monotonic is not None:
-            od_age = round(time.monotonic() - state.last_od_monotonic, 1)
+            od_age = round(now_mono - state.last_od_monotonic, 1)
+        try:
+            stir_pause = {
+                str(v): snap for v, snap in state.engine.stir_pause_snapshot().items()
+            }
+        except Exception:
+            log.exception("stir_pause_snapshot failed")
+            stir_pause = {}
         return {
             "timestamp": ts_iso,
             "temperature": {
@@ -3167,8 +3166,21 @@ def create_app(use_mock: bool):
                 "raw": state.last_temperature.get("raw") if state.last_temperature else [],
             },
             "od": {
-                "calibrated": o.get("calibrated") if o else [],
-                "raw": o.get("raw") if o else [],
+                # Each vial's last ACCEPTED value. Identical to the latest
+                # acquisition for every vial that does not pause its stirrer;
+                # a pausing vial (od_stir_pause) keeps its last settled read
+                # between pauses, and `vial_timestamps` / `vial_ages` say how
+                # old each one is.
+                "calibrated": list(state.od_vial_calibrated) if o else [],
+                "raw": list(state.od_vial_raw) if o else [],
+                "vial_timestamps": list(state.od_vial_timestamp),
+                "vial_ages": [
+                    None if m is None else round(now_mono - m, 1)
+                    for m in state.od_vial_monotonic
+                ],
+                # Per pausing vial (string keys): "stirring" | "settling" |
+                # "suspended", plus the group's config.
+                "stir_pause": stir_pause,
                 "dark": o.get("dark") if o else None,
                 "n_valid": o.get("n_valid") if o else None,
                 "flags": o.get("flags") if o else None,
@@ -3296,6 +3308,15 @@ def create_app(use_mock: bool):
             return
 
         fired = frames[:sent]
+        # Stir pause: no vial pauses until it has mixed min_mix_seconds after
+        # its pumps stop. Every frame of one schedule runs back to back in the
+        # firmware queue, so the schedule's span bounds each vial's end.
+        try:
+            state.engine.note_dilutions(
+                vials, time.monotonic() + fluidics.span_seconds(fired),
+            )
+        except Exception:
+            log.exception("stir-pause dilution note failed")
         _emit_event({
             "type": "pump_batch",
             "vials": vials,
@@ -3466,6 +3487,47 @@ def create_app(use_mock: bool):
     # Exposed for the API tests (the loop itself is not steppable).
     state.calibration_tick = _calibration_tick
 
+    def _gate_od_by_stir_pause(o: dict, started_at: float, ts_iso: str) -> dict:
+        """Apply the stir-pause schedule to one acquisition.
+
+        Returns ``{"calibrated", "flags", "skip"}``: the read as the ENGINE
+        sees it -- every vial that does not accept it (od_stir_pause.py) is
+        NaN, flagged ``stir_settling`` / ``stir_unsettled`` -- and the set of
+        vials whose OD row must not be logged. Also records each accepting
+        vial's value as its last accepted OD for the dashboard.
+
+        Never raises: a failure here falls back to every vial accepting the
+        read, which is exactly the behaviour with no pause configured."""
+        calibrated = list(o.get("calibrated") or [])
+        flags = list(o.get("flags") or ["ok"] * len(calibrated))
+        labels: dict = {}
+        try:
+            valid = {
+                v: isinstance(x, (int, float)) and math.isfinite(x)
+                for v, x in enumerate(calibrated)
+            }
+            labels = state.engine.classify_od_read(started_at, valid)
+        except Exception:
+            log.exception("stir-pause classification failed; accepting the read")
+            labels = {}
+        skip: set[int] = set()
+        for vial, label in labels.items():
+            if label == STIR_ACCEPTED or not (0 <= vial < len(calibrated)):
+                continue
+            calibrated[vial] = float("nan")
+            flags[vial] = label
+            skip.add(vial)
+        raw = list(o.get("raw") or [float("nan")] * len(calibrated))
+        now_mono = time.monotonic()
+        for vial in range(min(len(calibrated), N_VIALS)):
+            if vial in skip:
+                continue
+            state.od_vial_calibrated[vial] = calibrated[vial]
+            state.od_vial_raw[vial] = raw[vial] if vial < len(raw) else float("nan")
+            state.od_vial_timestamp[vial] = ts_iso
+            state.od_vial_monotonic[vial] = now_mono
+        return {"calibrated": calibrated, "flags": flags, "skip": skip}
+
     def sensor_loop():
         """One thread, two lanes: a fast safety lane and an OD lane that can
         be decimated below it.
@@ -3486,10 +3548,8 @@ def create_app(use_mock: bool):
         box -- the same reason the growth service schedules by due time.
         """
         log.info(
-            "sensor loop started (base tick %.1fs, OD every %d ticks = %.1fs, "
-            "settle %.1fs)",
-            SENSOR_LOOP_INTERVAL_SECONDS, OD_EVERY_N_TICKS,
-            OD_INTERVAL_SECONDS, OD_SETTLE_SECONDS,
+            "sensor loop started (base tick %.1fs, OD every %d ticks = %.1fs)",
+            SENSOR_LOOP_INTERVAL_SECONDS, OD_EVERY_N_TICKS, OD_INTERVAL_SECONDS,
         )
         # Acquire OD on the very first tick so a fresh start has a reading
         # immediately rather than after a full OD period.
@@ -3514,21 +3574,29 @@ def create_app(use_mock: bool):
 
                 # --- OD lane: every OD_EVERY_N_TICKS ticks -------------
                 o = None
+                o_gated = None
                 if od_tick:
                     # Advance from the due time, not from now, so a slow tick
                     # does not permanently push the OD cadence later.
                     next_od_due = max(
                         tick_start + 1e-9, next_od_due + OD_INTERVAL_SECONDS
                     )
+                    od_started = time.monotonic()
                     o = _acquire_od(state)
                     state.last_od = o
                     state.last_od_timestamp = ts_iso
                     state.last_od_monotonic = time.monotonic()
+                    # Stir pause: which vials ACCEPT this read. Must run
+                    # before run_cycle, whose composed stir write at the end
+                    # of the tick restores the vials accepted here.
+                    o_gated = _gate_od_by_stir_pause(o, od_started, ts_iso)
 
                 # SPEC 20.3 classification. Done here rather than inside
                 # SerialManager because this is where both subsystems' results
                 # are visible in one place, and it works while idle too.
                 # `o is None` marks OD not-attempted, which is not a failure.
+                # Fed the UNGATED read: sleeve and bus health are about the
+                # hardware answering, which a stir-paused vial's sleeve did.
                 _classify_bus_reads(t, o)
 
                 # log_sensor_cycle is a no-op when no experiment is running;
@@ -3546,6 +3614,9 @@ def create_app(use_mock: bool):
                         od_raw=o["raw"] if o else None,
                         od_n_valid=o.get("n_valid") if o else None,
                         od_flags=o.get("flags") if o else None,
+                        # A pausing vial's OD row is written only for the read
+                        # it accepts: vialNN_OD.csv stays one optical regime.
+                        od_skip_vials=o_gated["skip"] if o_gated else None,
                         od_dark=o.get("dark") if o else None,
                         od_lit=o.get("lit") if o else None,
                         od_dark_used=o.get("dark_used") if o else None,
@@ -3573,8 +3644,8 @@ def create_app(use_mock: bool):
                     pump_actions = state.engine.run_cycle(
                         ts_iso,
                         t["calibrated"],
-                        o["calibrated"] if o else None,
-                        od_flags=o.get("flags") if o else None,
+                        o_gated["calibrated"] if o_gated else None,
+                        od_flags=o_gated["flags"] if o_gated else None,
                     )
                 except Exception as exc:
                     log.exception("engine.run_cycle failed")
@@ -3804,16 +3875,8 @@ def main(argv: list[str] | None = None) -> int:
             "must be re-derived alongside it (GROWTH_RATE_METHOD.md 5.2)."
         ),
     )
-    parser.add_argument(
-        "--od-settle", type=float, default=None, metavar="SECONDS",
-        help=(
-            "Reserved for stopping the stirrers before an OD read. NOT "
-            "IMPLEMENTED -- must be 0; any other value is rejected. The "
-            "stirrers currently never stop."
-        ),
-    )
     args = parser.parse_args(argv)
-    configure_cadence(args.sensor_interval, args.od_every, args.od_settle)
+    configure_cadence(args.sensor_interval, args.od_every)
 
     logging.basicConfig(
         level=args.log_level.upper(),
@@ -3830,10 +3893,8 @@ def main(argv: list[str] | None = None) -> int:
         log.exception("could not set up file logging in %s", LOGS_DIR)
 
     log.info(
-        "sensor cadence: base tick %.1f s, OD every %d ticks (%.1f s), "
-        "settle %.1f s",
-        SENSOR_LOOP_INTERVAL_SECONDS, OD_EVERY_N_TICKS,
-        OD_INTERVAL_SECONDS, OD_SETTLE_SECONDS,
+        "sensor cadence: base tick %.1f s, OD every %d ticks (%.1f s)",
+        SENSOR_LOOP_INTERVAL_SECONDS, OD_EVERY_N_TICKS, OD_INTERVAL_SECONDS,
     )
     flask_app, socketio = create_app(use_mock=args.mock)
     socketio.run(

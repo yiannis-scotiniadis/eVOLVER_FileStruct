@@ -410,6 +410,16 @@ span constants move with it — and materially does, otherwise.
 
 ---
 
+### 5.3 Slow-cadence tier (stir-pausing vials)
+
+A vial whose group pauses its stirrer before OD reads (SPEC §9.1.1) accepts one read per pause
+period — 120 s by default — not one per 10 s tick. At that cadence `MIN_SAMPLES = 30` would mean
+an hour of data before any μ, so a series whose **median cadence is ≥ 30 s** uses a slow tier:
+sample floor `max(5, round(MIN_FIT_SPAN_SECONDS / cadence))`, preferred span 3600 s, history 6 h
+(the values §5.2 measured for a 60 s lane). It is a tier, not a formula, so a 10 s series —
+including its loop-overrun jitter — is bit-identical to before. Estimates at 120 s are
+**approximate by design** and have not been separately re-validated.
+
 ## 6. `server/growth_rate.py` — module shape
 
 Pure, I/O-free, no imports from `experiment_engine`, `app`, or any control mode. Takes

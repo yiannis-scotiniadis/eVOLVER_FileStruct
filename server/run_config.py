@@ -51,6 +51,7 @@ to this module.
 from __future__ import annotations
 
 import copy
+import math
 import re
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Optional
@@ -380,3 +381,235 @@ def config_temperature_c_by_vial(config: Mapping) -> dict[int, float]:
         groups_from_config(config),
         normalise_vial_targets(config.get("vial_targets")),
     )
+
+
+# ---------------------------------------------------------------------------
+# Stir pause before OD reads (SPEC §9.1)
+# ---------------------------------------------------------------------------
+#
+# A vortex, foam or bubble train that reaches the light path spoils an OD
+# read. Whether it does depends on fill height, stir rate and the culture, all
+# of which can differ between groups -- so the pause is a GROUP parameter like
+# ``stir_rate``, not a run-wide one. It is NOT in RUN_WIDE_KEYS: the OD read
+# still serves all sixteen vials on every tick, and what a vial pauses for is
+# which of those reads it ACCEPTS (``server/od_stir_pause.py``). Two groups --
+# or two parallel experiments -- that disagree therefore never need merging.
+#
+# Shape (all keys optional; a missing block, or enabled=false, means the vial
+# never pauses, which is how every config from before this existed loads)::
+#
+#     "od_stir_pause": {"enabled": true, "settle_seconds": 20,
+#                       "period_seconds": 120, "pause_pwm": 0,
+#                       "min_mix_seconds": 30}
+#
+# One object per group, deliberately with no per-vial lists inside it: a vial
+# that needs different timing goes in its own group.
+
+STIR_PAUSE_KEY = "od_stir_pause"
+
+STIR_PAUSE_DEFAULTS: dict[str, Any] = {
+    "enabled": False,
+    "settle_seconds": 20.0,
+    "period_seconds": 120.0,
+    "pause_pwm": 0,
+    "min_mix_seconds": 30.0,
+}
+
+STIR_PAUSE_SETTLE_MIN_SECONDS = 5.0
+STIR_PAUSE_SETTLE_MAX_SECONDS = 120.0
+STIR_PAUSE_MIN_MIX_MAX_SECONDS = 600.0
+STIR_PAUSE_PERIOD_MAX_SECONDS = 3600.0
+STIR_MAX = 15
+
+#: Above this fraction of each period with the stirrer paused, a group is
+#: refused. Every second of pause is a second without mixing or oxygen
+#: transfer, and for a sedimenting or strictly aerobic culture the pause
+#: changes the physiology the run is measuring.
+STIR_PAUSE_MAX_PAUSED_FRACTION = 0.5
+#: Above this, the group is accepted with a warning.
+STIR_PAUSE_WARN_PAUSED_FRACTION = 1.0 / 3.0
+
+#: The sensor loop's base tick, which is also how long one OD acquisition
+#: holds the bus (3 dark + 5 lit reads, ~9.4 s measured -- CLAUDE.md fact 13).
+#: Every pause is quantised up to it. Passed in rather than imported so this
+#: module stays free of app/engine imports.
+DEFAULT_TICK_SECONDS = 10.0
+
+
+@dataclass(frozen=True)
+class StirPause:
+    """A validated, enabled stir pause for one group."""
+
+    settle_seconds: float
+    period_seconds: float
+    pause_pwm: int
+    min_mix_seconds: float
+
+    def to_dict(self) -> dict:
+        return {
+            "enabled": True,
+            "settle_seconds": self.settle_seconds,
+            "period_seconds": self.period_seconds,
+            "pause_pwm": self.pause_pwm,
+            "min_mix_seconds": self.min_mix_seconds,
+        }
+
+
+def stir_pause_paused_seconds(
+    pause: StirPause, tick_seconds: float = DEFAULT_TICK_SECONDS,
+) -> float:
+    """Seconds per period the stirrer is actually held at ``pause_pwm``.
+
+    The settle is honoured as a MINIMUM rounded up to whole ticks (the read
+    that is accepted is the first one to START at least ``settle_seconds``
+    after the pause), and the stirrer stays paused through that read, which
+    occupies one more tick."""
+    tick = max(float(tick_seconds), 1e-9)
+    return math.ceil(pause.settle_seconds / tick - 1e-9) * tick + tick
+
+
+def stir_pause_paused_fraction(
+    pause: StirPause, tick_seconds: float = DEFAULT_TICK_SECONDS,
+) -> float:
+    return stir_pause_paused_seconds(pause, tick_seconds) / pause.period_seconds
+
+
+def _stir_pause_number(block: Mapping, key: str, where: str) -> float:
+    value = block.get(key, STIR_PAUSE_DEFAULTS[key])
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{where}: '{STIR_PAUSE_KEY}.{key}' must be a number, got {value!r}")
+    value = float(value)
+    if not math.isfinite(value):
+        raise ValueError(f"{where}: '{STIR_PAUSE_KEY}.{key}' must be finite")
+    return value
+
+
+def normalise_stir_pause(
+    raw: Any,
+    *,
+    where: str = "experiment",
+    stir_rates: Iterable[int] = (),
+    tick_seconds: float = DEFAULT_TICK_SECONDS,
+) -> Optional[StirPause]:
+    """Validate one group's ``od_stir_pause`` block. ``None`` = no pause.
+
+    Raises ``ValueError`` naming ``where`` (the API maps it to HTTP 400) for:
+    an unknown key (a typo must not silently mean "never pause"), a
+    non-boolean ``enabled``, a settle outside 5-120 s, a ``pause_pwm`` that is
+    not below every one of the group's ``stir_rates`` (pausing must slow the
+    stirrer, never speed it up), a period too short to fit the settle, the
+    read and ``min_mix_seconds`` of stirring, and a paused fraction above
+    :data:`STIR_PAUSE_MAX_PAUSED_FRACTION`."""
+    if raw is None:
+        return None
+    if not isinstance(raw, Mapping):
+        raise ValueError(f"{where}: '{STIR_PAUSE_KEY}' must be an object")
+    unknown = sorted(set(raw) - set(STIR_PAUSE_DEFAULTS))
+    if unknown:
+        raise ValueError(
+            f"{where}: unknown '{STIR_PAUSE_KEY}' key(s) {unknown}; "
+            f"allowed: {sorted(STIR_PAUSE_DEFAULTS)}"
+        )
+    enabled = raw.get("enabled", STIR_PAUSE_DEFAULTS["enabled"])
+    if not isinstance(enabled, bool):
+        raise ValueError(f"{where}: '{STIR_PAUSE_KEY}.enabled' must be true or false")
+    if not enabled:
+        return None
+
+    settle = _stir_pause_number(raw, "settle_seconds", where)
+    period = _stir_pause_number(raw, "period_seconds", where)
+    min_mix = _stir_pause_number(raw, "min_mix_seconds", where)
+    pwm_raw = raw.get("pause_pwm", STIR_PAUSE_DEFAULTS["pause_pwm"])
+    if isinstance(pwm_raw, bool) or not isinstance(pwm_raw, (int, float)) \
+            or float(pwm_raw) != int(pwm_raw):
+        raise ValueError(f"{where}: '{STIR_PAUSE_KEY}.pause_pwm' must be an integer")
+    pause_pwm = int(pwm_raw)
+
+    if not (STIR_PAUSE_SETTLE_MIN_SECONDS <= settle <= STIR_PAUSE_SETTLE_MAX_SECONDS):
+        raise ValueError(
+            f"{where}: '{STIR_PAUSE_KEY}.settle_seconds' must be "
+            f"{STIR_PAUSE_SETTLE_MIN_SECONDS:g}-{STIR_PAUSE_SETTLE_MAX_SECONDS:g} s, "
+            f"got {settle:g}"
+        )
+    if not (0.0 <= min_mix <= STIR_PAUSE_MIN_MIX_MAX_SECONDS):
+        raise ValueError(
+            f"{where}: '{STIR_PAUSE_KEY}.min_mix_seconds' must be "
+            f"0-{STIR_PAUSE_MIN_MIX_MAX_SECONDS:g} s, got {min_mix:g}"
+        )
+    if not (0 <= pause_pwm <= STIR_MAX):
+        raise ValueError(
+            f"{where}: '{STIR_PAUSE_KEY}.pause_pwm' must be 0-{STIR_MAX}, got {pause_pwm}"
+        )
+    rates = sorted({int(r) for r in stir_rates})
+    if rates and pause_pwm >= rates[0]:
+        raise ValueError(
+            f"{where}: '{STIR_PAUSE_KEY}.pause_pwm' ({pause_pwm}) must be below "
+            f"the group's stir rate ({rates[0]}) -- a pause that does not slow "
+            "the stirrer settles nothing"
+        )
+
+    pause = StirPause(
+        settle_seconds=settle,
+        period_seconds=period,
+        pause_pwm=pause_pwm,
+        min_mix_seconds=min_mix,
+    )
+    paused = stir_pause_paused_seconds(pause, tick_seconds)
+    shortest = paused + min_mix
+    if period < shortest:
+        raise ValueError(
+            f"{where}: '{STIR_PAUSE_KEY}.period_seconds' ({period:g}) is too "
+            f"short: each cycle holds the stirrer paused ~{paused:g} s (the "
+            f"settle rounded up to whole {tick_seconds:g} s ticks, plus the "
+            f"read itself) and then stirs at least min_mix_seconds "
+            f"({min_mix:g}), so it needs >= {shortest:g} s"
+        )
+    if period > STIR_PAUSE_PERIOD_MAX_SECONDS:
+        raise ValueError(
+            f"{where}: '{STIR_PAUSE_KEY}.period_seconds' must be <= "
+            f"{STIR_PAUSE_PERIOD_MAX_SECONDS:g} s, got {period:g}"
+        )
+    fraction = paused / period
+    if fraction > STIR_PAUSE_MAX_PAUSED_FRACTION + 1e-9:
+        raise ValueError(
+            f"{where}: the stirrer would be paused {100 * fraction:.0f} % of "
+            f"the time (~{paused:g} s of every {period:g} s); the limit is "
+            f"{100 * STIR_PAUSE_MAX_PAUSED_FRACTION:.0f} %. Lengthen "
+            "period_seconds or shorten settle_seconds"
+        )
+    return pause
+
+
+def stir_pause_by_vial(
+    groups: Iterable[Group],
+    tick_seconds: float = DEFAULT_TICK_SECONDS,
+) -> dict[int, StirPause]:
+    """``{vial: StirPause}`` for every vial whose group pauses before OD reads.
+    Vials whose group does not pause are absent.
+
+    Reader mode: the config was validated at create, so the stir-rate check
+    is not repeated here (a kept override target may since have moved a
+    vial's stir; the scheduler composes ``min(stir, pause_pwm)`` for that)."""
+    out: dict[int, StirPause] = {}
+    for g in groups:
+        pause = normalise_stir_pause(
+            g.parameters.get(STIR_PAUSE_KEY),
+            where=f"group {g.name!r}", tick_seconds=tick_seconds,
+        )
+        if pause is None:
+            continue
+        for v in g.vials:
+            out[v] = pause
+    return out
+
+
+def group_stir_rates(group: Group) -> list[int]:
+    """The stir PWM of each of ``group``'s vials (scalar or 16-list)."""
+    raw = group.parameters.get("stir_rate")
+    return [int(_per_vial_value(raw, v, DEFAULT_STIR_RATE)) for v in group.vials]
+
+
+def config_stir_pause_by_vial(config: Mapping) -> dict[int, StirPause]:
+    """:func:`stir_pause_by_vial` straight from a config dict (calibration
+    layer: the blank needs to know which vials will be read paused)."""
+    return stir_pause_by_vial(groups_from_config(config))

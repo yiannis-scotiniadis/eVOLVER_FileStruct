@@ -1332,6 +1332,26 @@ class TempStabilityTracker:
 BLANK_SESSION_STALE_SECONDS = 60 * 60
 
 
+def stir_pause_blank_warning(stir_paused_vials: dict) -> Optional[str]:
+    """The warning for a per-run blank whose run pauses some vials' stirrers
+    before OD reads (``od_stir_pause``), or None when no vial pauses.
+
+    The blank is taken with the stirrers running. The re-anchor it computes
+    is therefore an offset measured in a different optical condition from the
+    settled reads it will correct, and the organism's OD curve was fitted
+    stirring too. Warn-only by decision (SPEC §19.2): the error is the size
+    of the vortex effect, which is exactly what the operator chose to remove."""
+    if not stir_paused_vials:
+        return None
+    vials = sorted(int(v) for v in stir_paused_vials)
+    return (
+        f"vials {vials} pause their stirrer before every OD read, but this "
+        "blank (and the organism's OD curve) was measured with stirring ON. "
+        "Their OD will carry an offset roughly the size of the vortex effect; "
+        "compare against an off-line reading, or recalibrate the run post hoc."
+    )
+
+
 class OdBlankSession:
     """State for one §5.4 dark/blank sequence. Deliberately in-memory: the
     whole procedure is ~10 minutes at the bench, and a server restart
@@ -1357,6 +1377,13 @@ class OdBlankSession:
         self.stir_by_vial = {int(k): int(v) for k, v in stir_by_vial.items()}
         self.targets_c = dict(targets_c)
         self.n_samples = int(n_samples)
+        # Vials whose group pauses its stirrer before every OD read
+        # (od_stir_pause): {vial: pause config}. The blank itself is always
+        # taken STIRRING, so for these vials it is measured in a different
+        # optical condition from every read it will correct -- warned, not
+        # refused (SPEC §19.2), and recorded so a future paused blank can be
+        # told apart from this one.
+        self.stir_paused_vials: dict[int, dict] = {}
         self.created_at = _iso_now()
         self.dark: Optional[dict] = None
         self.blank: Optional[dict] = None
@@ -3822,14 +3849,26 @@ class CalibrationService:
             pin = self._od_pin_from_config(config)
             if pin is not None:
                 self._blank.od_profile, self._blank.od_version = pin
-            return {
+            try:
+                paused = run_config.config_stir_pause_by_vial(config or {})
+            except ValueError:
+                paused = {}
+            self._blank.stir_paused_vials = {
+                v: p.to_dict() for v, p in paused.items() if v in vials
+            }
+            out = {
                 "session": self._blank.id,
                 "experiment": experiment,
                 "vials": vials,
                 "n_samples": self._blank.n_samples,
                 "thermal": self.tracker.settled(vials, targets),
                 "stir_mismatch": self._stir_mismatch(stir_by_vial),
+                "warnings": [],
             }
+            warning = stir_pause_blank_warning(self._blank.stir_paused_vials)
+            if warning:
+                out["warnings"].append(warning)
+            return out
 
     def _od_pin_from_config(self, config: Optional[dict]) -> Optional[tuple[str, str]]:
         """``(profile, version)`` from an experiment config's calibration
@@ -4003,6 +4042,9 @@ class CalibrationService:
             # §5.4 acceptance criteria -> qc block.
             failures: list[str] = []
             warnings: list[str] = []
+            paused_warning = stir_pause_blank_warning(s.stir_paused_vials)
+            if paused_warning:
+                warnings.append(paused_warning)
             dark_sd = s.dark["sd"]
             blank_sd = s.blank["sd"]
             for v in vials:
@@ -4097,6 +4139,14 @@ class CalibrationService:
                         str(k): v for k, v in s.stir_by_vial.items()
                     },
                     "target_temp_c": {str(k): v for k, v in s.targets_c.items()},
+                    # The blank is always measured with the stirrers running.
+                    # Vials listed below will be READ with their stirrer
+                    # paused (od_stir_pause), so this blank corrects them from
+                    # a different optical condition -- see the QC warning.
+                    "stir_condition": "stirring",
+                    "stir_paused_reads_by_vial": {
+                        str(k): v for k, v in s.stir_paused_vials.items()
+                    },
                     "parent_od_cal": od_env.get("version"),
                     "od_profile": od_profile_id_of(od_env),
                     "dark_subtracted": dark_subtracted,

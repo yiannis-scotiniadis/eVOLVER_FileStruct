@@ -145,6 +145,44 @@ MIN_SEGMENTS = 2
 #: side; 3 h at the 10 s cadence is 1080 samples per vial.
 HISTORY_WINDOW_SECONDS = 3 * 3600.0
 
+#: **Slow-cadence tier.** A vial that pauses its stirrer before OD reads
+#: (``run_config`` ``od_stir_pause``) accepts one read per pause period --
+#: 120 s by default -- instead of one per 10 s tick. At that cadence the three
+#: sample-count-shaped constants above stop making sense (``MIN_SAMPLES = 30``
+#: would be an HOUR of data before any μ, and fast growers would never get
+#: one), so a series whose median cadence is at or above
+#: SLOW_CADENCE_SECONDS uses the values measured for the 60 s lane instead
+#: (GROWTH_RATE_METHOD.md §5.2). A tier rather than a formula so the 10 s
+#: path -- including its loop-overrun jitter -- stays bit-identical. The
+#: estimate at 120 s is approximate by design; nothing here pretends otherwise.
+SLOW_CADENCE_SECONDS = 30.0
+SLOW_PREFERRED_FIT_SPAN_SECONDS = 3600.0
+SLOW_HISTORY_WINDOW_SECONDS = 6 * 3600.0
+#: Never fit fewer points than this, whatever the cadence.
+MIN_SAMPLES_FLOOR = 5
+
+
+def min_samples_for_cadence(cadence_seconds: float) -> int:
+    """The sample-count floor for a series at ``cadence_seconds``: MIN_SAMPLES
+    on the fast tier; on the slow tier the number of samples a
+    MIN_FIT_SPAN_SECONDS window holds (10 at 60 s), floored at
+    MIN_SAMPLES_FLOOR."""
+    if cadence_seconds < SLOW_CADENCE_SECONDS:
+        return MIN_SAMPLES
+    return max(MIN_SAMPLES_FLOOR, int(round(MIN_FIT_SPAN_SECONDS / cadence_seconds)))
+
+
+def preferred_span_for_cadence(cadence_seconds: float) -> float:
+    return (PREFERRED_FIT_SPAN_SECONDS if cadence_seconds < SLOW_CADENCE_SECONDS
+            else max(PREFERRED_FIT_SPAN_SECONDS, SLOW_PREFERRED_FIT_SPAN_SECONDS))
+
+
+def history_window_for_cadence(cadence_seconds: float) -> float:
+    """How much OD history to retain for a vial read every ``cadence_seconds``."""
+    return (HISTORY_WINDOW_SECONDS if cadence_seconds < SLOW_CADENCE_SECONDS
+            else max(HISTORY_WINDOW_SECONDS, SLOW_HISTORY_WINDOW_SECONDS))
+
+
 #: How often the engine recomputes. The estimate does not change meaningfully
 #: in one 10 s sensor cycle, and this keeps vialNN_growth.csv ~1/6 the size of
 #: vialNN_OD.csv.
@@ -644,7 +682,9 @@ def best_window_fit(
 
     n = len(times_s)
     span = (times_s[-1] - times_s[0]) if n >= 2 else 0.0
-    if n < MIN_SAMPLES or span < MIN_FIT_SPAN_SECONDS:
+    cadence = _median_cadence(times_s)
+    min_samples = min_samples_for_cadence(cadence)
+    if n < min_samples or span < MIN_FIT_SPAN_SECONDS:
         return GrowthEstimate(
             method=method,
             n_points=n,
@@ -653,11 +693,10 @@ def best_window_fit(
             flags=_merge_flags((FLAG_SHORT_SPAN,), extra_flags),
         )
 
-    cadence = _median_cadence(times_s)
     if window_seconds is None:
         window = min(
             max(WINDOW_FRACTION * span, MIN_FIT_SPAN_SECONDS),
-            PREFERRED_FIT_SPAN_SECONDS,
+            preferred_span_for_cadence(cadence),
         )
     else:
         window = float(window_seconds)
@@ -671,8 +710,8 @@ def best_window_fit(
     else:
         step = max(cadence, slack / MAX_WINDOW_CANDIDATES, 1e-9)
 
-    expected = (window / cadence + 1.0) if cadence > 0 else float(MIN_SAMPLES)
-    min_window_samples = max(MIN_SAMPLES, int(math.ceil((1.0 - MAX_MISSING_FRACTION) * expected)))
+    expected = (window / cadence + 1.0) if cadence > 0 else float(min_samples)
+    min_window_samples = max(min_samples, int(math.ceil((1.0 - MAX_MISSING_FRACTION) * expected)))
 
     best_r2: float = -1.0
     best_bounds: Optional[tuple] = None
@@ -1053,7 +1092,8 @@ def estimate_chemostat(
     base_flags = _merge_flags(
         (FLAG_ASSUMES_COMMANDED_D, FLAG_R2_IS_DRIFT_FIT), extra_flags
     )
-    if n < MIN_SAMPLES or span < MIN_FIT_SPAN_SECONDS:
+    min_samples = min_samples_for_cadence(_median_cadence(times_s))
+    if n < min_samples or span < MIN_FIT_SPAN_SECONDS:
         return GrowthEstimate(
             method=METHOD_CHEMOSTAT, n_points=n, span_seconds=span,
             flags=_merge_flags((FLAG_SHORT_SPAN,), base_flags),
@@ -1065,7 +1105,7 @@ def estimate_chemostat(
         if t >= cutoff:
             t_win.append(t)
             o_win.append(od)
-    if len(t_win) < MIN_SAMPLES:
+    if len(t_win) < min_samples:
         t_win, o_win = list(times_s), list(ods)
     fit = fit_log_linear(t_win, o_win)
     if fit is None:
@@ -1281,15 +1321,16 @@ def estimate(
     above.sort(key=lambda p: p[0])
     # Only needed to tell `low_od` from `short_span`, so it is computed only
     # when the estimate is about to be refused.
-    n_valid = len(above) if len(above) >= MIN_SAMPLES else sum(
+    min_samples = min_samples_for_cadence(_median_cadence([t for t, _ in above]))
+    n_valid = len(above) if len(above) >= min_samples else sum(
         1 for t, od in samples
         if 0.0 < od < _INF and cutoff <= t < _INF
     )
 
-    if len(above) < MIN_SAMPLES:
+    if len(above) < min_samples:
         # Distinguish "the culture is too dilute to measure" from "we simply
         # have not logged enough yet" — they need different operator responses.
-        flag = FLAG_LOW_OD if n_valid >= MIN_SAMPLES else FLAG_SHORT_SPAN
+        flag = FLAG_LOW_OD if n_valid >= min_samples else FLAG_SHORT_SPAN
         return GrowthReport(
             growth=GrowthEstimate(
                 method=METHOD_CHEMOSTAT if is_chemostat else METHOD_SEGMENT,

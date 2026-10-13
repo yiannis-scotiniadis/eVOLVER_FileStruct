@@ -305,24 +305,16 @@ def _closure(fn, name):
     return fn.__closure__[fn.__code__.co_freevars.index(name)].cell_contents
 
 
-def test_a_nonzero_settle_is_refused() -> None:
-    """The stirrers never stop, and the only way a settle could currently be
-    honoured is by blocking the sensor thread -- which stalls the TEMPERATURE
-    lane too and multiplies over-temperature detection latency by three. The
-    value is refused rather than documented, because that failure is silent
-    and lands on the safety path."""
+def test_the_global_settle_knob_is_gone() -> None:
+    """Pausing the stirrers before OD reads is a per-group setting
+    (``od_stir_pause``, test_od_stir_pause.py), never a process-wide settle:
+    a global settle could only be honoured by blocking the sensor thread,
+    which stalls the TEMPERATURE lane and multiplies over-temperature
+    detection latency. The old knob must not come back."""
+    import inspect
     import app as A
-    saved = A.OD_SETTLE_SECONDS
-    try:
-        for bad in (0.5, 2.0, 30.0, -1.0):
-            with pytest.raises(ValueError) as exc:
-                A.configure_cadence(od_settle_seconds=bad)
-            assert "not implemented" in str(exc.value), exc.value
-        assert A.OD_SETTLE_SECONDS == 0.0
-        A.configure_cadence(od_settle_seconds=0.0)  # zero is fine
-        assert A.OD_SETTLE_SECONDS == 0.0
-    finally:
-        A.OD_SETTLE_SECONDS = saved
+    assert not hasattr(A, "OD_SETTLE_SECONDS")
+    assert "od_settle_seconds" not in inspect.signature(A.configure_cadence).parameters
 
 
 def test_od_lane_is_currently_every_tick() -> None:
@@ -334,7 +326,6 @@ def test_od_lane_is_currently_every_tick() -> None:
     import growth_rate as g
     assert A.OD_EVERY_N_TICKS == 1, "OD lane is decimated"
     assert A.OD_INTERVAL_SECONDS == A.SENSOR_LOOP_INTERVAL_SECONDS
-    assert A.OD_SETTLE_SECONDS == 0.0, "a settle implies stopping the stirrers"
     # The constants that must move with the OD cadence, at their 10 s values.
     assert g.PREFERRED_FIT_SPAN_SECONDS == 1800.0
     assert g.MIN_SAMPLES == 30
@@ -344,9 +335,9 @@ def test_od_lane_is_currently_every_tick() -> None:
 def test_configure_cadence_recomputes_the_od_interval() -> None:
     import app as A
     saved = (A.SENSOR_LOOP_INTERVAL_SECONDS, A.OD_EVERY_N_TICKS,
-             A.OD_SETTLE_SECONDS, A.OD_INTERVAL_SECONDS)
+             A.OD_INTERVAL_SECONDS)
     try:
-        A.configure_cadence(base_seconds=5.0, od_every=4, od_settle_seconds=0.0)
+        A.configure_cadence(base_seconds=5.0, od_every=4)
         assert A.OD_INTERVAL_SECONDS == 20.0
         with pytest.raises(ValueError):
             A.configure_cadence(od_every=0)
@@ -354,7 +345,7 @@ def test_configure_cadence_recomputes_the_od_interval() -> None:
             A.configure_cadence(base_seconds=0)
     finally:
         (A.SENSOR_LOOP_INTERVAL_SECONDS, A.OD_EVERY_N_TICKS,
-         A.OD_SETTLE_SECONDS, A.OD_INTERVAL_SECONDS) = saved
+         A.OD_INTERVAL_SECONDS) = saved
 
 
 # ---------------------------------------------------------------------------

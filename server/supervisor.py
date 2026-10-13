@@ -65,6 +65,7 @@ from experiment_engine import (
     materialize_od_acquisition,
     od_curve_dark_subtracted,
 )
+from od_stir_pause import StirPauseScheduler
 from vessels import VesselRegistry
 from vial_override import OverrideError
 
@@ -172,6 +173,7 @@ class ExperimentSupervisor:
         maintenance_timeout_minutes: float = DEFAULT_MAINTENANCE_TIMEOUT_MINUTES,
         machine_dir: Optional[Path] = None,
         max_concurrent_runs: int = MAX_CONCURRENT_RUNS,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self._manager = serial_manager
         self._data_logger = data_logger
@@ -202,6 +204,14 @@ class ExperimentSupervisor:
         )
         # name -> engine, in load order.
         self._runs: dict[str, ExperimentEngine] = {}
+        # Machine-wide stir-pause schedule (od_stir_pause.py). Machine-wide
+        # because the stir write and the OD read both serve all sixteen vials;
+        # per-vial because each vial follows its own group's config. Runs on
+        # a MONOTONIC clock -- the sensor loop stamps OD acquisitions and
+        # pump-schedule ends on the same one -- never on the engines' wall
+        # clock, which can jump.
+        self._monotonic = monotonic
+        self._stir_pause = StirPauseScheduler(clock=monotonic)
         # Stopped experiments, remembered until another experiment claims one
         # of their vials (or they are deleted/renamed). A manual pump on a
         # just-stopped experiment's vial still books against ITS bottle and
@@ -845,10 +855,22 @@ class ExperimentSupervisor:
     def _resend_stir_locked(self) -> None:
         """ONE stir write per tick for every experiment's driven vials,
         re-asserted every tick (drift protection, SPEC §9 step 6). Vials no
-        experiment drives keep whatever manual control last set."""
+        experiment drives keep whatever manual control last set.
+
+        This is also where a stir pause happens (od_stir_pause.py): a pausing
+        vial is written at ``min(stir, pause_pwm)`` while it settles. It has to
+        be HERE, inside the composition, because this write re-asserts every
+        vial every tick -- a pause applied anywhere else would be undone by
+        the next one. ``min`` rather than ``pause_pwm`` so a vial an operator
+        kept at a lower stir is never sped up by its pause."""
         targets: dict[int, int] = {}
         for engine in self._runs.values():
             targets.update(engine.stir_targets())
+        now = self._monotonic()
+        self._sync_stir_pause_locked(now)
+        for vial, pwm in self._stir_pause.stir_overrides(now).items():
+            if vial in targets:
+                targets[vial] = min(int(targets[vial]), int(pwm))
         if not targets:
             return
         current = list(getattr(self._manager, "stir_speed", [0] * N_VIALS))
@@ -856,6 +878,56 @@ class ExperimentSupervisor:
         for vial, value in targets.items():
             stir[vial] = int(value)
         self._manager.set_stir(stir)
+
+    # ------------------------------------------------------------------
+    # Stir pause before OD reads (od_stir_pause.py, SPEC §9.1)
+    # ------------------------------------------------------------------
+
+    def _sync_stir_pause_locked(self, now: float) -> None:
+        """Bring the schedule up to date with every engine's pausing vials.
+
+        Called at BOTH ends of a tick. At the start (``classify_od_read``)
+        so the first read after a run starts or resumes is already judged
+        against its pause config -- syncing only in the stir write would let
+        that one stirred read through as if the vial never paused."""
+        configs: dict = {}
+        suspended: set[int] = set()
+        for engine in self._runs.values():
+            c, held = engine.stir_pause_targets()
+            configs.update(c)
+            suspended |= held
+        self._stir_pause.sync(configs, suspended, now=now)
+
+    def classify_od_read(
+        self,
+        read_started_at: float,
+        valid: Optional[dict[int, bool]] = None,
+    ) -> dict[int, str]:
+        """Which pausing vials accept the OD acquisition that began at
+        ``read_started_at`` (this supervisor's monotonic clock). Vials absent
+        from the result do not pause and accept every read. An accepted read
+        ends that vial's settle; the composed write at the end of this tick
+        restores its stir, before any dilution decided on the read fires."""
+        with self._lock:
+            self._sync_stir_pause_locked(float(read_started_at))
+            return self._stir_pause.classify(read_started_at, valid)
+
+    def note_dilutions(self, vials, ends_at: float) -> None:
+        """A pump schedule touching ``vials`` finishes at ``ends_at``
+        (monotonic): their next pause waits for ``min_mix_seconds`` of mixing
+        after it."""
+        with self._lock:
+            for vial in vials:
+                if self._stir_pause.note_dilution(int(vial), ends_at):
+                    log.warning(
+                        "vial %s was diluted mid-settle; its stir pause was "
+                        "abandoned and stir restored", vial,
+                    )
+
+    def stir_pause_snapshot(self) -> dict[int, dict]:
+        """Per-vial stir-pause state for the dashboard."""
+        with self._lock:
+            return self._stir_pause.snapshot(self._monotonic())
 
     def check_maintenance_timeout(self) -> list[tuple[int, PumpAction, str]]:
         """Every experiment's maintenance failsafe, plus the machine hold's.

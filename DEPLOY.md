@@ -410,7 +410,7 @@ git fetch origin --tags
 ./deploy.sh <new-tag>
 
 # 3. Apply it. install.sh is idempotent: it updates the venv from
-#    requirements.txt and re-registers the systemd unit. For a major
+#    requirements.txt and re-registers the systels md unit. For a major
 #    dependency jump (e.g. a numpy major version), rebuild the venv
 #    first: rm -rf /home/pi/evolver-gui/.venv
 cd /home/pi/evolver-gui && ./install.sh
