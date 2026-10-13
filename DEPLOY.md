@@ -117,33 +117,41 @@ If `/opt/python3.11/bin/python3.11` is missing, complete the Prerequisites secti
 
 ### P3.3 Get the code onto the RPi
 
-The Pi keeps two directories. `evolver-src` is a full git clone — history, docs, tests,
-tags — and is never run directly. `evolver-gui` is the runtime directory that `install.sh`
-and `evolver.service` actually use, and holds nothing but what a tag of `evolver-src`
-actually needs to run: `deploy.sh` builds/updates it via `git archive`, which honors the
-`export-ignore` rules in `.gitattributes` that mark everything else (docs, tests,
-`mac_original/`/`rpi_original/` reference code, dev tooling) as not part of that archive.
-This is what keeps the box that's actually running the server free of files it never reads.
+The Pi keeps two directories, and every procedure in this document depends on keeping them
+apart:
+
+| Directory | What it is | Written by |
+|---|---|---|
+| `/home/pi/evolver-src` | A full git clone: history, docs, tests, tags. Never run. | `git`, and nothing else |
+| `/home/pi/evolver-gui` | The runtime directory `install.sh` and `evolver.service` use. **Not a git checkout:** an export of one release tag, plus the rig's state. | `deploy.sh` (code), the server (state) |
+
+`deploy.sh` builds `evolver-gui` from a tag with `git archive`, which honours the
+`export-ignore` rules in `.gitattributes`, so docs, tests, `mac_original/`/`rpi_original/` and
+dev tooling never reach the runtime directory. Because `evolver-gui` has no git history of its
+own, `deploy.sh` records what it deployed in `evolver-gui/DEPLOYED_VERSION` (tag, commit, time).
 
 ```bash
 cd /home/pi
-git clone <repo-url> evolver-src
+git clone https://github.com/yiannis-scotiniadis/eVOLVER_FileStruct.git evolver-src
 cd evolver-src
-git checkout pilot-v0.1.0
-./deploy.sh pilot-v0.1.0        # builds /home/pi/evolver-gui from that tag
+git checkout <newest-tag>        # deploy.sh runs from this checkout; the default branch may not have it
+./deploy.sh <newest-tag>         # builds /home/pi/evolver-gui from that tag
 ```
 
-`deploy.sh` never touches `evolver-gui/{calibration,experiments,logs,machine,exports,.venv}`
-— that's the rig's persistent state, lives only under `evolver-gui`, and is never part of
-`evolver-src`'s working tree. Re-running `deploy.sh` (for an update, or after editing
-`.gitattributes`) is always safe for exactly that reason — see "Installing updates" below.
+`deploy.sh` never touches `evolver-gui/{calibration,experiments,exports,logs,machine,.venv}` —
+the rig's persistent state. Its sync uses `rsync --delete`, so before it changes anything it
+**refuses** to run if pointed at `evolver-src` itself, at any directory containing `.git`, at
+`$HOME`, at a non-empty directory that isn't an eVOLVER runtime, or at a runtime directory
+holding top-level files no release put there — and it refuses while `evolver.service` is
+running. Each of those is a way the sync would otherwise delete something. A refusal changes
+nothing; read the message, fix what it names, run it again.
 
-If no remote exists, `rsync` the dev tree into `evolver-src` (not into `evolver-gui`
-directly — `deploy.sh` still does the export step) and run `deploy.sh` from there:
+If no remote exists, rsync the dev tree — **including `.git`**, since `deploy.sh` exports from
+git — into `evolver-src` (never into `evolver-gui`) and run `deploy.sh` from there:
 
 ```powershell
-# From the Windows dev machine — this seeds evolver-src, not evolver-gui directly
-rsync -avz --exclude='.git' --exclude='__pycache__' --exclude='experiments/' `
+# From the Windows dev machine — this seeds evolver-src, not evolver-gui
+rsync -avz --exclude='__pycache__' --exclude='.venv/' --exclude='experiments/' --exclude='logs/' `
     "c:\Research\BIOLOGY\PersonalResearch\EVOLVER_GUI_DEV\eVOLVER_FileStruct\" `
     pi@evolver-001:/home/pi/evolver-src/
 ```
@@ -152,13 +160,14 @@ rsync -avz --exclude='.git' --exclude='__pycache__' --exclude='experiments/' `
 
 ```bash
 cd /home/pi/evolver-gui
-chmod +x install.sh
 ./install.sh
 ```
 
-The installer:
-- Installs `python3`, `python3-venv`, `python3-pip` via apt.
-- Creates a venv at `.venv/` and installs pinned requirements.
+The installer (safe to re-run; every update does):
+- Picks a Python ≥ 3.10 (system `python3`, else `/opt/python3.11`).
+- Creates `.venv/` — rebuilding it only if the interpreter's version changed — and installs the
+  pinned requirements, skipping pip entirely when `requirements.txt` is unchanged since the
+  last successful install.
 - Adds `pi` to `dialout` for `/dev/ttyAMA0` access (logout/login required).
 - Generates a Flask secret at `/etc/evolver/secret.env` (mode 0600, root-owned).
 - Registers `/etc/systemd/system/evolver.service` but does **not** start it.
@@ -386,57 +395,152 @@ smaller than the largest bolus the controller can request.**
 
 ## Installing updates
 
-Future versions ship as git tags (`pilot-v0.1.2`, then `v0.2.0`, …). Follow this protocol to move the rig to a new version.
+Versions ship as git tags (`pilot-v0.1.11`, …). This is the whole procedure. Every step names
+the directory it runs in, because running a command in the wrong one of the two directories
+(P3.3) is how this procedure has failed before — see "What went wrong on 2026-10-11" below.
 
-**Principles**
-- **Deploy by tag, never a moving branch.** Always check out a tag in `evolver-src`, never `git pull` on `main` — tags are reproducible and give a clean rollback target.
-- **Updates end the running experiment.** Stopping the service to apply an update fires the SIGTERM handler, which calls `stop_experiment` and marks the run STOPPED (it cannot be re-`start`ed — you'd create a fresh experiment). **Update between experiments, not mid-run.**
-- **`deploy.sh` cannot touch state, by construction.** `calibration/`, `experiments/`, `logs/`, `machine/`, `exports/` and `.venv/` exist only under `evolver-gui` and are excluded from every sync it does — an update cannot alter or lose them. The backup-before-update ritual this section used to require is gone; it's still wise to back up `experiments/` off-Pi periodically (SD cards fail), just not *because of* the update.
-- **Test the new tag before it touches the live rig** — run the test suite on a dev machine and/or boot the new tag in `--mock` mode first.
+**Rules**
+- **`git` only ever runs in `evolver-src`, and `deploy.sh` only ever runs from `evolver-src`.**
+  `evolver-gui` is not a git checkout; `git` there answers "not a git repository", and that is
+  correct. If a rig's `evolver-gui` *is* a git checkout, migrate it first (below).
+- **Deploy by tag, never a branch.** Tags are reproducible and give a clean rollback target.
+  `deploy.sh` refuses branch names.
+- **Never move or delete a tag once it is pushed — cut a new one.** The rig records the tag it
+  deployed, and a rollback names it. `pilot-v0.2.0` was deployed to eVOLVER-001 and then
+  renamed on GitHub to `pilot-v0.1.10`; anything that only knew the old name couldn't find it.
+  (`DEPLOYED_VERSION` also records the commit, which `deploy.sh` accepts when a tag is gone.)
+- **Updates end the running experiment.** Stopping the service fires the SIGTERM handler, which
+  calls `stop_experiment` and marks the run STOPPED (it cannot be re-`start`ed — you'd create a
+  fresh experiment). **Update between experiments, not mid-run.** `deploy.sh` refuses while
+  the service is running.
+- **`deploy.sh` cannot touch state.** `calibration/`, `experiments/`, `exports/`, `logs/`,
+  `machine/` and `.venv/` are excluded from its sync, so an update cannot alter or lose them.
+  Back `experiments/` up off-Pi periodically anyway — SD cards fail.
+- **Test the new tag before it touches the live rig** — the test suite on a dev machine and/or
+  the new tag in `--mock` mode.
 
 ### Update an existing Pi to a new version
 
 ```bash
-# 0. Pre-flight — confirm no experiment is running (or accept that it ends).
+# 0. While the server is still running, do everything that needs the network.
 #    Read the new tag's notes for state.json / calibration / requirements changes.
 cd /home/pi/evolver-src
-git describe --tags                               # record CURRENT tag (rollback target)
+git fetch origin --tags
+git checkout <new-tag>                      # so the deploy.sh you run is the newest one
+cat /home/pi/evolver-gui/DEPLOYED_VERSION   # note tag= and commit=: your rollback target
 
 # 1. Stop the service (ends any running experiment, zeros actuators).
 sudo systemctl stop evolver
 
-# 2. Build the new tag into evolver-gui.
-git fetch origin --tags
+# 2. Export the new tag into evolver-gui. Still in evolver-src.
 ./deploy.sh <new-tag>
 
-# 3. Apply it. install.sh is idempotent: it updates the venv from
-#    requirements.txt and re-registers the systels md unit. For a major
-#    dependency jump (e.g. a numpy major version), rebuild the venv
-#    first: rm -rf /home/pi/evolver-gui/.venv
+# 3. Apply it. install.sh re-registers the systemd unit, rebuilds the venv only if the
+#    interpreter changed, and runs pip only if requirements.txt changed — so a routine
+#    update needs no network from here on. To force a clean venv: rm -rf .venv first.
 cd /home/pi/evolver-gui && ./install.sh
 
-# 4. Restart and verify.
+# 4. Start and verify.
 sudo systemctl start evolver
 systemctl status evolver --no-pager               # active (running)?
+cat DEPLOYED_VERSION                              # tag= is <new-tag>
 tail -n 40 logs/evolver.log                       # "loaded calibration", clean sensor cycles?
 curl -s localhost:5000/api/sensors/all | head -c 200; echo
 # Hard-refresh the dashboard; spot-check one manual control.
 ```
 
-If `install.sh` fails at the pip step (e.g. an unresolvable dependency), the service stays down until you fix it or roll back — which is exactly why you test the new tag off the live rig first.
+If `deploy.sh` refuses, nothing has changed — every check runs before the sync — so
+`sudo systemctl start evolver` brings the old version straight back while you sort out what the
+message names. If `install.sh` fails at the pip step (an unresolvable dependency, or no network
+when `requirements.txt` changed), the service stays down until you fix it or roll back — which is
+exactly why you test the new tag off the live rig first.
 
 ### Rollback
 
-Symmetric, because you deploy by tag, and just as safe for `calibration/`/`experiments/` as the forward update:
-
 ```bash
 sudo systemctl stop evolver
-cd /home/pi/evolver-src && ./deploy.sh <previous-tag>
+cd /home/pi/evolver-src && ./deploy.sh <previous-tag>   # do NOT check out the old tag first
+cd /home/pi/evolver-gui && ./install.sh                  # Permission denied? bash install.sh
+sudo systemctl start evolver
+```
+
+Roll back with the **newest** `deploy.sh`: leave `evolver-src` on the newest checkout and just
+name the older tag. `deploy.sh` exports by tag name, so the checkout doesn't need to match — and
+`pilot-v0.1.9` through `pilot-v0.1.11` carry the `deploy.sh` that caused the 2026-10-11
+incident. If the tag no longer exists, pass the `commit=` value from `DEPLOYED_VERSION` instead.
+Tags cut before the fix ship `install.sh` without its executable bit, hence the
+`bash install.sh` fallback. Nothing to restore afterwards: neither direction touches state.
+
+### Migrating a single-clone rig (one-time)
+
+Before the `evolver-src`/`evolver-gui` split, `evolver-gui` *was* the git clone and an update was
+`git checkout <tag>` inside it. A rig still in that layout has to be migrated once, and
+`deploy.sh` refuses to run against it until it has been.
+
+**eVOLVER-001 is half-migrated (as of 2026-10-13).** Its `evolver-gui` holds the export of
+`pilot-v0.1.10` (commit `80f201a`, deployed under the since-renamed tag `pilot-v0.2.0`) next to
+a gutted `.git` that has only `.git/logs/` left — so `git` there says "not a git repository" —
+and `evolver-src` does not exist yet. The steps below cover it; skip step 2a there, because the
+clone it reads is already gone.
+
+`<newest-tag>` must be a tag cut **after** the 2026-10-13 `deploy.sh` fix. `pilot-v0.1.11` and
+everything before it carry the old script, which has none of the checks described below.
+
+```bash
+# 1. Stop the service (ends any running experiment).
+sudo systemctl stop evolver
+
+# 2a. Working clone only: record what the old release put at the top level, so deploy.sh
+#     may replace those entries (docs, tests, mac_original/, ...) instead of refusing on them.
+git -C /home/pi/evolver-gui ls-tree --name-only HEAD > /home/pi/evolver-gui/.deploy-manifest
+
+# 2b. Take the git metadata out of the runtime directory. Move it, don't delete it: a working
+#     clone holds any local branches and unpushed commits. (eVOLVER-001's local branch,
+#     pi-inline-edits, was pushed and bundled in ~/pi-inline-edits.bundle back in June.)
+mkdir -p ~/backups
+mv /home/pi/evolver-gui/.git ~/backups/evolver-gui-dotgit-$(date +%F)
+
+# 3. Create the source clone, with an identity for the calibration commit in step 6.
+cd /home/pi
+git clone https://github.com/yiannis-scotiniadis/eVOLVER_FileStruct.git evolver-src
+cd evolver-src
+git checkout <newest-tag>
+git config user.name  "<your name>"
+git config user.email "<your email>"
+
+# 4. Deploy. If deploy.sh lists top-level entries that aren't part of the release, move each
+#    one out and run it again. On eVOLVER-001 that is the two old backup folders:
+./deploy.sh <newest-tag>
+mv /home/pi/evolver-gui/evolver-backup-2026-06-0* ~/backups/
+./deploy.sh <newest-tag>                       # succeeds; writes evolver-gui/DEPLOYED_VERSION
+
+# 5. Install, start, verify — steps 3 and 4 of the update procedure.
 cd /home/pi/evolver-gui && ./install.sh
 sudo systemctl start evolver
 ```
 
-No `experiments/`/`calibration/` restore step needed — `deploy.sh` never touched them going forward, so there's nothing to undo.
+**6. Commit back the calibration that exists only on the rig** — see the next section. On
+eVOLVER-001 that is the Tier 2 pump calibration (`calibration/pump/2026-09-06T222026Z.json`), the
+*C. necator* H16 organism profile (`calibration/od/2026-10-11T215618Z.json`) and the
+`current.json` that points at both. Until they're committed they exist on that SD card and
+nowhere else.
+
+### What went wrong on 2026-10-11
+
+eVOLVER-001 had never been migrated, so `evolver-gui` was still the git clone, with `deploy.sh`
+checked out inside it. Running `./deploy.sh pilot-v0.2.0` there exported the tag and rsynced it
+with `--delete` back over the clone it was running from. A `git archive` export has no `.git`,
+so the sync deleted the clone's `HEAD`, `objects/`, `refs/` and `config`. `.git/logs/` survived
+only by accident: `--exclude logs` was unanchored, so it matched `.git/logs/` as well as
+`evolver-gui/logs/`. The same unanchored excludes stripped `evolver-backup-2026-06-0*/` of
+everything but their `experiments/` folders. No code or rig state was lost — the commit is on
+GitHub, and calibration, experiments, logs and the venv were excluded from the sync.
+
+`deploy.sh` now: refuses to target its own clone, any directory containing `.git`, `$HOME`, or a
+non-runtime directory; anchors every exclude to the top level and excludes `.git`
+unconditionally; refuses to delete top-level entries no release put there; refuses while the
+service runs; and records the deployed tag and commit in `DEPLOYED_VERSION`, since the runtime
+directory has no history to ask.
 
 ### Clean re-install (new SD card / new Pi)
 
@@ -450,9 +554,9 @@ identity, and which parts of Phase 4 a rebuild may skip.
 The shape of it: flash Raspberry Pi OS Lite (64-bit, ≥32 GB, username `pi`) → harvest the old
 card → DHCP network path (no static IP needed — Tailscale carries the real address) → UART
 (`enable_uart=1` + `dtoverlay=disable-bt`, serial console off) →
-`apt install python3-venv python3-pip git` → `git clone` into `evolver-src` →
-`git checkout <tag>` → `./deploy.sh <tag>` to build `evolver-gui` → restore `experiments/` +
-calibration runtime state into `evolver-gui` → `cd evolver-gui && ./install.sh` → Tailscale
+`apt install python3-venv python3-pip git rsync` → `git clone` into `evolver-src` →
+`git checkout <tag>` → `./deploy.sh <tag>` to build `evolver-gui` → restore `experiments/`,
+`calibration/` and `machine/` into `evolver-gui` → `cd evolver-gui && ./install.sh` → Tailscale
 (rejoin as `evolver-001`) → mock test → Phase 4 hardware validation →
 `systemctl enable --now evolver`.
 
@@ -473,14 +577,21 @@ like `experiments/`.
 The tradeoff: that divergence is real calibration history (gravimetric pump runs, OD dilution
 series, thermistor two-point sessions) that no longer lands in git automatically, so it isn't
 backed up by `git push` the way it used to be intended to. After any bench calibration
-session, copy the new envelopes back into the source tree and commit, so they're preserved:
+session, copy the new envelopes back into the source tree and commit them on a branch —
+`evolver-src` sits on a detached tag checkout, where a commit is easily lost:
 
 ```bash
-rsync -a /home/pi/evolver-gui/calibration/ /home/pi/evolver-src/calibration/
 cd /home/pi/evolver-src
-git add calibration/ && git commit -m "calibration: pull in <what you just ran>"
+git switch -c calibration/$(date +%F)
+rsync -a /home/pi/evolver-gui/calibration/ calibration/
+git status --short calibration/        # new envelopes, current.json, the derived .txt views
+git add calibration/                   # _sessions/ and reconciliation_log.json are gitignored
+git commit -m "calibration: <what you ran> on eVOLVER-001"
+git push -u origin HEAD
+git switch --detach <deployed-tag>     # back to a release checkout before the next deploy
 ```
 
+Then merge that branch into the release branch on the dev machine, so later tags carry it.
 This is a manual, deliberate step (do it after a calibration session, not as part of a
 routine code update) rather than something `deploy.sh` does for you — going the other
 direction automatically is exactly the overwrite hazard this section used to describe.
@@ -490,7 +601,7 @@ direction automatically is exactly the overwrite hazard this section used to des
 eVOLVER-001 is reached over Tailscale. On Yale's symmetric-NAT WiFi the Pi's per-peer reachability decays when idle — a peer can only reach the Pi after the Pi has initiated a path to *that* peer. `deploy/ts-keepalive/` holds a systemd timer that, every 20 s, has the Pi `tailscale ping` every enrolled peer (self excluded) to keep all paths warm. Install on the Pi:
 
 ```bash
-cd deploy/ts-keepalive
+cd /home/pi/evolver-gui/deploy/ts-keepalive
 sudo install -m 0755 ts-keepalive-pingall.sh /usr/local/bin/ts-keepalive-pingall.sh
 sudo install -m 0644 ts-keepalive.service /etc/systemd/system/ts-keepalive.service
 sudo install -m 0644 ts-keepalive.timer   /etc/systemd/system/ts-keepalive.timer

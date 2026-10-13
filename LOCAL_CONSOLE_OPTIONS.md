@@ -86,8 +86,11 @@ And it is code you now own, though at 132 lines against a stable API that is a s
 ```bash
 sudo systemctl edit getty@tty1        # ExecStart=-/sbin/agetty --autologin pi %I $TERM
 # ~/.bash_profile on tty1 only:
-[ "$(tty)" = /dev/tty1 ] && exec python3 /home/pi/evolver-gui/evolver_console.py
+[ "$(tty)" = /dev/tty1 ] && exec /home/pi/console-venv/bin/python /home/pi/evolver-src/evolver_console.py
 ```
+
+The console lives in `evolver-src`, not the runtime directory — `.gitattributes` keeps it out
+of the export — and has its own venv for its extra dependencies (`SETUP_FROM_SCRATCH.md` §13.3).
 
 Run it under a systemd unit with `Restart=always` if you want it to survive its own crashes, and
 give it `OOMScoreAdjust=100` so it dies before the control server does.

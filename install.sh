@@ -1,16 +1,24 @@
 #!/bin/bash
-# eVOLVER pilot installer — run as the `pi` user from /home/pi/evolver-gui
+# eVOLVER installer — run as the `pi` user from /home/pi/evolver-gui, after deploy.sh.
 #
 # This directory is a runtime export, not a git checkout: `deploy.sh` (run from the
 # `evolver-src` source clone) builds it via `git archive`, so it never contains docs, tests,
 # or DEPLOY.md itself — see DEPLOY.md in evolver-src, or on GitHub, for the full procedure.
+#
+# Safe to re-run on every update. The venv is rebuilt only when the interpreter's version
+# changes, and pip runs only when requirements.txt has changed since the last successful
+# install — so a routine update needs no network once the service is stopped.
 set -euo pipefail
 
 REPO_DIR="/home/pi/evolver-gui"
 VENV_DIR="$REPO_DIR/.venv"
+REQ_STAMP="$VENV_DIR/.requirements.sha256"
 SECRET_DIR="/etc/evolver"
 SECRET_FILE="$SECRET_DIR/secret.env"
-LOG_DIR="/var/log/evolver"
+if [[ $EUID -eq 0 ]]; then
+    echo "ERROR: run this as pi, not root — it calls sudo itself where it needs to." >&2
+    exit 1
+fi
 if [[ "$(pwd)" != "$REPO_DIR" ]]; then
     echo "ERROR: run this from $REPO_DIR (currently: $(pwd))" >&2
     exit 1
@@ -30,24 +38,34 @@ else
     exit 1
 fi
 
-echo "[1/6] Using Python: $PYTHON_BIN ($("$PYTHON_BIN" --version 2>&1))"
+echo "[1/5] Using Python: $PYTHON_BIN ($("$PYTHON_BIN" --version 2>&1))"
 
-echo "[2/6] Creating Python virtualenv at $VENV_DIR..."
-"$PYTHON_BIN" -m venv "$VENV_DIR"
-"$VENV_DIR/bin/pip" install --upgrade pip
-"$VENV_DIR/bin/pip" install -r "$REPO_DIR/requirements.txt"
+echo "[2/5] Python virtualenv at $VENV_DIR..."
+want=$("$PYTHON_BIN" -c 'import sys; print("%d.%d" % sys.version_info[:2])')
+have=$("$VENV_DIR/bin/python" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || true)
+if [[ "$have" != "$want" ]]; then
+    # A venv built for another interpreter (e.g. after an OS upgrade) keeps importing the old
+    # site-packages; `python -m venv` over it does not rebuild them.
+    [[ -z "$have" ]] || echo "  -> venv is Python $have but the interpreter is $want: rebuilding"
+    rm -rf "$VENV_DIR"
+    "$PYTHON_BIN" -m venv "$VENV_DIR"
+fi
+req_hash=$(sha256sum "$REPO_DIR/requirements.txt" | cut -d' ' -f1)
+if [[ -f "$REQ_STAMP" && "$(cat "$REQ_STAMP")" == "$req_hash" ]]; then
+    echo "  -> requirements.txt unchanged since the last install; skipping pip"
+else
+    "$VENV_DIR/bin/pip" install --upgrade pip
+    "$VENV_DIR/bin/pip" install -r "$REPO_DIR/requirements.txt"
+    echo "$req_hash" >"$REQ_STAMP"
+fi
 
-echo "[3/6] Adding pi to dialout group (for /dev/ttyAMA0 access)..."
+echo "[3/5] Adding pi to dialout group (for /dev/ttyAMA0 access)..."
 sudo usermod -aG dialout pi
 
-echo "[4/6] Creating log directory $LOG_DIR..."
-sudo mkdir -p "$LOG_DIR"
-sudo chown pi:pi "$LOG_DIR"
-
-echo "[5/6] Generating Flask secret at $SECRET_FILE (if missing)..."
+echo "[4/5] Generating Flask secret at $SECRET_FILE (if missing)..."
 sudo mkdir -p "$SECRET_DIR"
 if [[ ! -f "$SECRET_FILE" ]]; then
-    SECRET=$(python3 -c 'import secrets; print(secrets.token_urlsafe(48))')
+    SECRET=$("$PYTHON_BIN" -c 'import secrets; print(secrets.token_urlsafe(48))')
     echo "EVOLVER_SECRET_KEY=$SECRET" | sudo tee "$SECRET_FILE" >/dev/null
     sudo chmod 600 "$SECRET_FILE"
     sudo chown root:root "$SECRET_FILE"
@@ -56,19 +74,27 @@ else
     echo "  -> $SECRET_FILE already exists, keeping it"
 fi
 
-echo "[6/6] Installing systemd unit..."
+echo "[5/5] Installing systemd unit..."
 sudo cp "$REPO_DIR/evolver.service" /etc/systemd/system/evolver.service
 sudo systemctl daemon-reload
 
+if systemctl is-enabled --quiet evolver 2>/dev/null; then
+    cat <<'EOF'
+
+Install complete. evolver.service is already enabled — start it and check it came up:
+     sudo systemctl start evolver
+     systemctl status evolver --no-pager
+     tail -n 40 /home/pi/evolver-gui/logs/evolver.log
+EOF
+    exit 0
+fi
+
 cat <<'EOF'
 
-Install complete.
+Install complete — first-install next steps:
 
-Next steps (do NOT skip the ordering — old supervisor processes hold /dev/ttyAMA0):
-
-  1. Stop the legacy system:
+  1. Legacy cards only — stop the 2016 supervisor processes, which hold /dev/ttyAMA0:
        sudo supervisorctl stop all
-       sudo supervisorctl status         # confirm all STOPPED
        sudo fuser /dev/ttyAMA0           # must print nothing
 
   2. Log out and back in so the dialout group membership takes effect:

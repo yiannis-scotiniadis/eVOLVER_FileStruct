@@ -492,7 +492,8 @@ backup, multi-phase protocols, and authentication.
 - `DEPLOY.md` — operator runbook for the RPi: hardware validation, the pilot procedure,
   update-by-tag and rollback, day-to-day operations.
 - `SETUP_FROM_SCRATCH.md` — building the Pi's SD card from a freshly flashed headless OS:
-  harvesting the old card, static IP on NetworkManager, the `disable-bt` UART configuration
+  harvesting the old card (incl. calibration git doesn't have yet), DHCP + Tailscale network
+  bring-up, `evolver-src` + `deploy.sh` into `evolver-gui`, the `disable-bt` UART configuration
   and how to verify `/dev/ttyAMA0` is the PL011, restoring the state git does not carry,
   Tailscale identity, and which parts of `DEPLOY.md` Phase 4 a rebuild may skip.
 
@@ -790,8 +791,10 @@ eVOLVER_FileStruct/
                              #   off the Pi (this file, every doc, tests, dev tooling,
                              #   rpi_original/mac_original) — see DEPLOY.md P3.3
   deploy.sh                  # builds/updates the Pi's runtime dir from a tag via
-                             #   `git archive`; run from the source clone (`evolver-src`
-                             #   on the Pi), never copied into the runtime dir itself
+                             #   `git archive` + `rsync --delete`; run from the source clone
+                             #   (`evolver-src`). Refuses any target the sync could damage
+                             #   (its own clone, a dir with .git, $HOME, operator files) —
+                             #   it wiped eVOLVER-001's clone on 2026-10-11 (DEPLOY.md)
 
   rpi_original/              # Original RPi scripts (reference only, do not modify) —
     evolver_UPD.py           #   never imported by server/; export-ignored, dev-tree only

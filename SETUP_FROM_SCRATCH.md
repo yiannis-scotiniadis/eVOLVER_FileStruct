@@ -25,17 +25,20 @@ Getting this split right is most of the job. Three categories:
 
 | Category | Lives where | Rebuild action |
 |---|---|---|
-| **Code** — server, frontend, `install.sh`, `evolver.service`, docs | git, tag `pilot-v0.1.5` | `git clone` + `git checkout <tag>` |
-| **Calibration provenance** — `calibration/*.txt`, `current.json`, `od/`, `temperature/` | **git (tracked)** | comes with the clone — then *verify against this rig* |
-| **Rig state** — `experiments/`, `logs/`, `calibration/_sessions/`, `reconciliation_log.json`, `/etc/evolver/secret.env`, Tailscale node identity, SSH keys, `/boot/firmware/config.txt` | **only the old card** | harvest in Stage 0, restore in Stage 7 |
+| **Code** — server, frontend, `install.sh`, `evolver.service` | git, a release tag | `git clone` into `evolver-src`, `git checkout <tag>`, `./deploy.sh <tag>` (`DEPLOY.md` P3.3) |
+| **Calibration** — `calibration/` | **the old card's `evolver-gui`**; git only has what was committed back | harvest in Stage 0, restore whole in Stage 7 — then *verify against this rig* |
+| **Rig state** — `experiments/`, `machine/`, `logs/`, `/etc/evolver/secret.env`, Tailscale node identity, SSH keys, `/boot/firmware/config.txt` | **only the old card** | harvest in Stage 0, restore in Stage 7 |
 
-The trap is the middle row. Calibration is **tracked in git** (`DEPLOY.md`, "⚠ Calibration is
-not update-safe yet"), so a clone silently hands you *whatever was committed*, which is
-correct today only because nobody has re-calibrated on the Pi without committing. Stage 7
-makes you check rather than assume.
+The trap is the middle row. Since the `evolver-src`/`evolver-gui` split, the rig's calibration
+lives in the runtime directory and reaches git only when someone commits it back
+(`DEPLOY.md`, "Calibration: update-safe now, but provenance needs a manual step"). A fresh
+deploy seeds `calibration/` with *whatever was last committed*, which can be older than the rig's
+— eVOLVER-001's Tier 2 pump calibration and its first organism profile were on the card alone
+for weeks. So Stage 7 restores the old card's `calibration/` whole, and checks it.
 
 The other trap: `experiments/` is the lab notebook. It is gitignored, it exists nowhere else,
-and pulling the card is the moment you can lose it. Stage 0 is not optional.
+and pulling the card is the moment you can lose it. `machine/` is the same kind of thing on a
+smaller scale — shared bottle and carboy levels, and the machine hold. Stage 0 is not optional.
 
 ---
 
@@ -70,7 +73,9 @@ sudo tar czf /home/pi/evolver-001-card-$(date +%F).tar.gz \
     boot/firmware/cmdline.txt \
     var/lib/tailscale/tailscaled.state \
     home/pi/.ssh/authorized_keys \
+    home/pi/evolver-gui/DEPLOYED_VERSION \
     home/pi/evolver-gui/experiments \
+    home/pi/evolver-gui/machine \
     home/pi/evolver-gui/logs \
     home/pi/evolver-gui/calibration
 sudo chown pi:pi /home/pi/evolver-001-card-$(date +%F).tar.gz
@@ -78,8 +83,9 @@ ls -lh /home/pi/evolver-001-card-*.tar.gz
 tar tzf /home/pi/evolver-001-card-$(date +%F).tar.gz | wc -l    # sanity: not empty
 ```
 
-`--ignore-failed-read` is there because a couple of those paths may legitimately not exist
-(`logs/`, `authorized_keys` on a password-auth card). Read tar's warnings — a missing
+`--ignore-failed-read` is there because a few of those paths may legitimately not exist
+(`logs/`, `authorized_keys` on a password-auth card, `DEPLOYED_VERSION` on a card that still
+uses the single-clone layout). Read tar's warnings — a missing
 `experiments/` or `tailscaled.state` is not a warning to shrug at.
 
 Pull it **off the Pi** — the point of the exercise is to not depend on this card:
@@ -93,8 +99,9 @@ scp pi@evolver-001:/home/pi/evolver-001-card-*.tar.gz `
 ### 0.3 Record the things that are settings, not files
 
 ```bash
-git -C /home/pi/evolver-gui describe --tags       # the tag actually deployed
-git -C /home/pi/evolver-gui status --short        # MUST be clean; anything here is uncommitted rig state
+cat /home/pi/evolver-gui/DEPLOYED_VERSION         # the tag and commit actually deployed
+diff -r /home/pi/evolver-src/calibration /home/pi/evolver-gui/calibration
+                                                  # anything listed is calibration git doesn't have
 timedatectl                                       # timezone — CSV timestamps depend on it
 hostnamectl                                       # hostname (Tailscale/MagicDNS name)
 tailscale status --self --json | head -40         # node name + Tailscale IP
@@ -104,10 +111,18 @@ crontab -l; sudo crontab -l
 head -1 /home/pi/evolver-gui/calibration/temp_calibration.txt
 ```
 
-`git status --short` deserves a pause. If `calibration/` shows as modified, **someone
-re-calibrated on the Pi and never committed it** — those values are the real ones and the git
-copy is stale. Copy them out by hand and commit them from the dev machine before you rebuild,
-or the rebuild will quietly install worse calibration than the rig had.
+The `diff` deserves a pause. Anything it lists in `evolver-gui` — a new envelope under `od/`,
+`pump/` or `temperature/`, a changed `current.json` — is **calibration made on the Pi and never
+committed**. Those values are the real ones and git's are stale. The Stage 0.2 tarball already
+holds them, and Stage 7 restores them whole, but commit them back as well (`DEPLOY.md`,
+"Calibration: update-safe now…"), so they stop depending on this card and its tarball.
+(`_sessions/` and `reconciliation_log.json` always show up here; they are per-rig and never
+committed.)
+
+On a card that still uses the single-clone layout (`DEPLOY.md`, "Migrating a single-clone
+rig"), there is no `evolver-src` or `DEPLOYED_VERSION`: use
+`git -C /home/pi/evolver-gui describe --tags` and `git -C /home/pi/evolver-gui status --short`
+instead, where a modified `calibration/` means the same thing.
 
 ### 0.4 Label and shelve the old card
 
@@ -146,7 +161,7 @@ ssh pi@<hostname>.local
 
 ```bash
 sudo apt update && sudo apt full-upgrade -y
-sudo apt install -y git python3-venv python3-pip
+sudo apt install -y git rsync python3-venv python3-pip     # deploy.sh needs git + rsync
 sudo reboot            # if the upgrade touched the kernel or firmware
 ```
 
@@ -342,16 +357,18 @@ hand-edit on the Pi (see "Known issues" below for why hand-edits to tracked file
 
 ## Stage 6 — Get the code onto the card
 
-The clone directory **must** be `/home/pi/evolver-gui` — `install.sh` refuses to run anywhere
-else and `evolver.service` hardcodes it. Note that this differs from the GitHub repo name, so
-name it explicitly:
+Two directories, never the same one (`DEPLOY.md` P3.3): the git clone goes in
+`/home/pi/evolver-src`, and `deploy.sh` exports a release tag from it into
+`/home/pi/evolver-gui`, the runtime directory `install.sh` and `evolver.service` hardcode.
+`evolver-gui` is **not** a git checkout — never clone into it.
 
 ```bash
 cd /home/pi
-git clone https://github.com/yiannis-scotiniadis/eVOLVER_FileStruct.git evolver-gui
-cd evolver-gui
-git checkout pilot-v0.1.5
-git describe --tags                      # pilot-v0.1.5
+git clone https://github.com/yiannis-scotiniadis/eVOLVER_FileStruct.git evolver-src
+cd evolver-src
+git checkout <tag>                       # deploy.sh runs from this checkout
+./deploy.sh <tag>                        # creates /home/pi/evolver-gui
+cat /home/pi/evolver-gui/DEPLOYED_VERSION   # tag=<tag>
 ```
 
 If the repo is private, either use a personal access token for the HTTPS clone, or give this
@@ -360,22 +377,25 @@ card its own SSH deploy key:
 ```bash
 ssh-keygen -t ed25519 -C "evolver-001-$(date +%F)" -f ~/.ssh/id_ed25519 -N ""
 cat ~/.ssh/id_ed25519.pub                # add as a read-only Deploy Key on the GitHub repo
-git clone git@github.com:yiannis-scotiniadis/eVOLVER_FileStruct.git evolver-gui
+git clone git@github.com:yiannis-scotiniadis/eVOLVER_FileStruct.git evolver-src
 ```
+
+A read-only deploy key can't push the calibration commit-back; do that from the dev machine, or
+give the key write access.
 
 **Deploy by tag, never by branch.** `DEPLOY.md`'s update protocol depends on it: a tag is
-reproducible and gives a clean rollback target; `main` is not.
+reproducible and gives a clean rollback target; `main` is not. `deploy.sh` refuses branch names.
 
-Fallback with no network path to GitHub — rsync from the dev machine:
+Fallback with no network path to GitHub — rsync the dev tree, **`.git` included**, into
+`evolver-src`, then run `deploy.sh` from there as above:
 
 ```powershell
-rsync -avz --exclude='.git' --exclude='.venv' --exclude='__pycache__' --exclude='experiments/' `
+rsync -avz --exclude='.venv/' --exclude='__pycache__' --exclude='experiments/' --exclude='logs/' `
     "C:\Research\BIOLOGY\PersonalResearch\EVOLVER_GUI_DEV\eVOLVER_FileStruct\" `
-    pi@evolver-001:/home/pi/evolver-gui/
+    pi@evolver-001:/home/pi/evolver-src/
 ```
 
-This loses the git history, and with it `git describe` and one-command rollback. Use it only
-if you must.
+`deploy.sh` exports from git, so a copy without `.git` can't be deployed at all.
 
 ---
 
@@ -387,30 +407,32 @@ Unpack the Stage 0 backup somewhere scratch, then move each piece into place.
 mkdir -p ~/restore && tar xzf ~/evolver-001-card-<date>.tar.gz -C ~/restore
 ```
 
-### 7.1 The lab notebook
+### 7.1 The lab notebook and machine state
 
 ```bash
 rsync -a ~/restore/home/pi/evolver-gui/experiments/ /home/pi/evolver-gui/experiments/
 ls /home/pi/evolver-gui/experiments/ | wc -l          # same count as the old card
+rsync -a ~/restore/home/pi/evolver-gui/machine/ /home/pi/evolver-gui/machine/
 ```
 
+`machine/` holds the shared bottle and carboy levels (`vessels.json`) and the machine hold
+(`hold.json`); without it the server starts with an empty vessel registry and no hold.
 `logs/` is optional — restore it if you want log continuity, skip it if you want a clean slate.
 
-### 7.2 Calibration runtime state
+### 7.2 Calibration
 
-The tracked files (`temp_calibration.txt`, `OD_cal.txt`, `current.json`, `od/`, `temperature/`)
-came with the clone. Restore only the two gitignored pieces:
+`deploy.sh` seeded `calibration/` with what git has, which can be older than the rig's (Stage
+0.3). Replace it with the old card's — all of it, including `_sessions/` and
+`reconciliation_log.json`:
 
 ```bash
-rsync -a ~/restore/home/pi/evolver-gui/calibration/_sessions/ \
-         /home/pi/evolver-gui/calibration/_sessions/ 2>/dev/null || true
-cp ~/restore/home/pi/evolver-gui/calibration/reconciliation_log.json \
-   /home/pi/evolver-gui/calibration/ 2>/dev/null || true
+rsync -a --delete ~/restore/home/pi/evolver-gui/calibration/ /home/pi/evolver-gui/calibration/
 ```
 
 ### 7.3 Verify calibration is *this rig's* — do not skip
 
 ```bash
+cd /home/pi/evolver-gui
 head -1 calibration/temp_calibration.txt
 ```
 
@@ -425,14 +447,15 @@ every heater the wrong way. `xr` is a closed-loop setpoint, not a PWM: lower `xr
 `xr=0` requests ~82 °C. **Abort and fix before continuing.**
 
 ```bash
-cat calibration/current.json      # od + temperature: "2026-08-20T134535Z"; pump: null; stir: null
-git status --short calibration/   # MUST be clean
+cat calibration/current.json      # the same pointers the old card had (Stage 0.3)
+diff -r ~/restore/home/pi/evolver-gui/calibration calibration     # MUST print nothing
 ```
 
-If `git status` shows `calibration/` as modified after the restore, the restored values
-disagree with the tag. Work out which is right — the versioned JSON envelopes under
-`calibration/od/` and `calibration/temperature/` are the source of truth and the `.txt` files
-are a **derived view** regenerated from `current.json`. Never hand-edit the `.txt` files.
+If the `diff` prints anything, the restore didn't take — rerun 7.2. The versioned JSON envelopes
+under `calibration/{od,temperature,pump}/` are the source of truth, and the `.txt` files are a
+**derived view** regenerated from `current.json`. Never hand-edit the `.txt` files. If Stage 0.3
+found calibration git didn't have, this is the moment to commit it back (`DEPLOY.md`,
+"Calibration: update-safe now…"), if you haven't from the old card.
 
 ### 7.4 The Flask secret
 
@@ -463,18 +486,16 @@ entries from earlier in the rebuild too, if you connected by those in the meanti
 
 ```bash
 cd /home/pi/evolver-gui
-chmod +x install.sh
 ./install.sh
 ```
 
-It prints six steps. What each one means:
+It prints five steps. What each one means:
 
 1. **Picks the interpreter** — prefers system `python3` if ≥ 3.10, else `/opt/python3.11`. On this card it should say 3.11 or 3.13; if it announces `/opt/python3.11` something is wrong.
-2. **Creates `.venv/`** and installs `requirements.txt` (flask 3.1.3, flask-socketio 5.6.1, pyserial 3.5, numpy 2.x) via piwheels + PyPI. Slowest step; a few minutes on a Pi 3B.
+2. **Creates `.venv/`** and installs `requirements.txt` (flask 3.1.3, flask-socketio 5.6.1, pyserial 3.5, numpy 2.x) via piwheels + PyPI. Slowest step; a few minutes on a Pi 3B. On later runs it skips pip unless `requirements.txt` changed, and rebuilds the venv only if the interpreter's version changed.
 3. **Adds `pi` to `dialout`** — required for `/dev/ttyAMA0`.
-4. **Creates `/var/log/evolver`** (vestigial; the unit logs to the journal now).
-5. **Generates `/etc/evolver/secret.env`** if absent, mode 0600, root-owned.
-6. **Installs `evolver.service`** and runs `daemon-reload` — it does **not** start it.
+4. **Generates `/etc/evolver/secret.env`** if absent, mode 0600, root-owned.
+5. **Installs `evolver.service`** and runs `daemon-reload` — it does **not** start it.
 
 Then log out and back in so `dialout` takes effect:
 
@@ -485,8 +506,8 @@ id                          # must list dialout
 ls -l /home/pi/evolver-gui/.venv/bin/python*
 ```
 
-`install.sh`'s closing message mentions `supervisorctl stop all`. **That is legacy** — there is
-no supervisor on this card. Confirm and move on:
+`install.sh`'s first-install message mentions `supervisorctl stop all` for legacy cards. There
+is no supervisor on this card; confirm nothing holds the port and move on:
 
 ```bash
 sudo fuser /dev/ttyAMA0     # must print nothing
@@ -646,10 +667,14 @@ when I typed the command" from "it is an instrument."
 `PI3B_HEADED_OS_ASSESSMENT.md` scales x86 measurements to the Pi by a **guessed ×7**. A new
 card with a new filesystem is exactly when to replace the guess with a measurement:
 
+The bench scripts are dev tooling, so they aren't in the runtime directory; run them from
+`evolver-src` with the runtime venv (neither touches rig state; `bench_read_paths.py` works in
+a temporary directory):
+
 ```bash
-cd /home/pi/evolver-gui
-.venv/bin/python server/bench_growth_rate.py     # pins the scalar-throughput factor
-.venv/bin/python server/bench_read_paths.py      # SD-card I/O does not extrapolate from x86
+cd /home/pi/evolver-src
+/home/pi/evolver-gui/.venv/bin/python server/bench_growth_rate.py   # pins the scalar-throughput factor
+/home/pi/evolver-gui/.venv/bin/python server/bench_read_paths.py    # SD-card I/O does not extrapolate from x86
 vcgencmd measure_temp; vcgencmd get_throttled    # expect throttled=0x0
 df -h /; free -m; swapon --show
 ```
@@ -668,8 +693,7 @@ systemctl status hciuart bluetooth --no-pager | head
 
 # before every run:
 head -1 /home/pi/evolver-gui/calibration/temp_calibration.txt   # slopes still negative
-git -C /home/pi/evolver-gui describe --tags                     # the tag you think you deployed
-git -C /home/pi/evolver-gui status --short                      # clean
+cat /home/pi/evolver-gui/DEPLOYED_VERSION                       # the tag you think you deployed
 ```
 
 ### 13.3 Optional — the framebuffer console
@@ -677,12 +701,15 @@ git -C /home/pi/evolver-gui status --short                      # clean
 `LOCAL_CONSOLE_OPTIONS.md` recommends the TUI (`evolver_console.py`, 50 MB, no graphics stack)
 over a desktop, and a headless card is exactly the right substrate for it: it is a pure API
 client, it adds no safety surface, and installing it pulls in nothing that could undo Stage 4 —
-which is precisely what a desktop install risks. Its dependencies are **not** in
-`requirements.txt`:
+which is precisely what a desktop install risks. It isn't in the runtime directory (it's not
+the GUI, so `.gitattributes` keeps it out of the export); run it from `evolver-src`. Its
+dependencies are **not** in `requirements.txt`, so give it its own venv — the runtime venv
+gets rebuilt whenever the interpreter changes, and would silently lose them:
 
 ```bash
-.venv/bin/pip install textual "python-socketio[client]" requests plotext
-.venv/bin/python evolver_console.py --host 127.0.0.1 --port 5000     # also works over SSH
+python3 -m venv ~/console-venv
+~/console-venv/bin/pip install textual "python-socketio[client]" requests plotext
+~/console-venv/bin/python /home/pi/evolver-src/evolver_console.py --host 127.0.0.1 --port 5000   # also works over SSH
 ```
 
 To put it on `tty1` at the bench:
@@ -690,7 +717,7 @@ To put it on `tty1` at the bench:
 ```bash
 sudo systemctl edit getty@tty1     # ExecStart=-/sbin/agetty --autologin pi %I $TERM
 # in ~/.bash_profile:
-[ "$(tty)" = /dev/tty1 ] && exec /home/pi/evolver-gui/.venv/bin/python /home/pi/evolver-gui/evolver_console.py
+[ "$(tty)" = /dev/tty1 ] && exec /home/pi/console-venv/bin/python /home/pi/evolver-src/evolver_console.py
 ```
 
 `Ctrl-Alt-F2` still gives you a real root shell with nothing in the way. **Do not install a
@@ -710,7 +737,7 @@ A fresh card is a clean OS, not a clean codebase. These ship with `pilot-v0.1.5`
 | # | Issue | Where | Impact on a fresh card |
 |---|---|---|---|
 | 1 | **`socket.io` loaded from a public CDN**, no vendored copy, no `typeof io` guard | `index.html:2457`, `:6064` | Dashboard is unusable without internet egress. Assessment §1. |
-| 2 | **`calibration/` is tracked in git** | `.gitignore` | A future `git checkout <tag>` can overwrite this rig's calibration; re-calibrating on the Pi without committing blocks the next checkout. `DEPLOY.md` standing warning. |
+| 2 | ~~**`calibration/` is tracked in git**~~ — overwrite hazard resolved by the `evolver-src`/`evolver-gui` split | `DEPLOY.md` P3.3 | Checkouts no longer touch the rig's calibration. What remains: calibration made on the Pi reaches git only when committed back by hand (`DEPLOY.md`, "Calibration: update-safe now…"). |
 | 3 | **`state.json` fsync every tick**, inside the engine lock | `run_cycle` `experiment_engine.py:1379` → `:1700`; `os.fsync` `:3249` | 8 640 forced commits/day to the card. Wants on-change + 60 s heartbeat. Assessment §5.1. |
 | 4 | **`_pump_log_cache` never trimmed**, scans the whole experiments tree | `calibration_service.py:225`, `:621` | Dormant while `current.json` has `"pump": null`. **Arms itself the moment Tier 2 pump calibration lands** — bound it *before* that bench session, not after. Assessment §7.1. |
 | 5 | **Plots "All" range** is O(n) across 16 vials in parallel | `get_data` `experiment_engine.py:1934` (see the comment at `:1986`), `index.html:4833` | ~8 min of Pi CPU from one click on a 7-day run. Assessment §5.2. |
@@ -718,10 +745,9 @@ A fresh card is a clean OS, not a clean codebase. These ship with `pilot-v0.1.5`
 | 7 | **Werkzeug dev server** with `allow_unsafe_werkzeug=True` | `app.py:2542` | Fine for 1–3 clients. **Do not "fix" it with waitress** — measured to silently break WebSocket and downgrade every client to long-polling. Moving off it means an async-mode change. Assessment §6. |
 | 8 | **Over-temp detection is a 3-tick debounce** on a loop whose period is `max(10 s, work)` | `_handle_heater_safety_locked` `experiment_engine.py:2783` | A silent RS485 bus can stretch one tick to 30–45 s, and the debounce to three times that. Worth attention on its own merits. Assessment §4. |
 
-**Fix #1 and #2 as commits from the dev machine, then deploy a new tag — never as hand-edits on
-the Pi.** Editing a tracked file in place leaves the working tree dirty, which makes the next
-`git checkout <tag>` fail or clobber the change. That is the same trap `DEPLOY.md` documents
-for calibration, and it applies identically here. The `socket.io` fix is two lines:
+**Fix these as commits from the dev machine, then deploy a new tag — never as hand-edits on
+the Pi.** `evolver-gui` is an export: `deploy.sh` replaces every code file in it on the next
+deploy, so a hand-edit there is silently lost. The `socket.io` fix is two lines:
 
 ```bash
 # on the dev machine, on a branch
@@ -740,7 +766,8 @@ Stop and reassess on any of these:
 - `/dev/serial0` resolves to `ttyS0`, or `dmesg` does not attribute `ttyAMA0` to the PL011 *(Stage 4.5)*
 - `hciuart` or `bluetooth` active after the reboot *(Stage 4.5)*
 - First row of `temp_calibration.txt` is not the sixteen negative slopes in Stage 7.3
-- `git status --short` on `calibration/` is dirty after restore *(Stage 7.3)*
+- `diff -r` of the restored `calibration/` against the backup prints anything *(Stage 7.3)*
+- `deploy.sh` refuses and you're tempted to work around it rather than fix what it names — every refusal is a case where its `rsync --delete` would have deleted something *(Stage 6)*
 - Server logs `calibration files not found` *(P4.1)*
 - Sensor NaN for > 3 consecutive ticks on hardware *(P4.2)*
 - A vial heats toward 80 °C when commanded to 30 °C *(P4.3)* — **emergency stop immediately**
@@ -754,10 +781,10 @@ Stop and reassess on any of these:
 ```
 [ ]  0.1  no experiment running; `systemctl stop evolver` completed cleanly
 [ ]  0.2  backup tarball taken AND copied off the Pi
-[ ]  0.3  tag, timezone, hostname, Tailscale identity, `git status` recorded
+[ ]  0.3  DEPLOYED_VERSION, timezone, hostname, Tailscale identity recorded; uncommitted calibration committed back
 [ ]  0.4  old card labelled and shelved as rollback
 [ ]  1    Lite 64-bit, >=32 GB, username `pi`, hostname + timezone match old card
-[ ]  2    apt full-upgrade; git + python3-venv installed; python3 >= 3.10; aarch64
+[ ]  2    apt full-upgrade; git + rsync + python3-venv installed; python3 >= 3.10; aarch64
 [ ]  3    DHCP network path confirmed, internet reachable (no static IP needed — Tailscale carries the real address)
 [ ]  4.1  serial hardware ON, serial login console OFF
 [ ]  4.2  config.txt has enable_uart=1 AND dtoverlay=disable-bt; no miniuart-bt
@@ -766,10 +793,10 @@ Stop and reassess on any of these:
 [ ]  4.5  /dev/serial0 -> ttyAMA0 (PL011); fuser prints nothing
 [ ]  4.6  config.txt.evolver-known-good snapshot taken
 [ ]  5    zram active, dphys-swapfile disabled            (optional)
-[ ]  6    cloned to /home/pi/evolver-gui; `git describe` == pilot-v0.1.5
-[ ]  7.1  experiments/ restored, directory count matches
-[ ]  7.2  calibration/_sessions/ + reconciliation_log.json restored
-[ ]  7.3  temp_calibration.txt row 1 == the 16 negative slopes; git status clean
+[ ]  6    cloned to /home/pi/evolver-src; deploy.sh built evolver-gui; DEPLOYED_VERSION tag == <tag>
+[ ]  7.1  experiments/ restored, directory count matches; machine/ restored
+[ ]  7.2  calibration/ restored whole from the old card
+[ ]  7.3  temp_calibration.txt row 1 == the 16 negative slopes; diff against the backup is empty
 [ ]  7.4  /etc/evolver/secret.env restored or generated
 [ ]  7.5  authorized_keys restored; laptop known_hosts cleared
 [ ]  8    install.sh completed; `id` lists dialout after re-login
