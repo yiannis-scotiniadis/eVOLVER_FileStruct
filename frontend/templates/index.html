@@ -687,6 +687,7 @@
     .vial-health[data-health="lossy"] { display: inline-block; background: var(--status-warn); }
     .vial-health[data-health="degraded"] { display: inline-block; background: var(--status-critical); }
     .vial-health[data-health="out_of_range"] { display: inline-block; background: var(--status-info); }
+    .vial-health[data-health="temp_suspect"] { display: inline-block; background: var(--status-warn); }
 
     @media (max-width: 640px) {
       .alert-drawer { width: 100%; }
@@ -3613,10 +3614,16 @@
         el.textContent =
           v.state === "degraded" ? "sensor"
           : v.state === "lossy" ? "lossy"
+          : v.state === "temp_suspect" ? "temp?"
           : v.state === "out_of_range" ? "OD hi" : "";
         el.title =
           v.state === "out_of_range"
             ? `OD above calibrated range for ${v.out_of_range_streak} cycles`
+          : v.state === "temp_suspect"
+            ? `Temperature reading jumped +${v.last_temp_jump_c} °C in one read ` +
+              `in the last 30 min, faster than the heater can warm a vial: ` +
+              `likely a thermistor or wiring fault. The heater regulates on ` +
+              `this reading, so the vial may be running cold.`
             : `${v.dropped_streak} consecutive dropped reads`;
       }
     }

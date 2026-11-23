@@ -63,6 +63,7 @@ import run_config
 from od_stir_pause import GATE_FLAGS as STIR_GATE_FLAGS
 from od_stir_pause import STIR_SETTLING, STIR_UNSETTLED
 import vessels as vessel_lib
+from event_log import THERMISTOR_GLITCH_RISE_C
 from vial_override import VialOverrideMixin, VialOverride
 from vessels import KIND_MEDIA, KIND_WASTE, VesselRegistry
 from serial_manager import (
@@ -135,9 +136,29 @@ _VALID_BOTTLE_ID = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 N_VIALS = 16
 N_PUMPS = 32  # 16 influx + 16 efflux; canonical pump index (CLAUDE.md)
 STIR_MAX = 15
+# Heater safety (SPEC §10). The server never lowers a heater target on its own:
+# the Arduino closes the loop on the same thermistor the Pi reads, so whenever
+# the reading is above target its heater is already off, and a software
+# step-down only ever acted when that reading was WRONG -- it took three vials
+# of 20261103_longrunattempt2 to room temperature for up to 58 h on thermistor
+# glitches. What remains is detection: an alert, never an actuation, except the
+# critical park-off latch below.
+#
+# Margin above target that counts as an overrun, for the sustained-overrun alert.
 DEFAULT_HEATER_OVERRUN_C = 5.0
+# Three consecutive reads above this park the heater off (the latch).
 DEFAULT_HEATER_CRITICAL_C = 50.0
-DEFAULT_HEATER_STEP_DOWN_C = 2.0  # SPEC.md §10: per-cycle target reduction on overrun
+# A critical alert needs this many consecutive overrun reads (3 min at the 10 s
+# base tick). None of the six glitch episodes in 20261103_longrunattempt2 held
+# an overrun longer than 12 reads. The watch only counts once the vial has
+# been in band at its current target, so a vial cooling toward a lowered
+# target (or starting hot) never alerts; the 50 C latch still covers it.
+HEATER_OVERRUN_ALERT_READS = 18
+# A rise of THERMISTOR_GLITCH_RISE_C (event_log.py) only counts as a glitch
+# between reads at most this far apart.
+THERMISTOR_GLITCH_MAX_GAP_S = 30.0
+# One glitch warning per episode: the alert re-arms after this long without one.
+THERMISTOR_GLITCH_REARM_S = 1800.0
 DEFAULT_SENSOR_FAILURE_THRESHOLD = 3
 # The control lane's period: how often run_cycle is handed a fresh OD sample
 # and calls controller.decide(). Equal to app.py's OD_INTERVAL_SECONDS, which
@@ -849,6 +870,7 @@ class ExperimentEngine(VialOverrideMixin):
         sensor_failure_threshold: int = DEFAULT_SENSOR_FAILURE_THRESHOLD,
         heater_overrun_C: float = DEFAULT_HEATER_OVERRUN_C,
         heater_critical_C: float = DEFAULT_HEATER_CRITICAL_C,
+        thermistor_glitch_rise_c: Optional[float] = THERMISTOR_GLITCH_RISE_C,
         maintenance_timeout_minutes: float = DEFAULT_MAINTENANCE_TIMEOUT_MINUTES,
         lock: Optional[threading.RLock] = None,
         vessel_registry: Optional[VesselRegistry] = None,
@@ -868,6 +890,11 @@ class ExperimentEngine(VialOverrideMixin):
         self._sensor_failure_threshold = int(sensor_failure_threshold)
         self._heater_overrun_C = float(heater_overrun_C)
         self._heater_critical_C = float(heater_critical_C)
+        # None disables the thermistor-glitch warning (app.py, under --mock:
+        # the mock's accelerated thermal model has no per-read rise limit).
+        self._glitch_rise_c = (
+            None if thermistor_glitch_rise_c is None else float(thermistor_glitch_rise_c)
+        )
         self._maintenance_timeout_seconds = float(maintenance_timeout_minutes) * 60.0
 
         # Shared with every other experiment when a supervisor holds several:
@@ -913,6 +940,18 @@ class ExperimentEngine(VialOverrideMixin):
         # Consecutive over-critical temperature reads per vial; three latch
         # an overtemp fault (_handle_heater_safety_locked).
         self._overtemp_streak: dict[int, int] = {}
+        # Heater-safety detection state, per vial (_handle_heater_safety_locked).
+        # Advisory and never persisted, like _overtemp_streak: a restart
+        # simply starts watching afresh. See _reset_heater_watch_locked.
+        self._last_temp_read: dict[int, tuple[float, float]] = {}  # (clock, °C)
+        self._last_glitch_at: dict[int, float] = {}   # clock of the episode's latest glitch
+        self._overrun_seen_raw: dict[int, int] = {}   # setpoint the watch last saw
+        self._overrun_armed: dict[int, bool] = {}     # been in band at that setpoint
+        self._overrun_reads: dict[int, int] = {}
+        self._overrun_alerted: dict[int, bool] = {}
+        # Vials whose heater target resume_from_state put back on its °C
+        # target (a setpoint left behind by the retired overrun step-down).
+        self._resume_retargeted_vials: list[int] = []
         # Set by anything that changes persisted state on a fast tick, so the
         # every-tick fsync in _save_state_locked can be skipped when nothing
         # actually moved. OD ticks persist unconditionally.
@@ -1310,7 +1349,7 @@ class ExperimentEngine(VialOverrideMixin):
             self._temp_nan_streak = {v: 0 for v in self._vials}
             self._od_nan_streak = {v: 0 for v in self._vials}
             self._od_range_streak = {v: 0 for v in self._vials}
-            self._overtemp_streak = {}
+            self._reset_heater_watch_locked()
             self._vial_faults = {v: None for v in self._vials}
             self._reset_growth_state_locked()
             self._created_at = _now_utc()
@@ -2546,8 +2585,9 @@ class ExperimentEngine(VialOverrideMixin):
                     "group": group.name if group else None,
                     "mode": group.mode if group else None,
                     "stir": self._stir_by_vial.get(vial, 0),
-                    # The heater target in effect, after any overrun step-down;
-                    # None while parked off.
+                    # The heater target in effect (group / kept / override
+                    # value -- the server never lowers it on its own); None
+                    # while parked off.
                     "target_temp_c": (
                         None if setpoint_raw >= HEATER_OFF_SETPOINT
                         or self._temp_cal is None
@@ -3635,17 +3675,43 @@ class ExperimentEngine(VialOverrideMixin):
     # Safety / fault helpers (must hold self._lock)
     # ------------------------------------------------------------------
 
-    def _handle_heater_safety_locked(self, vial: int, temp_c: float) -> None:
-        """Per-cycle overtemp watchdog.
+    def _reset_heater_watch_locked(self) -> None:
+        """Forget every per-vial heater-safety counter (create, resume,
+        unload). All of it is advisory: a fresh watch can only alert later,
+        and the critical latch needs three consecutive reads either way."""
+        self._overtemp_streak = {}
+        self._last_temp_read = {}
+        self._last_glitch_at = {}
+        self._overrun_seen_raw = {}
+        self._overrun_armed = {}
+        self._overrun_reads = {}
+        self._overrun_alerted = {}
+        self._resume_retargeted_vials = []
 
-        Convention reminder: raw setpoint is INVERTED — lower = hotter. So
-        "back off the heater" means *raising* the raw setpoint integer
-        (lowering the target Celsius). The gate doesn't condition on
-        ``setpoint_raw > 0`` (that would only trigger when the heater is
-        already cooling); it fires whenever the measured temperature
-        overshoots the target by more than the overrun threshold."""
-        setpoint_raw = self._setpoint_raw.get(vial, HEATER_OFF_SETPOINT)
-        setpoint_c = self._raw_to_C(setpoint_raw, vial)
+    def _handle_heater_safety_locked(self, vial: int, temp_c: float) -> None:
+        """Per-read heater safety for one vial (SPEC §10).
+
+        Detection only, apart from the critical latch. The server never
+        lowers a heater target on its own: the Arduino closes the loop on
+        this same thermistor, so whenever the reading is above target its
+        heater is already off. The overrun step-down that used to live here
+        could therefore only act when the reading was WRONG -- and then it
+        cooled the culture (vials 4, 7 and 11 of 20261103_longrunattempt2, to
+        room temperature for up to 58 h, on thermistor glitches).
+
+        1. Thermistor glitch: a rise of THERMISTOR_GLITCH_RISE_C or more
+           between consecutive reads is faster than the heater can warm a
+           vial. One warning per episode.
+        2. Sustained overrun: more than ``heater_overrun_C`` above target for
+           HEATER_OVERRUN_ALERT_READS reads, once the vial has been in band at
+           that target. One critical alert per episode: the heater should
+           already be off, so the thermistor is wrong or the heater is not
+           regulating -- a person has to look.
+        3. Critical latch: three consecutive reads above ``heater_critical_C``
+           park the heater off (HEATER_OFF_SETPOINT -- never 0, which under
+           the inverted convention drives the heater to maximum)."""
+        self._watch_thermistor_glitch_locked(vial, temp_c)
+        self._watch_overrun_locked(vial, temp_c)
         if temp_c > self._heater_critical_C:
             # Debounce: the thermistor/RS485 bus is lossy and can spike
             # spuriously, so a SINGLE over-critical sample must not park the
@@ -3662,19 +3728,105 @@ class ExperimentEngine(VialOverrideMixin):
                 )
             return
         self._overtemp_streak[vial] = 0
-        if temp_c > setpoint_c + self._heater_overrun_C:
-            # Overrun: lower the target by DEFAULT_HEATER_STEP_DOWN_C (SPEC.md §10).
-            new_target_c = max(22.0, setpoint_c - DEFAULT_HEATER_STEP_DOWN_C)
-            new_raw = self._C_to_raw(new_target_c, vial)
-            self._setpoint_raw[vial] = new_raw
-            self._state_dirty = True  # must survive a resume; see run_cycle (6)
-            self._apply_temperature_locked()
-            log.warning(
-                "vial %d overtemp: %.2f C > target %.2f C + %.1f; "
-                "target -> %.2f C (raw %d -> %d)",
-                vial, temp_c, setpoint_c, self._heater_overrun_C,
-                new_target_c, setpoint_raw, new_raw,
-            )
+
+    def _watch_thermistor_glitch_locked(self, vial: int, temp_c: float) -> None:
+        """Warn on a reading that rose faster than the heater can warm a vial.
+
+        Only rises count: a real cooling event can drop a reading by 2 C in
+        one read, but nothing on this rig has ever raised one by 1 C. Reads
+        further apart than THERMISTOR_GLITCH_MAX_GAP_S (dropped reads in
+        between) are not compared. Every glitch is logged; the operator gets
+        one alert per episode, re-armed after THERMISTOR_GLITCH_REARM_S
+        without one."""
+        if self._glitch_rise_c is None:
+            return
+        now = self._clock()
+        prev = self._last_temp_read.get(vial)
+        self._last_temp_read[vial] = (now, temp_c)
+        if prev is None:
+            return
+        prev_t, prev_c = prev
+        rise = temp_c - prev_c
+        if rise < self._glitch_rise_c or now - prev_t > THERMISTOR_GLITCH_MAX_GAP_S:
+            return
+        log.warning(
+            "vial %d thermistor glitch: %.2f C -> %.2f C (+%.2f C in one read)",
+            vial, prev_c, temp_c, rise,
+        )
+        last = self._last_glitch_at.get(vial)
+        self._last_glitch_at[vial] = now
+        if last is not None and now - last < THERMISTOR_GLITCH_REARM_S:
+            return  # same episode -- already alerted
+        self._broadcast_alert(
+            level="warning",
+            message=(
+                f"Vial {vial}: temperature reading jumped +{rise:.1f} °C in one "
+                f"read ({prev_c:.1f} -> {temp_c:.1f} °C), faster than the heater "
+                "can warm a vial -- likely a thermistor or wiring fault. The "
+                "heater regulates on this reading, so the vial may run cold "
+                "until it settles. Heater target unchanged."
+            ),
+            vial=vial,
+            category="sensor",
+            dedup_key=("thermistor_glitch", vial),
+        )
+
+    def _watch_overrun_locked(self, vial: int, temp_c: float) -> None:
+        """Critical alert when a vial stays more than ``heater_overrun_C``
+        above its target for HEATER_OVERRUN_ALERT_READS reads.
+
+        Never changes the target. The watch arms only once the reading has
+        been in band at the current target, and disarms whenever that target
+        is lowered, so a vial cooling toward a lower target -- or starting a
+        run hot -- never alerts. A heater that runs away starts in band, so it
+        is caught; anything else is still covered by the critical latch."""
+        setpoint_raw = self._setpoint_raw.get(vial, HEATER_OFF_SETPOINT)
+        if setpoint_raw >= HEATER_OFF_SETPOINT or self._temp_cal is None:
+            # Parked off (nothing to regulate) or no curve to compare with.
+            self._overrun_seen_raw.pop(vial, None)
+            self._overrun_armed[vial] = False
+            self._overrun_reads[vial] = 0
+            self._overrun_alerted[vial] = False
+            return
+        seen = self._overrun_seen_raw.get(vial)
+        if seen is None or setpoint_raw > seen:
+            # A new or LOWERED target (inverted: higher raw = colder): the
+            # vial has to come into band at it before the watch counts.
+            self._overrun_armed[vial] = False
+            self._overrun_reads[vial] = 0
+            self._overrun_alerted[vial] = False
+        self._overrun_seen_raw[vial] = setpoint_raw
+
+        target_c = self._raw_to_C(setpoint_raw, vial)
+        if temp_c <= target_c + self._heater_overrun_C:
+            self._overrun_armed[vial] = True
+            self._overrun_reads[vial] = 0
+            self._overrun_alerted[vial] = False
+            return
+        if not self._overrun_armed.get(vial, False):
+            return
+        reads = self._overrun_reads.get(vial, 0) + 1
+        self._overrun_reads[vial] = reads
+        if reads < HEATER_OVERRUN_ALERT_READS or self._overrun_alerted.get(vial):
+            return
+        self._overrun_alerted[vial] = True
+        minutes = reads * self._base_tick_seconds / 60.0
+        msg = (
+            f"Vial {vial} has read {temp_c:.1f} °C -- {temp_c - target_c:.1f} °C "
+            f"above its {target_c:.1f} °C target -- for {minutes:.0f} min. Its "
+            "heater should already be off, so either the thermistor is wrong or "
+            "the heater is not regulating: check the vial. Heater target "
+            "unchanged; it is parked off automatically after three "
+            f"consecutive reads above {self._heater_critical_C:.0f} °C."
+        )
+        log.warning(msg)
+        self._broadcast_alert(
+            level="critical",
+            message=msg,
+            vial=vial,
+            category="heater",
+            dedup_key=("heater_overrun", vial),
+        )
 
     def _latch_fault_locked(self, vial: int, kind: str) -> None:
         if self._vial_faults.get(vial) is not None:
@@ -3774,28 +3926,45 @@ class ExperimentEngine(VialOverrideMixin):
 
         For a run resumed onto a temperature calibration newer than the one
         it started with (Session AA): the raw setpoints in state.json were
-        converted through the old curve, and ``resume_from_state`` restores
-        them verbatim. Latched-fault vials stay parked. An overrun step-down
-        is lost -- the heater safety re-derives it if still needed. Returns
-        the vials whose setpoint changed."""
+        converted through the old curve. Since the overrun step-down was
+        retired, ``resume_from_state`` already does this for a RUNNING run
+        (``resume_retargeted_vials``), so here it normally finds nothing left
+        to change. Latched-fault vials stay parked. Returns the vials whose
+        setpoint changed."""
         with self._lock:
-            if self._temp_cal is None:
-                return []
-            targets = run_config.temperature_c_by_vial(
-                self._groups, self._vial_targets_locked(),
-            )
-            changed: list[int] = []
-            for vial in self._vials:
-                if self._vial_faults.get(vial) is not None:
-                    continue
-                new_raw = self._C_to_raw(targets[vial], vial)
-                if new_raw != self._setpoint_raw.get(vial):
-                    self._setpoint_raw[vial] = new_raw
-                    changed.append(vial)
+            changed = self._reapply_temperature_targets_locked()
             if changed:
-                self._state_dirty = True
                 self._apply_temperature_locked()
             return changed
+
+    def _reapply_temperature_targets_locked(self) -> list[int]:
+        """Put every non-faulted vial's raw setpoint back on its °C target
+        (group value, or a kept ``vial_targets`` value) through the current
+        calibration. Marks state dirty but does NOT re-send -- the caller
+        does. Returns the vials whose setpoint changed."""
+        if self._temp_cal is None:
+            return []
+        targets = run_config.temperature_c_by_vial(
+            self._groups, self._vial_targets_locked(),
+        )
+        changed: list[int] = []
+        for vial in self._vials:
+            if self._vial_faults.get(vial) is not None:
+                continue
+            new_raw = self._C_to_raw(targets[vial], vial)
+            if new_raw != self._setpoint_raw.get(vial):
+                self._setpoint_raw[vial] = new_raw
+                changed.append(vial)
+        if changed:
+            self._state_dirty = True
+        return changed
+
+    @property
+    def resume_retargeted_vials(self) -> list[int]:
+        """Vials whose heater setpoint the last resume put back on its °C
+        target (read-only; see ``resume_from_state``)."""
+        with self._lock:
+            return list(self._resume_retargeted_vials)
 
     def _apply_temperature_locked(self) -> None:
         """Re-send the temperature raw-setpoint array reflecting current
@@ -4295,7 +4464,7 @@ class ExperimentEngine(VialOverrideMixin):
             for vial in self._vials:
                 self._stir_by_vial.setdefault(vial, 0)
             self._preconditioned_at = None
-            self._overtemp_streak = {}
+            self._reset_heater_watch_locked()
             self._setpoint_raw = {
                 int(k): int(v) for k, v in (state.get("setpoint_raw") or {}).items()
             }
@@ -4403,6 +4572,35 @@ class ExperimentEngine(VialOverrideMixin):
             if revoked:
                 self._revoke_after_restart_locked(revoked)
 
+            # SPEC §10: the server no longer lowers heater targets, so every
+            # non-faulted vial of a running experiment belongs on its °C
+            # target. A state.json written before the overrun step-down was
+            # retired can still carry a stepped-down setpoint (22 °C on a
+            # 30 °C vial); put it back, through the installed curve, and
+            # record it. Only a RUNNING run's heaters are live.
+            if self._status == ExperimentStatus.RUNNING:
+                self._resume_retargeted_vials = self._reapply_temperature_targets_locked()
+                if self._resume_retargeted_vials:
+                    targets = run_config.temperature_c_by_vial(
+                        self._groups, self._vial_targets_locked(),
+                    )
+                    restored = ", ".join(
+                        f"vial {v} -> {targets[v]:g} °C"
+                        for v in self._resume_retargeted_vials
+                    )
+                    msg = (
+                        "Heater target restored on resume: " + restored
+                        + " (the stored setpoint differed from the run's target, "
+                        "e.g. one left by the retired overrun step-down)"
+                    )
+                    log.warning(msg)
+                    self._broadcast_alert(
+                        level="warning",
+                        message=msg,
+                        category="heater",
+                        dedup_key=("heater_target_restored",),
+                    )
+
             # Re-send the heater + stir setpoints
             try:
                 self._apply_temperature_locked()
@@ -4436,7 +4634,7 @@ class ExperimentEngine(VialOverrideMixin):
         self._temp_nan_streak = {}
         self._od_nan_streak = {}
         self._od_range_streak = {}
-        self._overtemp_streak = {}
+        self._reset_heater_watch_locked()
         self._vial_faults = {}
         self._od_history = {}
         self._dilution_events = {}

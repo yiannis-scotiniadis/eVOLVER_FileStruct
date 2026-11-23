@@ -497,7 +497,7 @@ backup, multi-phase protocols, and authentication.
   and how to verify `/dev/ttyAMA0` is the PL011, restoring the state git does not carry,
   Tailscale identity, and which parts of `DEPLOY.md` Phase 4 a rebuild may skip.
 
-### Fourteen facts worth carrying into any new work
+### Fifteen facts worth carrying into any new work
 
 1. **`xr` is a closed-loop setpoint, not a PWM, and the slope is negative.** The Arduino
    already closes the temperature loop. `xr=0` requests ~82 °C. See the Testing warning
@@ -737,6 +737,27 @@ backup, multi-phase protocols, and authentication.
       `config.json` carries `pump_csv_schema`). Tag every new pump-log writer with its
       `source`.
 
+15. **Thermistor channels can fault, the Arduino regulates on the faulty reading, and the
+    server never lowers a heater target on its own.** In `20261103_longrunattempt2`
+    (Nov 2026) sleeves 4, 7 and 11 produced one-read temperature jumps of 2–10 °C, and
+    offsets of 3–4 °C lasting hours; 517k reads from the Sep–Oct runs contain no rise of even
+    1 °C per read. The old overrun step-down reacted to those reads by lowering targets to a
+    22 °C floor with no way back, taking three vials to room temperature for up to 58 h. It
+    was retired (SPEC §10): whenever the reading is above target the firmware's heater is
+    already off, so a step-down only ever acted on a wrong reading. Three rules for new work:
+
+    - **Heater safety detects; only the 50 °C × 3-read latch actuates.** Don't add a path
+      that changes `_setpoint_raw` from a temperature reading. Alert through
+      `_broadcast_alert` with a stable `dedup_key` instead (`heater_overrun`,
+      `thermistor_glitch`).
+    - **A glitch is a RISE.** ≥ `THERMISTOR_GLITCH_RISE_C` (1.5 °C, `event_log.py`) between
+      consecutive reads is not heat. Drops are real (cold media, cooling: −2.1 °C in one read
+      on 10/19). Software can flag a bad thermistor but not correct for it: the firmware
+      heats to whatever the sensor says.
+    - **Detection is off under `--mock`** (`glitch_rise_c=None`): the mock's thermal model
+      runs 100× accelerated with noise scaled to sim time, so its per-read changes aren't
+      physical. Engine and `VialHealth` tests build their own objects with the real threshold.
+
 
 ## Technical constraints
 
@@ -860,6 +881,8 @@ eVOLVER_FileStruct/
     test_od_recalibrate.py   #   post-hoc recalibration: identity, true curve, schema 1, HTTP
     test_vial_override.py    #   override: grant/expiry, controller coherence, books, holds,
                              #   restart, parallel runs, and the HTTP path to the wire
+    test_heater_safety.py    #   heater safety without the step-down: the real Nov 2026 glitch
+                             #   traces, overrun/glitch alerts, resume restores targets (fact 15)
     test_calibration_tier3*.py, test_od_curve_fit.py
                              #   Tier 3 wizards against a mock whose TRUE thermistor/OD
                              #   response differs from the installed curve (SPEC §19.5)

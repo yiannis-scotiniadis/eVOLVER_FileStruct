@@ -746,9 +746,24 @@ def classify_cycle(
 
 DEFAULT_VIAL_DEGRADED_THRESHOLD = 3
 
+# A thermistor reading that RISES this much between two consecutive reads is
+# not heat -- it is a sensor or wiring fault. Measured 2026-11-09 over 517k
+# healthy reads from the Sep-Oct runs: no rise ever reached 1.0 C per read, and
+# the fastest heater-on warm-up was 0.57 C per 10 s read. Run
+# 20261103_longrunattempt2 had 59 rises of 2-10 C on three sleeves, and the
+# overrun step-down that reacted to them took those vials to room temperature
+# for up to 58 h. DROPS are not flagged: a real cooling event moved three vials
+# by -2.1 C in one read (10/19). ExperimentEngine's heater safety imports this
+# constant, so the badge and the alert agree on what counts as a glitch.
+THERMISTOR_GLITCH_RISE_C = 1.5
+# How long the dashboard keeps a vial marked "temp_suspect" after its last
+# implausible rise, in temperature reads (~30 min at the 10 s base tick).
+TEMP_SUSPECT_HOLD_READS = 180
+
 
 class VialHealth:
-    """Per-vial consecutive dropped-read streaks.
+    """Per-vial consecutive dropped-read streaks, plus a suspect-thermistor
+    flag.
 
     Derived from the sensor arrays the loop already has, so the dashboard badge
     works whether or not an experiment is running — the engine's own
@@ -756,6 +771,12 @@ class VialHealth:
 
     ``out_of_range`` is tracked separately from ``dropped``: it means the
     culture outgrew the calibration, not that the sleeve is faulty.
+
+    ``temp_suspect`` is set by a temperature rise of at least
+    :data:`THERMISTOR_GLITCH_RISE_C` between consecutive reads and held for
+    :data:`TEMP_SUSPECT_HOLD_READS` reads. The Arduino regulates on that same
+    reading, so a suspect thermistor means the vial's real temperature may be
+    off even though the reading says otherwise.
     """
 
     def __init__(
@@ -763,9 +784,14 @@ class VialHealth:
         n_vials: int = N_VIALS,
         *,
         degraded_threshold: int = DEFAULT_VIAL_DEGRADED_THRESHOLD,
+        glitch_rise_c: Optional[float] = THERMISTOR_GLITCH_RISE_C,
     ) -> None:
         self.n_vials = int(n_vials)
         self.degraded_threshold = max(1, int(degraded_threshold))
+        # None disables the suspect-thermistor flag: app.py passes None under
+        # --mock, whose 100x-accelerated thermal model has no physical
+        # per-read rise limit to test against.
+        self.glitch_rise_c = None if glitch_rise_c is None else float(glitch_rise_c)
         self._lock = threading.RLock()
         # Split per lane, for the same reason ExperimentEngine splits its
         # streaks: temperature ticks ~6x more often than OD, so a single fused
@@ -774,6 +800,12 @@ class VialHealth:
         self._temp_dropped = [0] * self.n_vials
         self._od_dropped = [0] * self.n_vials
         self._out_of_range = [0] * self.n_vials
+        # Suspect-thermistor tracking: the previous finite reading (None after
+        # a dropped one, so a rise is only ever measured between two real
+        # reads), reads left on the hold, and the size of the last rise.
+        self._last_temp: list[Optional[float]] = [None] * self.n_vials
+        self._temp_suspect_left = [0] * self.n_vials
+        self._last_temp_jump: list[Optional[float]] = [None] * self.n_vials
 
     def record_cycle(
         self,
@@ -803,6 +835,9 @@ class VialHealth:
                 else:
                     self._temp_dropped[v] = 0
 
+                if temperature is not None and v < len(temperature):
+                    self._record_temp_locked(v, temperature[v])
+
                 if not od_acquired:
                     continue
 
@@ -829,6 +864,34 @@ class VialHealth:
                 else:
                     self._od_dropped[v] = 0
 
+    def _record_temp_locked(self, v: int, reading) -> None:
+        """Suspect-thermistor tracking for one vial's temperature read.
+
+        Only a RISE between two consecutive finite reads counts; a dropped
+        read forgets the previous value rather than comparing across the gap.
+        Every read, dropped or not, spends one read of an active hold."""
+        if self.glitch_rise_c is None:
+            return
+        if self._temp_suspect_left[v] > 0:
+            self._temp_suspect_left[v] -= 1
+        if not _is_finite(reading):
+            self._last_temp[v] = None
+            return
+        t = float(reading)
+        prev = self._last_temp[v]
+        if prev is not None and t - prev >= self.glitch_rise_c:
+            self._temp_suspect_left[v] = TEMP_SUSPECT_HOLD_READS
+            self._last_temp_jump[v] = round(t - prev, 2)
+        self._last_temp[v] = t
+
+    def forget_temperatures(self) -> None:
+        """Drop every vial's previous temperature reading, so the next read
+        is not compared with it. Called when a temperature calibration is
+        installed: every calibrated reading shifts at once, which is not a
+        thermistor fault. An active suspect hold is kept."""
+        with self._lock:
+            self._last_temp = [None] * self.n_vials
+
     def snapshot(self) -> list[dict]:
         with self._lock:
             out = []
@@ -839,8 +902,13 @@ class VialHealth:
                 # failing, and how long that streak actually is in seconds.
                 streak = max(self._temp_dropped[v], self._od_dropped[v])
                 oor = self._out_of_range[v]
+                suspect = self._temp_suspect_left[v] > 0
                 if streak >= self.degraded_threshold:
                     state = "degraded"
+                elif suspect:
+                    # Above out_of_range: a thermistor the heater regulates on
+                    # is a sleeve fault, while out_of_range is the culture.
+                    state = "temp_suspect"
                 elif oor >= self.degraded_threshold:
                     state = "out_of_range"
                 elif streak > 0:
@@ -854,5 +922,7 @@ class VialHealth:
                     "temp_dropped_streak": self._temp_dropped[v],
                     "od_dropped_streak": self._od_dropped[v],
                     "out_of_range_streak": oor,
+                    "temp_suspect": suspect,
+                    "last_temp_jump_c": self._last_temp_jump[v],
                 })
             return out

@@ -750,6 +750,12 @@ def create_app(use_mock: bool):
     state = AppState(
         manager=manager, temp_cal=temp_cal, od_cal=od_cal, data_logger=data_logger
     )
+    # Thermistor-glitch detection (SPEC §10) tests readings against what a real
+    # sleeve can do: no rise of THERMISTOR_GLITCH_RISE_C in one read. The mock
+    # runs its thermal model 100x accelerated with noise scaled to sim time,
+    # so its per-read changes are not physical -- detection is off under it.
+    glitch_rise_c = None if use_mock else evlog.THERMISTOR_GLITCH_RISE_C
+    state.vial_health = evlog.VialHealth(N_VIALS, glitch_rise_c=glitch_rise_c)
 
     flask_app = Flask(
         __name__,
@@ -926,6 +932,7 @@ def create_app(use_mock: bool):
         # in seconds.
         cycle_interval_seconds=OD_INTERVAL_SECONDS,
         base_tick_seconds=SENSOR_LOOP_INTERVAL_SECONDS,
+        thermistor_glitch_rise_c=glitch_rise_c,
         # Machine-scoped state (shared vessel levels, the machine hold) lives
         # beside experiments/, never inside it, so no listing mistakes it for
         # an experiment.
@@ -980,6 +987,9 @@ def create_app(use_mock: bool):
         state.engine.set_temp_cal(temp_cal)
         if subsystem == "temperature":
             cal_service.tracker.reset()
+            # Every calibrated temperature just shifted at once: not a
+            # thermistor fault, so don't compare across the install.
+            state.vial_health.forget_temperatures()
         _emit_event({
             "type": "calibration_installed",
             "subsystem": subsystem,
@@ -3762,7 +3772,15 @@ def create_app(use_mock: bool):
             run = state.engine.get_run(name)
             changed = []
             try:
-                changed = run.reapply_temperature_targets() if run is not None else []
+                if run is not None:
+                    # resume_from_state already put a RUNNING run's setpoints
+                    # back on their °C targets through the installed curve
+                    # (SPEC §10), so report what it changed; the call here is
+                    # the backstop and normally changes nothing more.
+                    changed = sorted(
+                        set(run.resume_retargeted_vials)
+                        | set(run.reapply_temperature_targets())
+                    )
             except Exception:
                 log.exception("recomputing heater setpoints for '%s' failed", name)
             _emit_alert(

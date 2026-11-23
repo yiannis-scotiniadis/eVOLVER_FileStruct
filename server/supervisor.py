@@ -48,6 +48,7 @@ from typing import Any, Callable, Optional
 import run_config
 import vessels as vessel_lib
 from control_modes.turbidostat import PumpAction
+from event_log import THERMISTOR_GLITCH_RISE_C
 from experiment_engine import (
     DEFAULT_BASE_TICK_SECONDS,
     DEFAULT_CYCLE_INTERVAL_SECONDS,
@@ -170,6 +171,7 @@ class ExperimentSupervisor:
         sensor_failure_threshold: int = DEFAULT_SENSOR_FAILURE_THRESHOLD,
         heater_overrun_C: float = DEFAULT_HEATER_OVERRUN_C,
         heater_critical_C: float = DEFAULT_HEATER_CRITICAL_C,
+        thermistor_glitch_rise_c: Optional[float] = THERMISTOR_GLITCH_RISE_C,
         maintenance_timeout_minutes: float = DEFAULT_MAINTENANCE_TIMEOUT_MINUTES,
         machine_dir: Optional[Path] = None,
         max_concurrent_runs: int = MAX_CONCURRENT_RUNS,
@@ -194,6 +196,7 @@ class ExperimentSupervisor:
             sensor_failure_threshold=sensor_failure_threshold,
             heater_overrun_C=heater_overrun_C,
             heater_critical_C=heater_critical_C,
+            thermistor_glitch_rise_c=thermistor_glitch_rise_c,
             maintenance_timeout_minutes=maintenance_timeout_minutes,
         )
         self._maintenance_timeout_seconds = float(maintenance_timeout_minutes) * 60.0

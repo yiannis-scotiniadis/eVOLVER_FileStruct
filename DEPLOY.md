@@ -490,9 +490,10 @@ everything before it carry the old script, which has none of the checks describe
 # 1. Stop the service (ends any running experiment).
 sudo systemctl stop evolver
 
-# 2a. Working clone only: record what the old release put at the top level, so deploy.sh
-#     may replace those entries (docs, tests, mac_original/, ...) instead of refusing on them.
-git -C /home/pi/evolver-gui ls-tree --name-only HEAD > /home/pi/evolver-gui/.deploy-manifest
+# 2a. Working clone only — SKIP on eVOLVER-001, whose clone is gone ("not a git repository").
+#     Records what the old release put at the top level, so deploy.sh may replace those
+#     entries (docs, tests, mac_original/, ...) instead of refusing on them.
+names=$(git -C /home/pi/evolver-gui ls-tree --name-only HEAD) && echo "$names" > /home/pi/evolver-gui/.deploy-manifest
 
 # 2b. Take the git metadata out of the runtime directory. Move it, don't delete it: a working
 #     clone holds any local branches and unpushed commits. (eVOLVER-001's local branch,
